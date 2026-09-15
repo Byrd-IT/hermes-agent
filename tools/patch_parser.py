@@ -174,13 +174,16 @@ def _seek_hunk(content: str, search_lines: List[str], cursor: int) -> Optional[T
     return None
 
 
-def _v4a_match_error(error: Optional[str]) -> Optional[str]:
+def _v4a_match_error(error: Optional[str], *, hint_window_ambiguous: bool = False) -> Optional[str]:
     """V4A cannot set ``replace_all``; keep ambiguity recovery actionable."""
     if error is None:
         return None
+    advice = ("Include unique context lines in this hunk's search text."
+              if hint_window_ambiguous else
+              "Add a unique @@ hint @@ to this hunk or include unique context lines in its search text.")
     return error.replace(
         "Provide more context to make it unique, or use replace_all=True.",
-        "Add a unique @@ hint @@ to this hunk or include unique context lines in its search text.",
+        advice,
     )
 
 
@@ -190,7 +193,7 @@ def _replace_hunk(content: str, hunk: Hunk, search_pattern: str, replacement: st
     from tools.fuzzy_match import fuzzy_find_and_replace
 
     location = _seek_hunk(content, search_pattern.split('\n'), cursor)
-    if location is not None and cursor:
+    if location is not None:
         start, end = location
         window_new, count, _strategy, error = fuzzy_find_and_replace(
             content[start:end], search_pattern, replacement, replace_all=False)
@@ -211,6 +214,7 @@ def _replace_hunk(content: str, hunk: Hunk, search_pattern: str, replacement: st
     # Keep validation and apply parity: both retry ambiguous global matches near
     # an explicit hunk hint before reporting failure.
     hint_pos = content.find(hunk.context_hint) if hunk.context_hint else -1
+    hint_window_ambiguous = False
     if error and hint_pos != -1:
         window_start = max(0, hint_pos - 500)
         window_end = min(len(content), hint_pos + 2000)
@@ -219,7 +223,8 @@ def _replace_hunk(content: str, hunk: Hunk, search_pattern: str, replacement: st
         if count:
             return (content[:window_start] + window_new + content[window_end:], count, None,
                     window_start + len(window_new))
-    return content, 0, _v4a_match_error(error), cursor
+        hint_window_ambiguous = error is not None
+    return content, 0, _v4a_match_error(error, hint_window_ambiguous=hint_window_ambiguous), cursor
 
 def _validate_operations(operations: List[PatchOperation], file_ops: Any) -> List[str]:
     """Dry-run every operation -> error strings (empty = safe). UPDATE hunks are simulated in
@@ -244,6 +249,7 @@ def _validate_operations(operations: List[PatchOperation], file_ops: Any) -> Lis
         if read_err:
             errors.append(f"{op.file_path}: {read_err}")
             return
+        assert simulated is not None
         cursor = 0
         for hunk_index, hunk in enumerate(op.hunks, start=1):
             search_lines, replace_lines = _split_hunk(hunk)
@@ -264,11 +270,34 @@ def _validate_operations(operations: List[PatchOperation], file_ops: Any) -> Lis
                         errors.append(f"{op.file_path}: addition-only hunk {ambiguous}")
                 continue
             search_pattern, replacement = '\n'.join(search_lines), '\n'.join(replace_lines)
+            # A lone first hunk with repeated source text has no ordering signal;
+            # preserve the historical fail-closed behavior.  A multi-hunk patch
+            # establishes file order, so its first hunk may safely seek from zero.
+            if (hunk_index == 1 and len(op.hunks) == 1
+                    and _count_occurrences(simulated, search_pattern) > 1):
+                errors.append(
+                    f"{op.file_path}: hunk 1 (no later ordering anchor) is ambiguous — "
+                    "include unique context lines in its search text")
+                continue
+            # A later unanchored hunk cannot safely skip one of several identical
+            # source blocks.  Cursor order locates the *next* block, not the block
+            # a human may have meant; reject atomically instead of silently editing
+            # that next block.  A first hunk deliberately starts at offset zero.
+            if cursor and not hunk.context_hint and _count_occurrences(
+                    simulated[cursor:], search_pattern) > 1:
+                errors.append(
+                    f"{op.file_path}: hunk {hunk_index} (no hint) is ambiguous after the "
+                    "previous hunk — include unique context lines in its search text")
+                continue
             new_simulated, count, match_error, cursor_after = _replace_hunk(
                 simulated, hunk, search_pattern, replacement, cursor)
             if count:
                 simulated, cursor = new_simulated, cursor_after
-            elif not is_already_applied(simulated or "", search_pattern, replacement):
+            # "Already applied" is safe only after the source pattern is gone at
+            # the next searchable site.  Otherwise a replacement at one location
+            # can hide an intended edit at another location.
+            elif (not is_already_applied(simulated or "", search_pattern, replacement)
+                  or _seek_hunk(simulated, search_lines, cursor) is not None):
                 label = f"'{hunk.context_hint}'" if hunk.context_hint else "(no hint)"
                 errors.append(
                     f"{op.file_path}: hunk {hunk_index} {label} not found"
