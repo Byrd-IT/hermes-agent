@@ -413,6 +413,72 @@ class TestValidationPhase:
         assert "validation failed" in result.error.lower()
 
 
+    def test_validation_and_apply_seek_boilerplate_hunks_from_context_hints(self):
+        """Later boilerplate hunks seek from inert anchors, then fall back when
+        the intended target is before the monotonic cursor."""
+        patch = """\
+*** Begin Patch
+*** Update File: adapter_test.py
+@@ class TestSessions @@
+ class TestSessions:
+@@
+-    self.assertEqual(resp.status_code, 200)
++    self.assertEqual(resp.status_code, 202)
+@@ class TestAuth @@
+ class TestAuth:
+@@
+-    self.assertEqual(resp.status_code, 200)
++    self.assertEqual(resp.status_code, 201)
+*** End Patch"""
+        ops, err = parse_v4a_patch(patch)
+        assert err is None
+
+        original = (
+            "class TestPartials:\n"
+            "    self.assertEqual(resp.status_code, 200)\n\n"
+            "class TestSessions:\n"
+            "    pass\n\n"
+            "class TestBounds:\n"
+            "    self.assertEqual(resp.status_code, 200)\n\n"
+            "class TestAuth:\n"
+            "    pass\n"
+        )
+        file_ops = _DictFileOps({"adapter_test.py": original})
+
+        result = apply_v4a_operations(ops, file_ops)
+
+        assert result.success is True, result.error
+        assert file_ops.files["adapter_test.py"] == original.replace(
+            "class TestPartials:\n    self.assertEqual(resp.status_code, 200)",
+            "class TestPartials:\n    self.assertEqual(resp.status_code, 201)",
+        ).replace(
+            "class TestBounds:\n    self.assertEqual(resp.status_code, 200)",
+            "class TestBounds:\n    self.assertEqual(resp.status_code, 202)",
+        )
+
+    def test_v4a_ambiguity_error_recommends_hunk_context_not_replace_all(self):
+        patch = """\
+*** Begin Patch
+*** Update File: duplicate.py
+@@
+-    self.assertEqual(resp.status_code, 200)
++    self.assertEqual(resp.status_code, 201)
+*** End Patch"""
+        ops, err = parse_v4a_patch(patch)
+        assert err is None
+        file_ops = _DictFileOps({
+            "duplicate.py": (
+                "    self.assertEqual(resp.status_code, 200)\n"
+                "    self.assertEqual(resp.status_code, 200)\n"
+            )
+        })
+
+        result = apply_v4a_operations(ops, file_ops)
+
+        assert result.success is False
+        assert "replace_all" not in result.error
+        assert "unique @@ hint @@" in result.error
+
     def test_validation_error_identifies_hunk_number(self):
         patch = """\
 *** Begin Patch
