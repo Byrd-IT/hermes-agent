@@ -274,6 +274,35 @@ def test_fallback_cycle_terminates(monkeypatch):
     })
     assert prov is None
 
+def test_kokoro_probe_uses_configured_target_and_one_deadline(monkeypatch):
+    import requests
+    times = iter([100.0, 100.0, 100.9, 100.9])
+    monkeypatch.setattr(ts.time, "monotonic", lambda: next(times))
+    calls = []
+    def down(url, timeout=None):
+        calls.append((url, timeout))
+        raise requests.ConnectionError("down")
+    monkeypatch.setattr("requests.get", down)
+    assert ts.KokoroStreamer.available({"base_url": "http://10.10.99.103:11640/v1"}) is False
+    assert calls[0][0].startswith("http://10.10.99.103:11640/v1/")
+    assert [call[1] for call in calls] == [ts.KOKORO_PROBE_TIMEOUT_S, pytest.approx(0.6)]
+
+
+def test_kokoro_error_body_is_bounded_without_response_text(monkeypatch):
+    response = _FakeResponse(status_code=502, chunks=[b"x" * 1024])
+    type(response).text = property(lambda _self: (_ for _ in ()).throw(AssertionError("must not materialise response.text")))
+    monkeypatch.setattr("requests.post", lambda *a, **k: response)
+    with pytest.raises(RuntimeError, match="Kokoro TTS failed"):
+        list(_kokoro().stream("hi"))
+
+
+def test_fallback_chain_depth_is_bounded(monkeypatch):
+    for index in range(ts.MAX_CONFIGURED_FALLBACK_DEPTH + 1):
+        _register_fake(monkeypatch, f"p{index}", available=False)
+    config = {"provider": "p0"}
+    config.update({f"p{index}": {"fallback_provider": f"p{index + 1}"} for index in range(ts.MAX_CONFIGURED_FALLBACK_DEPTH)})
+    assert ts.resolve_streaming_provider(config) is None
+
 
 # ── Built-in provider availability ───────────────────────────────────────
 

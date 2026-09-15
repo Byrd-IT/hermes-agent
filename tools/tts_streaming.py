@@ -35,6 +35,7 @@ DEFAULT_KOKORO_TIMEOUT_S = 60.0
 # Availability runs on the `auto` resolution path, so a down service must cost
 # milliseconds. Long enough for a loopback round trip, short enough not to stall.
 KOKORO_PROBE_TIMEOUT_S = 1.5
+MAX_CONFIGURED_FALLBACK_DEPTH = 32
 # 20 ms of 24 kHz int16 mono. Small chunks keep first-audio latency low; larger
 # ones would buffer speech that the user is waiting to hear.
 KOKORO_CHUNK_BYTES = 960
@@ -150,10 +151,14 @@ def register(name: str) -> Callable[[_ProviderT], _ProviderT]:
 def _try_instantiate(name: str, tts_config: Dict) -> Optional[StreamingTTSProvider]:
     """Construct the registered streamer *name* if it's usable, else None."""
     cls = _REGISTRY.get(name)
-    if cls is None or not cls.available():
+    if cls is None:
+        return None
+    section = tts_config.get(name) or {}
+    available = cls.available(section) if cls is KokoroStreamer else cls.available()
+    if not available:
         return None
     try:
-        return cls(tts_config, tts_config.get(name) or {})
+        return cls(tts_config, section)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("streaming provider %s init failed: %s", name, exc)
         return None
@@ -192,7 +197,8 @@ def resolve_streaming_provider(
 
 
 def _try_configured_fallback(
-    name: str, tts_config: Dict, _seen: Optional[set] = None) -> Optional[StreamingTTSProvider]:
+    name: str, tts_config: Dict, _seen: Optional[set] = None,
+    _depth: int = 0) -> Optional[StreamingTTSProvider]:
     """Follow ``tts.<name>.fallback_provider`` when *name* is unusable.
 
     Returns ``None`` when no fallback is configured, the fallback is itself
@@ -201,6 +207,9 @@ def _try_configured_fallback(
     ``_seen`` breaks a config cycle (a → b → a) instead of recursing forever.
     """
     seen = _seen if _seen is not None else set()
+    if _depth >= MAX_CONFIGURED_FALLBACK_DEPTH:
+        logger.warning("TTS fallback chain exceeded %d hops; stopping", MAX_CONFIGURED_FALLBACK_DEPTH)
+        return None
     if name in seen:
         logger.warning("TTS fallback cycle at %r; stopping", name)
         return None
@@ -211,7 +220,7 @@ def _try_configured_fallback(
         return None
     logger.info("streaming TTS %r unavailable; falling back to %r", name, fallback)
     return _try_instantiate(fallback, tts_config) or _try_configured_fallback(
-        fallback, tts_config, seen)
+        fallback, tts_config, seen, _depth + 1)
 
 
 def _capped(chunks: Iterator[bytes], label: str) -> Iterator[bytes]:
@@ -296,17 +305,18 @@ class KokoroStreamer(StreamingTTSProvider):
         return str((section or {}).get("base_url") or DEFAULT_KOKORO_BASE_URL).strip().rstrip("/")
 
     @staticmethod
-    def available() -> bool:
-        """True when a Kokoro service answers. Probe only — never imports torch.
-
-        A short timeout is the point: this runs on the resolution path for
-        ``auto``, and a down service must cost milliseconds, not seconds.
-        """
+    def available(section: Optional[Dict] = None) -> bool:
+        """True when a Kokoro service answers within one probe budget."""
         import requests
-        url = KokoroStreamer._base_url()
-        for path in ("/audio/voices", "/models"):
+        url = KokoroStreamer._base_url(section)
+        deadline = time.monotonic() + KOKORO_PROBE_TIMEOUT_S
+        for index, path in enumerate(("/audio/voices", "/models")):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            timeout = KOKORO_PROBE_TIMEOUT_S if index == 0 else remaining
             try:
-                if requests.get(f"{url}{path}", timeout=KOKORO_PROBE_TIMEOUT_S).status_code < 500:
+                if requests.get(f"{url}{path}", timeout=timeout).status_code < 500:
                     return True
             except requests.RequestException:
                 continue
@@ -334,7 +344,8 @@ class KokoroStreamer(StreamingTTSProvider):
                 timeout=timeout, stream=True,
             )) as response:
                 if response.status_code != 200:
-                    detail = response.text[:300]
+                    chunk = next(response.iter_content(chunk_size=300), b"")
+                    detail = chunk[:300].decode("utf-8", "replace")
                     raise RuntimeError(f"Kokoro TTS failed ({response.status_code}): {detail}")
                 for chunk in response.iter_content(chunk_size=KOKORO_CHUNK_BYTES):
                     if chunk:
