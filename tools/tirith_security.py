@@ -11,6 +11,8 @@ import json
 import logging
 import os
 import platform
+import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -513,42 +515,219 @@ def check_command_security(command: str) -> dict:
     if tirith_path is None:
         _warn_once("tirith_path_none", "tirith path resolved to None; scanning disabled")
         return _fail(fail_open, "tirith path unavailable", "tirith path unavailable (fail-closed)")
+    # First scan (also the witness for the cache-warm rescan below).
+    outcome = _tirith_check(tirith_path, timeout, command)
+    if outcome is None:
+        # Operational failure: re-attempt the spawn once to classify it exactly as
+        # before, keeping the crash/circuit-breaker accounting in this function.
+        try:
+            result = subprocess.run(
+                [tirith_path, "check", "--json", "--non-interactive", "--shell", "posix", "--", command],
+                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout,
+                stdin=subprocess.DEVNULL)
+        except OSError as exc:
+            # FileNotFoundError / PermissionError / exec format error: dedupe by (class, errno)
+            # so each failure mode surfaces once, not per command.
+            _warn_once(f"tirith_spawn_failed:{type(exc).__name__}:{getattr(exc, 'errno', '')}",
+                       "tirith spawn failed: %s", exc)
+            return _crash(fail_open, f"tirith unavailable: {exc}", f"tirith spawn failed (fail-closed): {exc}")
+        except subprocess.TimeoutExpired:
+            _warn_once(f"tirith_timeout:{timeout}", "tirith timed out after %ds", timeout)
+            return _crash(fail_open, f"tirith timed out ({timeout}s)", "tirith timed out (fail-closed)")
+        # Unknown exit code (includes signal-killed, e.g. -11): respect fail_open.
+        logger.warning("tirith returned unexpected exit code %d", result.returncode)
+        return _crash(fail_open, f"tirith exit code {result.returncode} (fail-open)",
+                      f"tirith exit code {result.returncode} (fail-closed)")
+    action, findings, summary = outcome
+    if action == "allow":
+        _crash_count = 0  # successful execution resets the circuit breaker
+    # .app is a legitimate gTLD: a warn consisting solely of lookalike_tld findings for .app is a
+    # known false positive and is downgraded to allow. Any other finding keeps the warn.
+    if action == "warn" and findings and all(_is_app_tld_finding(f) for f in findings):
+        return _verdict("allow")
+    # tirith <= 0.4.2 runs every package's threat-intel lookups under one small per-run wall-clock
+    # budget, so `npm install a b` warns "deadline exhausted" for all packages even when upstreams
+    # are healthy — the budget is spent before later packages finish their first lookup. Successful
+    # responses are cached on disk (failures are not), so solo per-package scans (one package per
+    # run = one budget each) warm the cache and a single re-scan then completes. Warnings for
+    # genuinely unreachable upstreams survive the re-scan and stand, so this never fails open.
+    if action == "warn" and (real := _incomplete_real_packages(findings, command)):
+        if (rescan := _rescan_after_cache_warm(command, tirith_path, timeout, real)) is not None:
+            rescan_action, rescan_findings, rescan_summary = rescan
+            if rescan_action == "warn" and rescan_findings:
+                rescan_action, rescan_findings = _suppress_app_tld_false_positives(
+                    rescan_action, rescan_findings)
+            if rescan_action == "allow":
+                _crash_count = 0
+                return _verdict("allow")
+            return _verdict(rescan_action, rescan_summary, rescan_findings)
+    return _verdict(action, summary, findings)
+
+
+_INCOMPLETE_PKG = re.compile(r"threat-intelligence check for package '([^']*)'")
+_REDIRECT_OP = re.compile(r"""
+    (?P<fd>\d*|\{[A-Za-z_][A-Za-z0-9_]*\})   # optional fd number or {varname}
+    (?:>>|>&|<&|<>|>\||>|<)                  # the redirection operator itself
+    """, re.VERBOSE)
+# Warm commands are constructed from names extracted out of tirith findings before they are ever
+# spawned, and tirith echoes package names from the install command it scanned — so this charset
+# (npm/pypi name rules, '=' for version specs) bounds what can reach the shell. Anything else is
+# not a package name.
+_PKGNAME_OK = re.compile(r"^[@a-zA-Z0-9][@/=.:_a-zA-Z0-9-]*$")
+_WARM_SCAN_LIMIT = 12  # bound worst-case added latency (~1s per cold solo scan)
+_WARM_CMDS = {"npm": "npm install {pkg}", "pnpm": "pnpm install {pkg}",
+              "yarn": "yarn add {pkg}", "pip": "pip install {pkg}"}
+
+
+_LONG_VALUE_FLAGS = frozenset({
+    # pip / uv
+    "--index-strategy", "--index-url", "--extra-index-url", "--find-links", "--index",
+    "--default-index", "--extra-index", "--keyring-provider", "--config-setting",
+    "--config-settings", "--constraint", "--requirement", "--editable", "--target", "--prefix",
+    "--platform", "--python-version", "--implementation", "--abi", "--python", "--only-binary",
+    "--no-binary", "--prefer-binary", "--trusted-host", "--timeout", "--retries",
+    "--resume-retries", "--build", "--cache-dir", "--build-constraint", "--build-constraints",
+    "--config-file", "--exclude-newer", "--resolution", "--annotation-style", "--fork-strategy",
+    "--link-mode", "--no-build-isolation-package", "--strategy",
+    # npm / yarn / cargo / gem
+    "--registry", "--destination", "--source", "--tag", "--cwd", "--output", "--format",
+})
+_SHORT_VALUE_FLAGS = frozenset({"-c", "-e", "-f", "-i", "-r", "-t", "-b", "-s"})
+
+
+def _redirect_artifact_tokens(command: str) -> set[str]:
+    """Tokens in *command* that exist only because of a shell redirection: the operator tokens
+    themselves (``2>&1``, ``>``, ``2>/tmp/e``), each redirection *target* (``out.log``), and the
+    numeric fd prefixes a naive splitter leaves behind. These are exactly the strings tirith
+    mistakes for packages."""
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:  # unbalanced quotes -- fall back to whitespace splitting
+        tokens = command.split()
+    artifacts: set[str] = set()
+    expect_target = False
+    for tok in tokens:
+        if expect_target:
+            artifacts.add(tok)
+            expect_target = False
+        if not (m := _REDIRECT_OP.search(tok)):
+            continue
+        artifacts.add(tok)
+        # "2>&1" also yields the bare fd number when a parser splits on the operator.
+        if (prefix := m.group("fd")) and prefix.isdigit():
+            artifacts.add(prefix)
+        # A bare operator ("> out.log") takes its target from the next token.
+        expect_target = tok.endswith(m.group(0)) and not tok[m.end():]
+    return artifacts
+
+
+def _flag_operand_tokens(command: str) -> set[str]:
+    """The flag token and operand of value-taking package-manager flags in *command*
+    (e.g. ``--index-strategy unsafe-best-match`` -> both tokens; ``--flag=value`` -> both).
+    The VALUE of a flag is not a package, but tirith enriches it as one."""
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:  # unbalanced quotes -- fall back to whitespace splitting
+        tokens = command.split()
+    artifacts: set[str] = set()
+    expect_value = False
+    for tok in tokens:
+        if expect_value:
+            artifacts.add(tok)
+            expect_value = False
+            continue
+        if tok in _SHORT_VALUE_FLAGS:
+            artifacts.add(tok)
+            expect_value = True
+        elif tok.startswith("--"):
+            if "=" in tok:
+                artifacts.add(tok)
+                artifacts.add(tok.split("=", 1)[1])
+            elif tok in _LONG_VALUE_FLAGS:
+                artifacts.add(tok)
+                expect_value = True
+    return artifacts
+
+
+def _incomplete_real_packages(findings: list, command: str) -> list[str]:
+    """Real package names (not command-text artifacts) named by analysis_incomplete findings,
+    filtered to a conservative package-name charset before any warm command is built."""
+    artifacts = _redirect_artifact_tokens(command) | _flag_operand_tokens(command)
+    pkgs: list[str] = []
+    for f in findings or []:
+        if not isinstance(f, dict) or f.get("rule_id") != "analysis_incomplete":
+            continue
+        for name in _INCOMPLETE_PKG.findall(str(f.get("description") or "")):
+            if (name and name not in artifacts and _PKGNAME_OK.match(name)
+                    and name not in pkgs):
+                pkgs.append(name)
+    return pkgs
+
+
+def _warm_command(pm: str, pkg: str) -> str:
+    """Solo-scan command that warms the cache for ``pkg`` on the SAME registry the original
+    command targets: npm/pnpm/yarn installs scan npm packages, everything else (pip etc.)
+    scans PyPI. Mirroring the manager keeps the warmed cache entries on the right registry."""
+    return _WARM_CMDS[pm].format(pkg=pkg)
+
+
+def _tirith_check(tirith_path: str, timeout: int, command: str) -> tuple[str, list, str] | None:
+    """One tirith check -> ``(action, findings, summary)``, or None on operational trouble."""
     try:
         result = subprocess.run(
             [tirith_path, "check", "--json", "--non-interactive", "--shell", "posix", "--", command],
             capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout,
-            stdin=subprocess.DEVNULL)
-    except OSError as exc:
-        # FileNotFoundError / PermissionError / exec format error: dedupe by (class, errno)
-        # so each failure mode surfaces once, not per command.
-        _warn_once(f"tirith_spawn_failed:{type(exc).__name__}:{getattr(exc, 'errno', '')}",
-                   "tirith spawn failed: %s", exc)
-        return _crash(fail_open, f"tirith unavailable: {exc}", f"tirith spawn failed (fail-closed): {exc}")
-    except subprocess.TimeoutExpired:
-        _warn_once(f"tirith_timeout:{timeout}", "tirith timed out after %ds", timeout)
-        return _crash(fail_open, f"tirith timed out ({timeout}s)", "tirith timed out (fail-closed)")
-    exit_code = result.returncode
-    if (action := _EXIT_ACTIONS.get(exit_code)) is None:
-        # Unknown exit code (includes signal-killed, e.g. -11): respect fail_open.
-        logger.warning("tirith returned unexpected exit code %d", exit_code)
-        return _crash(fail_open, f"tirith exit code {exit_code} (fail-open)",
-                      f"tirith exit code {exit_code} (fail-closed)")
-    if action == "allow":
-        _crash_count = 0  # successful execution resets the circuit breaker
-    # JSON enriches findings/summary; a parse failure never changes the verdict.
+            stdin=subprocess.DEVNULL, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if (action := _EXIT_ACTIONS.get(result.returncode)) is None:
+        return None
     findings, summary = [], ""
     try:
         data = json.loads(result.stdout) if result.stdout.strip() else {}
         findings = data.get("findings", [])[:_MAX_FINDINGS]
         summary = (data.get("summary", "") or "")[:_MAX_SUMMARY_LEN]
     except (json.JSONDecodeError, AttributeError):
-        logger.debug("tirith JSON parse failed, using exit code only")
         summary = _NO_DETAILS_SUMMARY.get(action, "")
-    # .app is a legitimate gTLD: a warn consisting solely of lookalike_tld findings for .app is a
-    # known false positive and is downgraded to allow. Any other finding keeps the warn.
-    if action == "warn" and findings and all(_is_app_tld_finding(f) for f in findings):
-        return _verdict("allow")
-    return _verdict(action, summary, findings)
+    return action, findings, summary
+
+
+def _rescan_after_cache_warm(command: str, tirith_path: str, timeout: int,
+                             packages: list[str]) -> tuple[str, list, str] | None:
+    """Warm tirith's persistent response cache with one solo scan per package, then re-scan the
+    full command once. Returns the re-scan verdict, or None (keep the original verdict) when
+    warming could not run: no binary path, operational failure, or an empty package list.
+    The solo-scan command mirrors the original package manager so the cache is warmed on the
+    registry the original command actually targets."""
+    if not tirith_path or not packages:
+        return None
+    # Manager detection from the ORIGINAL command text (what tirith scanned). If the manager
+    # can't be determined, the original warn verdict stands (fail-closed default).
+    head = command.strip().split()
+    if head and head[0] in ("npm", "pnpm", "yarn", "pip"):
+        pm = head[0]
+    elif head and head[0] == "uv" and len(head) > 1 and head[1] == "pip":
+        pm = "pip"
+    else:
+        return None
+    for pkg in packages[:_WARM_SCAN_LIMIT]:
+        if _tirith_check(tirith_path, timeout, _warm_command(pm, pkg)) is None:
+            return None  # binary trouble mid-warm: keep the original verdict untouched
+    return _tirith_check(tirith_path, timeout, command)
+
+
+def _suppress_app_tld_false_positives(action: str, findings: list) -> tuple[str, list]:
+    """Drop .app lookalike_tld findings from a warn; everything dropped -> allow, a partial
+    drop keeps the remaining real findings and the warn stands. Warn-only: a block action is
+    never downgraded."""
+    if action != "warn" or not findings:
+        return action, findings
+    kept = [f for f in findings if not _is_app_tld_finding(f)]
+    if kept == findings:
+        return action, findings
+    if not kept:
+        return "allow", []
+    return action, kept
 
 
 def _is_app_tld_finding(finding: dict) -> bool:
