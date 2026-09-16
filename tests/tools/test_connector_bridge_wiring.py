@@ -115,13 +115,35 @@ def test_resolve_legacy_connector_single_shape_routes_to_sentinel():
         ({"calls": [{"name": "tool_search"}]}, "itself a bridge tool"),
         ({"calls": [{"name": "x", "arguments": "not json {"}]}, "not valid JSON"),
         ({"calls": [{"name": "x", "arguments": 42}]}, "must be an object"),
-        ({"calls": "nope"}, "non-empty array"),
+        # calls-as-string: garbage string now gets the SPECIFIC unparseable-string
+        # error, not the generic empty-array message (t_99484a2c).
+        ({"calls": "nope"}, "emitted as a JSON-encoded string"),
     ],
 )
 def test_normalize_rejects_malformed_batches(bad, expected_fragment):
     entries, err = normalize_tool_call_entries(bad)
     assert entries == []
     assert expected_fragment in (err or "")
+
+
+def test_normalize_accepts_calls_as_json_string():
+    # t_99484a2c: models occasionally double-encode 'calls' as a JSON string.
+    # Same tolerance the per-entry 'arguments' field already gets.
+    inner = [{"name": "mcp__kb_server__search_kb", "arguments": {"query": "x"}}]
+    entries, err = normalize_tool_call_entries({"calls": json.dumps(inner)})
+    assert err is None
+    assert entries == inner
+
+
+def test_normalize_calls_as_mangled_json_string_gets_specific_error():
+    # Structure actually emitted in the wild (t_99484a2c, msg 39345): entry
+    # object closed before "name", leaving "name" outside its entry — must
+    # produce the specific unparseable-string error, not "non-empty array".
+    mangled = '[{"arguments": {"title": "x"}}], "name": "mcp__kb_server__search_kb"}]'
+    entries, err = normalize_tool_call_entries({"calls": mangled})
+    assert entries == []
+    assert "emitted as a JSON-encoded string" in (err or "")
+    assert "non-empty array" not in (err or "")
 
 
 # ---------------------------------------------------------------------------

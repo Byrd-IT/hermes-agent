@@ -151,6 +151,25 @@ def normalize_tool_call_entries(args: Dict[str, Any]) -> Tuple[List[Dict[str, An
         if not str(args.get("name") or "").strip():
             return [], "tool_call requires 'calls' (an array of {name, arguments})"
         raw_calls = [{"name": args.get("name"), "arguments": args.get("arguments")}]
+    if isinstance(raw_calls, str):
+        # Models occasionally emit 'calls' as a JSON-encoded string (observed in the
+        # wild: glm-5.3-flash on large multi-param MCP payloads, t_99484a2c). Extend
+        # the same tolerance the per-entry 'arguments' field gets below. A string
+        # that does not parse is a DIFFERENT failure from an empty/non-array
+        # 'calls' — say so specifically; the generic empty-array error drove a
+        # byte-stable 4x retry loop because it told the model nothing was wrong
+        # with its structure.
+        try:
+            raw_calls = json.loads(raw_calls)
+        except json.JSONDecodeError as e:
+            return [], (
+                "tool_call 'calls' was emitted as a JSON-encoded string and that string "
+                f"is not valid JSON: {e.msg} at char {e.pos} of {len(raw_calls)}. Re-emit "
+                "'calls' as a native JSON array (not a string), with every entry closed "
+                'before the next begins: [{"name": "…", "arguments": {"…": …}}, …]. '
+                "For large payloads, drop optional params or split the call rather than "
+                "string-encoding the array."
+            )
     if isinstance(raw_calls, dict):
         raw_calls = [raw_calls]
     if not isinstance(raw_calls, list) or not raw_calls:
