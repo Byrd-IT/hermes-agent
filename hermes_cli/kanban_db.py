@@ -4008,6 +4008,19 @@ def board_stats(conn: sqlite3.Connection) -> dict:
 
     by_assignee = _counts_by_assignee(conn)
 
+    # Split human-gated waits out of the impediment count. A card blocked with
+    # kind='needs_input' is waiting on an operator decision, not stuck; folding it
+    # into `blocked` made that number read as "things broken" when most of it was
+    # "things Brandon hasn't answered yet" (Byrd-IT ops board, 2026-09-17).
+    blocked_by_kind: dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT COALESCE(block_kind, 'untyped') AS k, COUNT(*) AS n "
+        "FROM tasks WHERE status = 'blocked' GROUP BY k"
+    ):
+        blocked_by_kind[str(row["k"])] = int(row["n"])
+    waiting_on_human = blocked_by_kind.get("needs_input", 0)
+    blocked_impediments = by_status.get("blocked", 0) - waiting_on_human
+
     oldest_row = conn.execute(
         "SELECT MIN(created_at) AS ts FROM tasks WHERE status = 'ready'"
     ).fetchone()
@@ -4020,6 +4033,9 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     return {
         "by_status": by_status,
         "by_assignee": by_assignee,
+        "blocked_by_kind": blocked_by_kind,
+        "waiting_on_human": waiting_on_human,
+        "blocked_impediments": blocked_impediments,
         "oldest_ready_age_seconds": oldest_ready_age,
         "now": now,
     }

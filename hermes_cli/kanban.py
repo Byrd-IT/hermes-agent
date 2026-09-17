@@ -1076,7 +1076,11 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         return 0
     print("By status:")
     for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
-        print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
+        line = f"  {k:8s}  {stats['by_status'].get(k, 0)}"
+        if k == "blocked" and stats.get("waiting_on_human"):
+            line += (f"   ({stats['blocked_impediments']} impediment, "
+                     f"{stats['waiting_on_human']} waiting-on-human)")
+        print(line)
     if stats["by_assignee"]:
         print("\nBy assignee:")
         for who, counts in sorted(stats["by_assignee"].items()):
