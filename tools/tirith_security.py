@@ -545,6 +545,15 @@ def check_command_security(command: str) -> dict:
     # known false positive and is downgraded to allow. Any other finding keeps the warn.
     if action == "warn" and findings and all(_is_app_tld_finding(f) for f in findings):
         return _verdict("allow")
+    # Redirection tokens and package-manager flag operands ("2>&1", the value of
+    # --index-strategy) that tirith mistook for package names produce analysis_incomplete
+    # warns on ordinary commands the same way: the names 404 on every registry. Drop only
+    # findings grounded in tokens of the scanned command (warn-only; a real package or any
+    # other rule keeps the verdict).
+    if action == "warn" and findings:
+        action, findings = _suppress_phantom_package_findings(command, action, findings)
+        if action == "allow":
+            return _verdict("allow")
     # tirith <= 0.4.2 runs every package's threat-intel lookups under one small per-run wall-clock
     # budget, so `npm install a b` warns "deadline exhausted" for all packages even when upstreams
     # are healthy — the budget is spent before later packages finish their first lookup. Successful
@@ -557,6 +566,8 @@ def check_command_security(command: str) -> dict:
             if rescan_action == "warn" and rescan_findings:
                 rescan_action, rescan_findings = _suppress_app_tld_false_positives(
                     rescan_action, rescan_findings)
+                rescan_action, rescan_findings = _suppress_phantom_package_findings(
+                    command, rescan_action, rescan_findings)
             if rescan_action == "allow":
                 _crash_count = 0
                 return _verdict("allow")
@@ -662,6 +673,33 @@ def _incomplete_real_packages(findings: list, command: str) -> list[str]:
                     and name not in pkgs):
                 pkgs.append(name)
     return pkgs
+
+
+def _is_phantom_package_finding(finding: dict, artifacts: set[str]) -> bool:
+    """True if *finding* is an incomplete-lookup warning whose named package(s) are all
+    command-text artifacts (redirection tokens, flag operands), not real packages."""
+    if not isinstance(finding, dict) or finding.get("rule_id") != "analysis_incomplete":
+        return False
+    names = _INCOMPLETE_PKG.findall(str(finding.get("description") or ""))
+    return bool(names) and all(n in artifacts for n in names)
+
+
+def _suppress_phantom_package_findings(command: str, action: str, findings: list) -> tuple[str, list]:
+    """Warn-only phantom-package suppression (t_2550b91f, re-land of the dc9df97cc6 lineage):
+    drop analysis_incomplete findings naming a redirection token or package-manager flag
+    operand from the scanned command ("2>&1", the value of --index-strategy) — names that
+    404 on every registry. Warn-only: a block action is never downgraded, and a real
+    package or any other rule keeps the verdict. Returns ``(action, findings)``; ``allow``
+    with an empty list when nothing but phantoms remains."""
+    if action != "warn" or not findings:
+        return action, findings
+    artifacts = _redirect_artifact_tokens(command) | _flag_operand_tokens(command)
+    kept = [f for f in findings if not _is_phantom_package_finding(f, artifacts)]
+    if kept == findings:
+        return action, findings
+    if not kept:
+        return "allow", []
+    return action, kept
 
 
 def _warm_command(pm: str, pkg: str) -> str:
