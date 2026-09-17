@@ -554,6 +554,28 @@ def check_command_security(command: str) -> dict:
         action, findings = _suppress_phantom_package_findings(command, action, findings)
         if action == "allow":
             return _verdict("allow")
+    # tirith 0.4.2 hard-blocks while/until bracket-test compounds with two
+    # analysis_incomplete HIGH findings even when every leaf command is
+    # read-only -- a false positive that kills the command outright in
+    # single-query mode. `[ args ]` is exactly `test args` (POSIX), so rewrite
+    # the bracket spans, and downgrade ONLY when the ORIGINAL command's leaf
+    # set is provably read-only AND the rewritten copy re-scans as a clean
+    # allow. The leaf gate is what keeps destructive watcher loops blocked:
+    # tirith 0.4.2 cannot see rm/sudo inside while bodies even after the
+    # rewrite, so a bare rescan-clean gate would fail open. Everything that
+    # does not pass both gates keeps the original block (fail-closed).
+    if action == "block" and _is_loop_analysis_fp_block(findings):
+        leaves = _extract_leaf_commands(command)
+        rewritten = _rewrite_bracket_tests(command)
+        if (rewritten is not None and rewritten != command
+                and _all_leaves_readonly(leaves)):
+            rescan = _tirith_check(tirith_path, timeout, rewritten)
+            if rescan is not None:
+                r_action, r_findings, r_summary = rescan
+                if r_action == "allow":
+                    _crash_count = 0
+                    return _verdict("allow", "bracket-test loop downgraded after "
+                                             "read-only-leaf rescan")
     # tirith <= 0.4.2 runs every package's threat-intel lookups under one small per-run wall-clock
     # budget, so `npm install a b` warns "deadline exhausted" for all packages even when upstreams
     # are healthy — the budget is spent before later packages finish their first lookup. Successful
@@ -775,3 +797,189 @@ def _is_app_tld_finding(finding: dict) -> bool:
     return any(
         val is not None and ".app" in str(val).lower()
         for val in (finding.get(k) for k in ("value", "tld", "detail", "description", "message")))
+
+
+# ---------------------------------------------------------------------------
+# analysis_incomplete nested-loop false-positive suppressor (t_0fb18e49)
+#
+# tirith 0.4.2 hard-BLOCKS `while [ ... ]`/`until [ ... ]` compounds (rule
+# analysis_incomplete, titles "Nested executable body could not be resolved" +
+# "nested command analysis was incomplete") even when every leaf command is
+# read-only -- and in single-query mode there is no user to approve, so the
+# command just dies. POSIX defines `[ args ]` as exactly `test args`, so the
+# wrapper rewrites word-boundary bracket spans to `test`, requires every leaf
+# command of the ORIGINAL text to be provably read-only, and re-scans the
+# rewritten copy; the block is downgraded ONLY on a clean allow. The read-only
+# leaf gate is NOT optional: tirith 0.4.2 cannot see destructive bodies inside
+# while-loops (verified live: `while test ! -f x; do sudo rm -rf /opt/x; done`
+# scans ALLOW), so a bare rescan-clean gate would un-block destructive watcher
+# loops.
+# ---------------------------------------------------------------------------
+
+_FP_LOOP_BLOCK_TITLE = "Nested executable body could not be resolved"
+_FP_LOOP_GAP_TITLE = "nested command analysis was incomplete"
+
+# Word-boundary `[`/`[[` that starts a test invocation (never a glob char
+# class like /tmp/[abc]*.log, which is preceded by / or a word char).
+_FP_BRACKET_TEST_SPAN = re.compile(r"(?<![\w/])\[{1,2}(?=\s)")
+
+# Strict read-only leaf allowlist for the downgrade gate. Deliberately narrow:
+# these commands' observable effects are on stdout/stderr only. `find` is
+# excluded on purpose (-delete / -exec rm); xargs/sed/awk/sh never listed.
+_FP_READONLY_LEAVES = frozenset({
+    "ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "ack",
+    "stat", "file", "tree", "du", "df", "readlink", "realpath", "basename",
+    "dirname", "hostname", "whoami", "id", "uname", "arch", "date", "pwd",
+    "tty", "true", "false", "test", "[", "[[", "sleep", "seq", "printf",
+    "echo", "env", "printenv",
+})
+
+# Shell reserved words that only structure a compound command; stripped from
+# segment starts before the leaf head is read.
+_FP_LOOP_KEYWORDS = frozenset({
+    "while", "until", "for", "if", "then", "do", "else", "elif", "fi",
+    "done", "case", "esac", "!", "time",
+})
+
+# Assignments that redirect executable/library/startup resolution or shell
+# parsing when set on a command -> the leaf is not provably read-only.
+_FP_DANGEROUS_ASSIGN = frozenset({
+    "PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "IFS", "ENV",
+    "BASH_ENV", "HOME", "SHELL", "CDPATH", "GLOBIGNORE", "PYTHONPATH",
+    "PYTHONHOME",
+})
+
+_FP_ASSIGN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=")
+
+
+def _is_loop_analysis_fp_block(findings: list) -> bool:
+    """True iff findings are EXACTLY the two analysis_incomplete HIGH titles
+    tirith 0.4.2 emits for while/until bracket-test loops (the t_0fb18e49
+    false-positive pair). Any other finding keeps the fail-closed block."""
+    if not isinstance(findings, list) or len(findings) != 2:
+        return False
+    titles = set()
+    for f in findings:
+        if not isinstance(f, dict) or f.get("rule_id") != "analysis_incomplete" \
+                or str(f.get("severity", "")).lower() != "high":
+            return False
+        titles.add(str(f.get("title", "")))
+    return titles == {_FP_LOOP_BLOCK_TITLE, _FP_LOOP_GAP_TITLE}
+
+
+def _fp_quoted_spans(command: str) -> list[tuple[int, int]]:
+    """Character-index ranges of single/double-quoted regions (best-effort:
+    backslash escapes honored outside quotes). Bracket spans inside quotes are
+    skipped -- rewriting there would change the quoted text."""
+    spans, start, quote = [], None, None
+    i, n = 0, len(command)
+    while i < n:
+        c = command[i]
+        if quote is None:
+            if c == "\\":
+                i += 2
+                continue
+            if c in ("'", '"'):
+                quote, start = c, i
+        elif c == quote:
+            spans.append((start, i))
+            quote = None
+        i += 1
+    if quote is not None:
+        spans.append((start, n))  # unterminated quote: rest counts as quoted
+    return spans
+
+
+def _rewrite_bracket_tests(command: str) -> str | None:
+    """Rewrite word-boundary bracket-test spans ``[ ... ]`` / ``[[ ... ]]`` to
+    ``test ...`` (POSIX-identical builtin). Returns the rewritten text, the
+    unchanged text when there is nothing to rewrite, or None when rewriting is
+    not provably equivalent: any ``$( `` ``${ `` ``$[ `` or backtick anywhere,
+    a quote/escape inside a span, an empty test body, an unterminated span, or
+    a ``[[`` span without its matching ``]]``."""
+    if any(t in command for t in ("$(", "${", "$[", "`")):
+        return None
+    quoted = _fp_quoted_spans(command)
+    out: list[str] = []
+    consumed, rewritten = 0, False
+    for m in _FP_BRACKET_TEST_SPAN.finditer(command):
+        start = m.start()
+        if start < consumed or any(a <= start <= b for a, b in quoted):
+            continue
+        close = command.find("]", start + len(m.group(0)))
+        if close == -1:
+            return None
+        if command.startswith("[[", start):
+            if command[close + 1:close + 2] != "]":
+                return None  # [[ without its ]] closer: do not guess
+        elif command[close + 1:close + 2] == "]":
+            return None  # single-[ span ending in ]]: unmodeled nesting
+        inner = command[start + len(m.group(0)):close]
+        if any(c in inner for c in "'\"\\\n"):
+            return None  # quotes/escapes inside the span: no quote parsing
+        words = inner.split()
+        if not words:
+            return None  # empty test: fail closed
+        if any(not re.fullmatch(r"[A-Za-z0-9_@%+=:,./!-]+", w) for w in words):
+            return None  # non-plain word inside the span (`!` = test negation)
+        out.append(command[consumed:start])
+        out.append("test" + inner.rstrip())
+        consumed = close + (2 if command.startswith("[[", start) else 1)
+        rewritten = True
+    if not rewritten:
+        return command
+    out.append(command[consumed:])
+    return "".join(out)
+
+
+def _extract_leaf_commands(command: str) -> list[str] | None:
+    """Leaf command heads of *command*, one per segment split on ``;`` ``|``
+    ``&`` ``&&`` and newlines. Returns None (fail-closed: unknown leaf set)
+    when any segment carries command substitution or quotes (``$``, backtick,
+    quote, backslash), grouping constructs, an input redirection or heredoc
+    (any ``<``), a non-/dev/null output redirection, a dangerous assignment
+    (``PATH=`` etc.), or an assignment/env wrapper with no command. Compound
+    scaffolding (while/do/done/...) is stripped from segment starts; bare
+    scaffolding segments yield no leaf. Special write flags of otherwise
+    read-only commands (date -s) also disqualify."""
+    if any(c in command for c in "$`'\"\\(){}<"):
+        return None
+    leaves: list[str] = []
+    for seg in re.split(r"[;|\n]+", command):
+        seg = re.sub(r"\d*(?:&>|>>|>|>&|<|<>|>&\d|>&-|<&|<&\d|<&-)\s*/dev/null\b", " ", seg)
+        seg = re.sub(r"\d*>\s*&\s*\d+\b", " ", seg)  # fd dups: 2>&1, >&2
+        seg = re.sub(r"\d*<>\s*", " ", seg)  # open-for-read-write fd: no file touched
+        seg = seg.replace("/dev/null", " ")
+        if re.search(r"[>|&]", seg):
+            return None  # unmodeled redirect/pipe/control char -> unknown
+        tokens = seg.split()
+        while tokens and tokens[0] in _FP_LOOP_KEYWORDS:
+            tokens = tokens[1:]
+        if not tokens:
+            continue  # bare scaffolding (done / fi / then ...)
+        while tokens and (m := _FP_ASSIGN.match(tokens[0])):
+            if m.group(1) in _FP_DANGEROUS_ASSIGN:
+                return None
+            tokens = tokens[1:]
+        while tokens and tokens[0] in ("env", "nice"):
+            tokens = tokens[1:]
+            while tokens and (m := _FP_ASSIGN.match(tokens[0])):
+                if m.group(1) in _FP_DANGEROUS_ASSIGN:
+                    return None
+                tokens = tokens[1:]
+        if not tokens:
+            return None  # assignment or env wrapper with no command
+        head, args = tokens[0], tokens[1:]
+        if head == "date" and any(a in ("-s", "--set") for a in args):
+            return None  # date writes the system clock with -s
+        leaves.append(head)
+    return leaves
+
+
+def _all_leaves_readonly(leaves: list[str] | None) -> bool:
+    """Every leaf head is in the strict read-only allowlist. Extraction already
+    rejected write channels (non-/dev/null redirects, heredocs, dangerous
+    assignments, date -s); an empty/None leaf set is fail-closed."""
+    if not leaves:
+        return False
+    return all(head in _FP_READONLY_LEAVES for head in leaves)
