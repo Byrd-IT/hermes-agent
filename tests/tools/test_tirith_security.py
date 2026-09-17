@@ -857,12 +857,14 @@ class TestCacheWarmRescan:
     @patch("tools.tirith_security._load_security_config")
     def test_artifact_tokens_not_warmed(self, mock_cfg, mock_run):
         # A name that is a plain token of the command text (redirection artifact shape) is
-        # never used to construct a warm command.
+        # never used to construct a warm command, and since t_2550b91f the phantom warn
+        # itself is suppressed warn-only: `npm install werift > foo.txt` warns solely on
+        # the redirect target 'foo.txt', which drops -> allow before any warm phase runs.
         mock_cfg.return_value = dict(self.CFG)
         mock_run.return_value = _mock_run(2, _json_stdout([self._incomplete("foo.txt")], "x"))
         result = check_command_security("npm install werift > foo.txt")
         # The artifact is filtered, no valid packages remain, no warm phase runs.
-        assert result["action"] == "warn"
+        assert result["action"] == "allow"
         assert mock_run.call_count == 1
 
     def test_pkgname_charset_rejects_shell_metachars(self):
