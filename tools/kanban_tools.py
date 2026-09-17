@@ -908,17 +908,7 @@ def _handle_create(args: dict, **kw) -> str:
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
-    # Byrd-IT: work that names the PRODUCTION Hermes install must run in a linked worktree.
-    # A scratch card gets no repo, so the worker reaches into /usr/local/lib/hermes-agent
-    # itself and `git checkout -b`s the checkout every gateway executes (t_86acfa96,
-    # 2026-09-17: production sat on a feature branch for ~5h). Upstream keeps scratch-vs-
-    # worktree advisory in general; this promotes only the one path where scratch is
-    # never right, and only when the creator did not choose explicitly.
-    if workspace_kind is None and workspace_path is None and project_id is None:
-        _prod = "/usr/local/lib/hermes-agent"
-        _text = f"{title}\n{args.get('body') or ''}"
-        if _prod in _text and not re.search(r"\b(read[- ]only|do not (edit|modify|commit)|no code change)\b", _text, re.I):
-            workspace_kind = "worktree"
+    # Production-path -> worktree defaulting lives in kb.create_task so the CLI gets it too.
     idempotency_key = (args.get("idempotency_key") or "").strip() or None
     # Worker-filed cards MUST carry an idempotency key. Without one, every worker that
     # hits the same defect files a fresh card (the same Tirith false-positive landed 5+

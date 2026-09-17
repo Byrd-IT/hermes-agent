@@ -1302,7 +1302,20 @@ def create_task(
         except Exception:
             pass
     if workspace_kind is None:
-        workspace_kind = "scratch"
+        # Byrd-IT: a card that names the PRODUCTION Hermes install gets a linked
+        # worktree, never scratch. Scratch has no repo, so the worker reaches into
+        # /usr/local/lib/hermes-agent and `git checkout -b`s the checkout every
+        # gateway executes (t_86acfa96, 2026-09-17: production on a feature branch
+        # ~5h). Lives here so BOTH create surfaces (CLI + kanban_create tool) get it.
+        # An explicit workspace_kind, workspace_path, or project still wins; cards
+        # that say read-only / do-not-edit stay scratch.
+        _text = f"{title}\n{body or ''}"
+        if (workspace_path is None and project_id is None
+                and "/usr/local/lib/hermes-agent" in _text
+                and not re.search(r"\b(read[- ]only|do not (edit|modify|commit|touch)|no code change)\b", _text, re.I)):
+            workspace_kind = "worktree"
+        else:
+            workspace_kind = "scratch"
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
