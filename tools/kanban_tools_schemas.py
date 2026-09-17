@@ -345,7 +345,7 @@ KANBAN_COMMENT_SCHEMA = _schema(
         )),
         "body": _prop("string", "Markdown-supported comment body."),
     },
-    ["task_id", "body"],
+    ["body"],
 )
 
 KANBAN_ATTACH_SCHEMA = _schema(
