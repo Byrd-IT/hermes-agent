@@ -998,14 +998,11 @@ def _handle_heartbeat(args: dict, **kw) -> str:
 def _handle_comment(args: dict, **kw) -> str:
     """Append a comment to a task's thread."""
     _reject_delegated_child_mutation("kanban_comment")
-    tid = args.get("task_id")
-    if not tid:
-        # A comment writes to the board, so a bare call must stay an error — but
-        # point at kanban_list, not an env var a chat caller cannot set (#91431).
-        raise _Reject(
-            "task_id is required: comments are per-task and this session has no "
-            "dispatcher-assigned task to default to. Discover task ids with "
-            "kanban_list, or pass the task id you mean.")
+    # Default resolution only — NOT _worker_guard: cross-task comments are the
+    # handoff channel between tasks (#19713), so no own-task ownership gate here.
+    # _require_task_id honors the dispatcher-worker default and, for any other
+    # caller, rejects with a message pointing at kanban_list (#91431).
+    tid = _require_task_id(args)
     body = _redact(_require_text(args, "body"))
     # Author comes from the worker's runtime identity (``_persisted_identity``), never
     # caller args: comments are injected into future workers' system prompts, so an
