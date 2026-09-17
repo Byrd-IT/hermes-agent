@@ -11,8 +11,10 @@ import functools
 import json
 import logging
 import os
+import re
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.redact import redact_sensitive_text
@@ -252,6 +254,37 @@ def _ok_landed(kb, conn, tid: str, default_status: str, **extra: Any) -> str:
     landed = kb.get_task(conn, tid)
     return _ok(task_id=tid, run_id=run.id if run else None,
                status=landed.status if landed else default_status, **extra)
+
+
+_REPO_WORK_HINT = re.compile(
+    r"\b(?:branch\s+off|on\s+(?:a\s+)?branch|commit\s+to)\b", re.IGNORECASE)
+
+
+def _scratch_repo_workspace_warning(
+    title: str, body: Optional[str], workspace_kind: Optional[str],
+) -> Optional[str]:
+    """Return guidance when a scratch card asks for branch/commit work.
+
+    This is intentionally advisory: a creator may explicitly choose scratch,
+    and the creation path must never silently promote that choice to worktree.
+    """
+    if workspace_kind != "scratch":
+        return None
+    text = f"{title}\n{body or ''}"
+    repo_path = next((
+        candidate.rstrip(".,;:!?)]}")
+        for candidate in re.findall(r"(?<!\S)(/[^\s]+)", text)
+        if Path(candidate.rstrip(".,;:!?)]}")).is_dir()
+    ), None)
+    if repo_path is None and not _REPO_WORK_HINT.search(text):
+        return None
+    repo_detail = f" {repo_path}" if repo_path else ""
+    return (
+        f"card references git repository{repo_detail} but workspace_kind=scratch — "
+        "scratch workspaces contain no git repo; create with "
+        "workspace_kind='worktree' (and workspace_path=<repo> for a non-default repo) "
+        "if this task needs a branch or commits"
+    )
 
 
 def _redact(value: Any) -> str:
@@ -906,8 +939,9 @@ def _handle_create(args: dict, **kw) -> str:
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
+        warning = _scratch_repo_workspace_warning(title, args.get("body"), landed["workspace_kind"])
         return _ok(task_id=new_tid, **landed, **gate,
-                   subscribed=_maybe_auto_subscribe(conn, new_tid))
+                   subscribed=_maybe_auto_subscribe(conn, new_tid), **({"warning": warning} if warning else {}))
 
 
 def _resolve_notify_target() -> Optional[dict[str, Any]]:

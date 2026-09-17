@@ -516,6 +516,27 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_scratch_with_repo_path_returns_worktree_guidance(worker_env, tmp_path):
+    """A repo-bound scratch card remains scratch but tells its creator why that
+    workspace cannot support the requested branch/commit work."""
+    from tools import kanban_tools as kt
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    result = json.loads(kt._handle_create({
+        "title": "Implement the fix",
+        "body": f"Branch off main in {repo} and commit the change.",
+        "assignee": "peer",
+        "workspace_kind": "scratch",
+    }))
+
+    assert result["ok"] is True
+    assert result["workspace_kind"] == "scratch"
+    assert str(repo) in result["warning"]
+    assert "workspace_kind='worktree'" in result["warning"]
+
+
 @pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])
 @pytest.mark.parametrize("target_scoped", [False, True])
 def test_create_explicit_scratch_ignores_ambient_board_project(
