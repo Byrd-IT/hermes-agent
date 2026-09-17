@@ -291,6 +291,12 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
                 board,
             ))
 
+    def _add_workspaces_root(board: str) -> None:
+        # The configured scratch root (may sit beside a dot-dir home).
+        with contextlib.suppress(OSError):
+            root = _kb.workspaces_root(board=board)
+            roots.append((root.resolve(strict=False), (_lexical_path(root),), board))
+
     override = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
     if override:
         override_root = Path(override).expanduser()
@@ -310,6 +316,7 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
         home = None
     if home is not None:
         _add_root(home, home_real, ("kanban", "workspaces"), _kb.DEFAULT_BOARD)
+        _add_workspaces_root(_kb.DEFAULT_BOARD)
         entries: list[Path] = []
         with contextlib.suppress(OSError):
             entries = list((home / "kanban" / "boards").resolve(strict=False).iterdir())
@@ -319,6 +326,7 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
                     _add_root(
                         home, home_real, ("kanban", "boards", entry.name, "workspaces"), entry.name
                     )
+                    _add_workspaces_root(entry.name)
     for root, lexical_roots, board in roots:
         if p_abs == root:
             continue
