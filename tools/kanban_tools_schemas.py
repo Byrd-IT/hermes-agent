@@ -338,8 +338,9 @@ KANBAN_COMMENT_SCHEMA = _schema(
     ),
     {
         "task_id": _prop("string", (
-                "Task id. Required (may be your own task or "
-                "another's — comment threads are per-task). Outside a "
+                "Task id. Optional for a dispatcher-spawned worker — defaults "
+                "to HERMES_KANBAN_TASK (this worker's own task); required for "
+                "cross-task comments (comment threads are per-task). Outside a "
                 "dispatcher-spawned worker there is no default; use "
                 "kanban_list to discover ids."
         )),
