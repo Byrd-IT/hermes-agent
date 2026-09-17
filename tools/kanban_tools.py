@@ -908,11 +908,28 @@ def _handle_create(args: dict, **kw) -> str:
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
+    idempotency_key = (args.get("idempotency_key") or "").strip() or None
+    # Worker-filed cards MUST carry an idempotency key. Without one, every worker that
+    # hits the same defect files a fresh card (the same Tirith false-positive landed 5+
+    # times under different titles on the Byrd-IT ops board). Humans and the
+    # orchestrator/decomposer are exempt: they create from a conversation, not a retry.
+    if _is_dispatcher_owned_worker() and os.environ.get("HERMES_KANBAN_TASK") and not idempotency_key:
+        _check(False, (
+            "idempotency_key is required for worker-created cards. Use a stable, "
+            "content-derived key that another worker hitting the same problem would also "
+            "produce, e.g. 'tirith-fp-<scanner-rule>' or 'tool-failure-<tool>-<short-cause>'. "
+            "If a card with that key already exists you get its id back and should COMMENT "
+            "on it instead of describing the problem again."))
     with _board(args.get("board")) as (kb, conn):
         from tools.async_delegation import _current_origin_session_id
         self_tid = (os.environ.get("HERMES_KANBAN_TASK")
                     if _is_dispatcher_owned_worker() else None)
         self_task = kb.get_task(conn, self_tid) if self_tid else None
+        pre_existing = None
+        if idempotency_key:
+            pre_existing = conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+                "ORDER BY created_at DESC LIMIT 1", (idempotency_key,)).fetchone()
         # The worker/API runtime may be transient; the owning task's origin is durable.
         session_id = (args.get("session_id") or (self_task.session_id if self_task else None)
                       or _current_origin_session_id() or os.environ.get("HERMES_SESSION_ID"))
@@ -929,13 +946,28 @@ def _handle_create(args: dict, **kw) -> str:
             board=args.get("board"),
             project_source_task_id=project_source_task_id, triage=triage,
             creator_task_id=self_tid,
-            idempotency_key=args.get("idempotency_key"),
+            idempotency_key=idempotency_key,
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
             initial_status=str(args.get("initial_status") or "running"),
             created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
+        if pre_existing is not None and new_tid == pre_existing["id"]:
+            # Dedupe hit: the caller's report is a repeat. Record it on the existing card
+            # so the recurrence is visible, and tell the caller plainly.
+            author = os.environ.get("HERMES_PROFILE") or "worker"
+            note = (f"Duplicate report (idempotency_key={idempotency_key}) from "
+                    f"{author}" + (f" while working {self_tid}" if self_tid else "") +
+                    f": {str(title).strip()}")
+            try:
+                kb.add_comment(conn, new_tid, author, note)
+            except Exception:
+                pass
+            landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
+            return _ok(task_id=new_tid, **landed, deduplicated=True,
+                       note="An open card with this idempotency_key already existed; your "
+                            "report was added as a comment. Do not file it again.")
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}

@@ -434,9 +434,12 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "the body before work starts."
         )),
         "idempotency_key": _prop("string", (
-                "If a non-archived task with this key already "
-                "exists, return that task's id instead of creating "
-                "a duplicate. Useful for retry-safe automation."
+                "REQUIRED when you are a dispatcher-spawned worker (HERMES_KANBAN_TASK set); "
+                "optional for humans/orchestrators. Stable, content-derived key that another "
+                "worker hitting the same problem would also produce, e.g. "
+                "'tirith-fp-<rule>' or 'tool-failure-<tool>-<cause>'. If a non-archived "
+                "task with this key exists, its id is returned, your report is appended as a "
+                "comment, and the response carries deduplicated=true — do not file again."
         )),
         "max_runtime_seconds": _prop("integer", (
                 "Per-task runtime cap. When exceeded, the "
