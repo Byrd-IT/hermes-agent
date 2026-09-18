@@ -318,6 +318,10 @@ DEFAULT_CONFIG = {
         "container_cpu": 1,
         "container_memory": 5120,       # MB (default 5GB)
         "container_disk": 51200,        # MB (default 50GB)
+        # Per-worker systemd scope MemoryMax. "auto" retains the conservative
+        # host-aware bound; an explicit MiB value may raise it, but never beyond
+        # a finite enclosing cgroup memory.max limit.
+        "worker_memory_max_mb": "auto",
         "container_persistent": True,   # Persist filesystem across sessions
         # Docker volume mounts, "host_path:container_path" (docker -v syntax), e.g.
         # ["/home/user/.hermes/cache/documents:/output"]. For gateway MEDIA delivery, write to
