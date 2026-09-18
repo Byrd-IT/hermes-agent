@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 
 import pytest
 
@@ -26,6 +27,17 @@ class TestZeroMatchProbe:
         r = json.loads(search_tool("token_alpha", path=str(proj / "proj"), task_id="t-zm"))
         assert r["total_count"] == 0
         assert "case-insensitive" in r.get("warning", "")
+
+    @pytest.mark.skipif(not shutil.which("rg"), reason="requires ripgrep")
+    def test_leading_dash_pattern_reaches_case_insensitive_probe(self, proj):
+        d = proj / "proj"
+        (d / "flag.py").write_text("--PLAN = 'find_me_value'\n")
+
+        r = json.loads(search_tool("--plan", path=str(d), task_id="t-zm"))
+
+        assert r["total_count"] == 0
+        assert "case-insensitive" in r.get("warning", "")
+        assert "flag.py" in r.get("warning", "")
 
     def test_case_mismatch_hint_names_the_files(self, proj):
         # The probe already ran the -i search; it must hand over the paths,
