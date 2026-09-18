@@ -147,3 +147,54 @@ def test_one_failing_row_does_not_abort_the_sweep(conn):
         for p in (broken, healthy):
             p.kill()
             p.wait()
+
+
+def test_dispatch_reconciles_terminal_task_with_open_run_before_capacity(conn):
+    """A terminal lifecycle row never leaves an open run that consumes capacity.
+
+    This is the durable version of the stale ``done``/``running`` mismatch: the
+    requested task state stays terminal, while the divergent run is closed and
+    the invalid active claim is removed before the dispatcher calculates slots.
+    """
+    tid = kb.create_task(conn, title="terminal divergence", assignee="coder")
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None
+    run_id = claimed.current_run_id
+    conn.execute(
+        "UPDATE tasks SET status='done', current_run_id=?, claim_lock='host:1', "
+        "claim_expires=9999999999, worker_pid=424242 WHERE id=?",
+        (run_id, tid),
+    )
+    conn.commit()
+
+    reconciled = kbd.reconcile_task_run_invariants(conn)
+
+    row = conn.execute(
+        "SELECT status, current_run_id, claim_lock, worker_pid FROM tasks WHERE id=?", (tid,)
+    ).fetchone()
+    run = conn.execute("SELECT outcome, ended_at FROM task_runs WHERE id=?", (run_id,)).fetchone()
+    assert reconciled == [tid]
+    assert dict(row) == {"status": "done", "current_run_id": None, "claim_lock": None, "worker_pid": None}
+    assert run["outcome"] == "reconciled_state_divergence" and run["ended_at"] is not None
+    assert "reconciled_state_divergence" in [
+        event["kind"] for event in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))
+    ]
+
+
+def test_first_auth_guard_becomes_one_actionable_block(conn, monkeypatch):
+    """Auth failures must surface as a typed hold, not an endlessly ready card."""
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    tid = kb.create_task(conn, title="missing auth", assignee="coder")
+    conn.execute("UPDATE tasks SET last_failure_error=? WHERE id=?", ("authentication failed", tid))
+    conn.commit()
+
+    result = kbd.dispatch_once(conn, spawn_fn=lambda *_args: 0)
+
+    row = conn.execute("SELECT status, block_kind FROM tasks WHERE id=?", (tid,)).fetchone()
+    assert result.respawn_guarded == [(tid, "blocker_auth")]
+    assert dict(row) == {"status": "blocked", "block_kind": "capability"}
+    assert [event["kind"] for event in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))].count("blocked") == 1
+    assert kb.unblock_task(conn, tid) is True
+    assert kbd.dispatch_once(conn, spawn_fn=lambda *_args: 0).spawned[0][0] == tid

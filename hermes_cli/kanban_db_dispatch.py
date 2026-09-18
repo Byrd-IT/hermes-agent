@@ -105,6 +105,8 @@ class DispatchResult:
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
     claim bookkeeping, dead/gone worker)."""
+    reconciled_state_divergence: list[str] = field(default_factory=list)
+    """Non-running cards whose leaked open attempts were closed before capacity."""
     reaped_terminal_workers: list[str] = field(default_factory=list)
     """Task ids whose worker outlived its closed run and was terminated by
     :func:`reap_terminal_workers`."""
@@ -472,6 +474,50 @@ def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[s
                 row["id"], row["task_id"], exc_info=True,
             )
     return reaped
+
+
+def reconcile_task_run_invariants(conn: sqlite3.Connection) -> list[str]:
+    """Close open runs that contradict their task's requested lifecycle state.
+
+    A dispatcher crash can leave a terminal/ready/blocked task pointing at an
+    open attempt. Those rows must not leak into capacity or make a later claim
+    inherit a foreign PID. For a non-running task, its lifecycle remains
+    authoritative; only the divergent attempt and active claim fields change.
+    """
+    rows = conn.execute(
+        "SELECT id, status FROM tasks WHERE status != 'running' AND (current_run_id IS NOT NULL "
+        "OR EXISTS (SELECT 1 FROM task_runs r WHERE r.task_id = tasks.id AND r.ended_at IS NULL))"
+    ).fetchall()
+    reconciled: list[str] = []
+    now = int(time.time())
+    for row in rows:
+        task_id = row["id"]
+        with _kb.write_txn(conn):
+            open_runs = conn.execute(
+                "SELECT id FROM task_runs WHERE task_id=? AND ended_at IS NULL", (task_id,)
+            ).fetchall()
+            current = _kb._current_run_id(conn, task_id)
+            if not open_runs and current is None:
+                continue
+            run_ids = [int(run["id"]) for run in open_runs]
+            conn.execute(
+                "UPDATE task_runs SET status='reconciled_state_divergence', "
+                "outcome='reconciled_state_divergence', error=?, ended_at=?, claim_expires=NULL "
+                "WHERE task_id=? AND ended_at IS NULL",
+                (f"task lifecycle is {row['status']!r}, not running", now, task_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET current_run_id=NULL, claim_lock=NULL, claim_expires=NULL, "
+                "worker_pid=NULL, worker_started_at=NULL, last_heartbeat_at=NULL "
+                "WHERE id=? AND status != 'running'",
+                (task_id,),
+            )
+            _kb._append_event(
+                conn, task_id, "reconciled_state_divergence",
+                {"task_status": row["status"], "closed_run_ids": run_ids, "current_run_id": current},
+            )
+            reconciled.append(task_id)
+    return reconciled
 
 
 def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: list[str]) -> None:
@@ -1870,6 +1916,18 @@ def _dispatch_lane_task(
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
+        if guard_reason == "blocker_auth":
+            # A durable credential/authentication failure cannot self-heal by
+            # repeatedly re-spawning the same ready card. Make the first hold
+            # actionable and sticky; explicit unblock clears the stale error
+            # and authorizes exactly one new dispatch attempt.
+            _kb.block_task(
+                conn,
+                task_id,
+                kind="capability",
+                reason="dispatcher detected an authentication or credential blocker; resolve it, then explicitly unblock",
+            )
+            return False
         # Event so ``hermes kanban tail`` shows why the task looks stuck.
         # Honour kanban.default_assignee: when the dispatcher hits an unassigned ready task and an
         # operator-configured fallback exists, persist the assignment and proceed. This removes the
@@ -1979,6 +2037,7 @@ def _run_reclaim_phase(
     board: Optional[str] = None,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
+    result.reconciled_state_divergence = reconcile_task_run_invariants(conn)
     reap_worker_zombies()
     result.reaped_terminal_workers = reap_terminal_workers(conn)
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
