@@ -682,9 +682,11 @@ def _rule_running_liveness_stale(task, events, runs, now, cfg) -> list[Diagnosti
     failures = []
     if heartbeat_stale:
         failures.append(
-            f"no fresh heartbeat for {int(heartbeat_age or 0)}s "
+            f"no fresh heartbeat for {heartbeat_age}s "
             f"(limit {threshold}s)"
         )
+    elif heartbeat_age is None:
+        failures.append("heartbeat timestamp unavailable")
     if worker_identity_matches is False:
         failures.append("recorded worker PID does not match its spawn identity")
     task_id = str(_task_field(task, "id") or "<task_id>")
