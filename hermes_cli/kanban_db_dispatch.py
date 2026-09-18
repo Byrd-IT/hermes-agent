@@ -77,6 +77,9 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
     re.IGNORECASE,
 )
+_RESPAWN_GUARD_CHANGES_REQUESTED_RE = re.compile(
+    r"\bchanges?(?:\s+|_)requested\b", re.IGNORECASE,
+)
 
 
 @dataclass
@@ -1444,12 +1447,38 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    A subsequent review rework signal deliberately reopens the ready task.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    latest_pr_comment = None
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT id, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? "
+        "ORDER BY created_at DESC, id DESC",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            latest_pr_comment = c
+            break
+    if latest_pr_comment:
+        pr_created_at = int(latest_pr_comment["created_at"] or 0)
+        changes_requested = conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ? "
+            "AND outcome = 'changes_requested' AND ended_at >= ? "
+            "UNION ALL "
+            "SELECT 1 FROM task_events WHERE task_id = ? "
+            "AND kind = 'changes_requested' AND created_at >= ? "
+            "LIMIT 1",
+            (task_id, pr_created_at, task_id, pr_created_at),
+        ).fetchone()
+        if not changes_requested:
+            for c in conn.execute(
+                "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+                (task_id, pr_created_at),
+            ).fetchall():
+                if c["body"] and _RESPAWN_GUARD_CHANGES_REQUESTED_RE.search(c["body"]):
+                    changes_requested = True
+                    break
+        if not changes_requested:
             return "active_pr"
 
     return None

@@ -483,6 +483,35 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
+def test_active_pr_guard_allows_ready_task_after_review_requests_changes(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A review rework signal newer than a PR link deliberately reopens work."""
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    pr_comment = "Opened https://github.com/example/repo/pull/123 for review."
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="needs rework", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        kb.add_comment(conn, tid, author="worker", body=pr_comment)
+        assert kb.request_review(
+            conn, tid, summary="PR ready", expected_run_id=claimed.current_run_id,
+        )
+
+        review_claim = kb.claim_review_task(conn, tid)
+        assert review_claim is not None
+        ok, _ = kb.request_changes(
+            conn, tid, reason="Please fix the lifecycle", expected_run_id=review_claim.current_run_id,
+        )
+        assert ok is True
+        assert kb.get_task(conn, tid).status == "ready"
+
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
 def test_dispatch_json_exposes_suppression_reasons(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
