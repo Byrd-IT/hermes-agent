@@ -177,7 +177,7 @@ session-scoped. Assert the GUI session gets the tool **with the env var absent**
 ## Development Environment
 
 ```bash
-source .venv/bin/activate   # or: source venv/bin/activate
+source venv/bin/activate   # .venv does NOT exist on this deployment; the repo ships venv/
 ```
 `scripts/run_tests.sh` probes `.venv`, then `venv`, then `$HOME/.hermes/hermes-agent/venv`
 (worktrees sharing the main checkout's venv).
