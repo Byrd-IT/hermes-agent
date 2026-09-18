@@ -91,11 +91,24 @@ def _stub_uvicorn_run(monkeypatch):
     """Replace uvicorn.Config/Server with no-op fakes so start_server
     returns immediately (rather than blocking on the event loop). Returns the dict
     that will capture the keyword args.
+
+    Also stubs out the real-socket EADDRINUSE probe (``_port_bind_conflict``).
+    These tests hardcode the production dashboard port (9119) for
+    ``host_header_middleware`` assertions; probing a real bind against that
+    port collides with any live ``hermes-dashboard`` service already bound
+    to it on the test host, turning a pure unit test into an environment
+    dependency (SystemExit: 75 / BACKEND_PORT_IN_USE). start_server's own
+    port-conflict behavior is covered separately in
+    tests/hermes_cli/test_serve_port_in_use.py, which exercises
+    ``_port_bind_conflict`` directly against an ephemeral port — no need to
+    re-probe a real socket here.
     """
     import asyncio
     import contextlib
     import uvicorn
     captured: dict = {"kwargs": {}}
+
+    monkeypatch.setattr(web_server, "_port_bind_conflict", lambda host, port: False)
 
     class _FakeConfig:
         loaded = True
