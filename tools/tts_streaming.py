@@ -478,7 +478,7 @@ class XAIStreamer(StreamingTTSProvider):
             raise RuntimeError("No xAI credentials for streaming TTS")
         voice = str(self.section.get("voice_id", DEFAULT_XAI_VOICE_ID)).strip() or DEFAULT_XAI_VOICE_ID
         ws_url = str(self.section.get("streaming_url") or "wss://api.x.ai/v1/tts").strip()
-        async with websockets.connect(ws_url, extra_headers={"Authorization": f"Bearer {api_key}"}) as ws:
+        async with websockets.connect(ws_url, additional_headers={"Authorization": f"Bearer {api_key}"}) as ws:
             await ws.send(_json.dumps({"text": text, "voice_id": voice, "response_format": "pcm"}))
             try:
                 while True:
