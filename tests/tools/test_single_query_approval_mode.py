@@ -359,3 +359,24 @@ class TestSingleQueryModeInteractions:
         with mock_patch("tools.approval_context._get_single_query_approval_mode", return_value="approve"):
             result = check_all_command_guards("rm -rf /", "local")
             assert not result["approved"]
+
+    def test_exact_service_restart_allowlist_is_scoped_in_single_query_deny(self, monkeypatch):
+        """A manual service-restart entry authorizes only its exact command text."""
+        monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+        approval_module.load_permanent({"sudo systemctl restart byrd-it.service"})
+
+        from unittest.mock import patch as mock_patch
+        with (
+            mock_patch("tools.approval_context._get_single_query_approval_mode", return_value="deny"),
+            mock_patch("tools.tirith_security.check_command_security",
+                       return_value={"action": "allow", "findings": [], "summary": ""}),
+        ):
+            allowed = check_all_command_guards("sudo systemctl restart byrd-it.service", "local")
+            denied = check_all_command_guards("sudo systemctl restart unrelated.service", "local")
+
+        assert allowed["approved"] is True
+        assert denied["approved"] is False
