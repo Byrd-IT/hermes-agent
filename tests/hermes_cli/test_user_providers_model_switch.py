@@ -80,10 +80,16 @@ def test_list_authenticated_providers_enumerates_dict_format_models(monkeypatch)
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
     monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
 
+    # Port intentionally NOT the Ollama default (11434): a dict-shaped ``models:`` is metadata,
+    # not an allowlist (``has_explicit_models`` stays False), so section 3 still probes live —
+    # on 11434 that probe hits ``should_use_ollama_native_catalog``'s native ``/api/tags`` path
+    # and bypasses the patched ``fetch_api_models`` entirely, hitting whatever real Ollama
+    # instance happens to be running on the host (#see t_03a026f8).
+    monkeypatch.setattr("hermes_cli.models.fetch_api_models", lambda *_a, **_kw: None)
     user_providers = {
         "local-ollama": {
             "name": "Local Ollama",
-            "api": "http://localhost:11434/v1",
+            "api": "http://localhost:18434/v1",
             "default_model": "minimax-m2.7:cloud",
             "models": {
                 "minimax-m2.7:cloud": {"context_length": 196608},
@@ -534,7 +540,7 @@ def test_section3_probes_no_key_endpoint_with_singular_default_model(monkeypatch
     user_providers = {
         "local-ollama": {
             "name": "Local Ollama",
-            "api": "http://localhost:11434/v1",
+            "api": "http://localhost:18434/v1",
             "default_model": "llama3",
             # No api_key, no models: list — singular default only.
         }
