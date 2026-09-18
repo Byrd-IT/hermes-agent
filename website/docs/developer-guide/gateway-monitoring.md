@@ -75,6 +75,30 @@ Works identically under systemd/launchd/s6 supervision, containers, tmux, or
 a plain `hermes gateway run`: the exporter lives in the gateway process, so
 no sidecar, agent, or collector is required on the host.
 
+### Custom resource attributes
+
+`monitoring.gateway_health_export.resource_attributes` is a free-form map of
+extra OTel resource attributes merged onto every exported span/metric/log —
+useful for a stable label like a profile name so multiple gateways sharing one
+collector are distinguishable without joining on the hashed instance id:
+
+```yaml
+monitoring:
+  gateway_health_export:
+    resource_attributes:
+      profile: task-manager
+      deployment.environment.name: production
+```
+
+Keys must be dotted-lowercase identifiers (`^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){0,4}$`,
+e.g. `profile`, `deployment.environment.name`) and are not a fixed allowlist —
+any key of that shape passes through. `service.name`, `service.instance.id`,
+and `telemetry.scope` are always set by Hermes and cannot be overridden this
+way. Values are still sanitized: bounded to 128 chars of `[A-Za-z0-9._:/-]`
+and rejected if redaction (`agent/monitoring/redaction.py`) would change them
+(so nothing that looks like an email, token, or free-form string egresses) —
+at most 16 custom attributes are kept.
+
 ## Collecting into DataDog
 
 Run a customer-owned OpenTelemetry Collector and forward:

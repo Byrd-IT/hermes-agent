@@ -1948,6 +1948,10 @@ DEFAULT_CONFIG = {
             "export_interval_seconds": 60,
             "logs_export_interval_seconds": 5,
             "resource_attributes": {
+                # Free-form: any dotted-lowercase key (e.g. "profile") passes through
+                # sanitization in agent/monitoring/otlp_exporter.py — not a fixed allowlist.
+                # service.name/service.instance.id/telemetry.scope are always set by Hermes
+                # and cannot be overridden here.
                 "service.name": "hermes-gateway", "deployment.environment.name": "production"
             },
         },

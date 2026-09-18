@@ -104,11 +104,16 @@ def _signal_endpoint(endpoint: str, signal: str) -> str:
     return endpoint
 
 
-_RESOURCE_ATTRIBUTE_KEYS = frozenset({
-    "service.name", "service.namespace", "service.version", "service.instance.id",
-    "deployment.environment.name", "cloud.provider", "cloud.platform", "cloud.region", "telemetry.scope",
-})
 _SAFE_RESOURCE_VALUE = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
+# Dotted lowercase namespaced keys, e.g. "service.name", "deployment.environment.name",
+# "profile" — same shape OTel semantic conventions use. Not a fixed-key allowlist: this is
+# trusted operator config (monitoring.gateway_health_export.resource_attributes), not runtime
+# event data, so any key of this shape is safe to pass through; the sanitization that matters
+# is on the VALUE (charset + redaction round-trip below). service.name/service.instance.id/
+# telemetry.scope are always overwritten by _runtime_resource_attributes after this runs, so an
+# operator can't spoof those.
+_RESOURCE_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){0,4}$")
+_MAX_RESOURCE_ATTRIBUTES = 16
 
 
 def _install_id(config: Dict[str, Any]) -> str:
@@ -120,11 +125,14 @@ def _install_id(config: Dict[str, Any]) -> str:
 
 
 def _safe_resource_attributes(raw: Any) -> Dict[str, str]:
-    """Allowlist bounded resource labels and reject values changed by redaction."""
+    """Sanitize operator-configured resource labels: dotted lowercase keys of bounded depth,
+    values restricted to a safe charset and rejected if redaction would change them."""
     attrs: Dict[str, str] = {}
     for key, value in (raw.items() if isinstance(raw, dict) else ()):
+        if len(attrs) >= _MAX_RESOURCE_ATTRIBUTES:
+            break
         key = str(key)
-        if key not in _RESOURCE_ATTRIBUTE_KEYS or value is None:
+        if value is None or not _RESOURCE_KEY_PATTERN.fullmatch(key):
             continue
         text = str(value)
         if key == "service.instance.id":
