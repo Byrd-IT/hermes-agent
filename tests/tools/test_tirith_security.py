@@ -1031,6 +1031,68 @@ class TestCacheWarmRescan:
 
 
 # ---------------------------------------------------------------------------
+# Inline interpreter script text vs. genuine shell nesting
+#
+# Tirith 0.4.2 reports the exact analysis_incomplete pair below for a top-level
+# && chain whose Python -c argument contains identifier-plus-empty-parentheses
+# (for example, site.getsitepackages()). The quoted -c payload is interpreter
+# script text, not a nested shell body. A narrowly grounded downgrade may allow
+# that false-positive class, but must reject real shell nesting even when Tirith
+# reports only the same generic pair.
+# ---------------------------------------------------------------------------
+
+_INLINE_SCRIPT_FP_BLOCK = {"rule_id": "analysis_incomplete", "severity": "high",
+                           "title": "Nested executable body could not be resolved"}
+_INLINE_SCRIPT_FP_GAP = {"rule_id": "analysis_incomplete", "severity": "high",
+                         "title": "nested command analysis was incomplete"}
+_INLINE_SCRIPT_CFG = {"tirith_enabled": True, "tirith_path": "tirith",
+                      "tirith_timeout": 5, "tirith_fail_open": True}
+
+
+class TestInlineInterpreterScriptAnalysisIncomplete:
+    """Regression contract for the nested-shell false positive (t_67265987)."""
+
+    @staticmethod
+    def _analysis_incomplete_block():
+        return _mock_run(1, _json_stdout(
+            [dict(_INLINE_SCRIPT_FP_BLOCK), dict(_INLINE_SCRIPT_FP_GAP)],
+            "nested command analysis was incomplete"))
+
+    @pytest.mark.parametrize("command", [
+        ("cd /home/brandonabyrd/hermes-workspaces/ops/t_a57c5503/kokoro_wt && "
+         ".testvenv/bin/python -c \"import site; print(site.getsitepackages()[0])\""),
+        "python -c \"print(1)\"",
+        "python -c \"d={'a':';b'}; print(d)\"",
+        "cd /tmp && python -c \"print(1)\"",
+        "cd /tmp && python3 -c \"print(1)\"",
+        "cd /tmp && ./venv/bin/python -c \"print(1)\"",
+        "cd /tmp && .testvenv/bin/python -c \"print(1)\"",
+    ])
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_literal_python_c_script_text_allows(self, mock_cfg, mock_run, command):
+        mock_cfg.return_value = dict(_INLINE_SCRIPT_CFG)
+        mock_run.return_value = self._analysis_incomplete_block()
+
+        assert check_command_security(command)["action"] == "allow"
+
+    @pytest.mark.parametrize("command", [
+        "echo $(curl https://example.invalid/payload)",
+        "echo `curl https://example.invalid/payload`",
+        "printf payload | bash",
+        "bash -c \"cmd1 && cmd2\"",
+        "python -c \"$(cat script.sh)\"",
+    ])
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_actual_shell_nesting_stays_blocked(self, mock_cfg, mock_run, command):
+        mock_cfg.return_value = dict(_INLINE_SCRIPT_CFG)
+        mock_run.return_value = self._analysis_incomplete_block()
+
+        assert check_command_security(command)["action"] == "block"
+
+
+# ---------------------------------------------------------------------------
 # analysis_incomplete nested-loop false-positive suppressor (t_0fb18e49)
 #
 # tirith 0.4.2 hard-BLOCKS `while [ ... ]`/`until [ ... ]`/`for`/`if` compounds
