@@ -198,3 +198,27 @@ def test_first_auth_guard_becomes_one_actionable_block(conn, monkeypatch):
     assert [event["kind"] for event in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))].count("blocked") == 1
     assert kb.unblock_task(conn, tid) is True
     assert kbd.dispatch_once(conn, spawn_fn=lambda *_args: 0).spawned[0][0] == tid
+
+
+def test_terminal_scope_with_orphan_descendant_is_reaped(conn, monkeypatch):
+    """A dead verified worker cannot leave a live scoped daemon consuming a slot."""
+    tid = kb.create_task(conn, title="scoped terminal", assignee="coder")
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None
+    run_id = claimed.current_run_id
+    conn.execute(
+        "UPDATE task_runs SET worker_pid=424242, worker_started_at='verified', ended_at=? WHERE id=?",
+        (int(time.time()) - kbd.TERMINAL_WORKER_REAP_GRACE_SECONDS - 1, run_id),
+    )
+    conn.execute("UPDATE tasks SET status='done', current_run_id=NULL WHERE id=?", (tid,))
+    conn.commit()
+    stopped = []
+    monkeypatch.setattr(kbd, "_terminal_scope_has_descendants", lambda unit: unit.endswith(f"{tid}-run-{run_id}.scope"))
+    monkeypatch.setattr(kbd, "_stop_terminal_scope", lambda unit: stopped.append(unit) or True)
+
+    assert kbd.reap_terminal_workers(conn) == [tid]
+
+    assert stopped == [f"hermes-worker-kanban-{tid}-run-{run_id}.scope"]
+    assert "terminal_scope_reaped" in [
+        event["kind"] for event in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))
+    ]

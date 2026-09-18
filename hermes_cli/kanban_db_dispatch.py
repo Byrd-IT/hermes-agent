@@ -520,6 +520,28 @@ def reconcile_task_run_invariants(conn: sqlite3.Connection) -> list[str]:
     return reconciled
 
 
+def _terminal_scope_name(task_id: str, run_id: int) -> str:
+    return f"hermes-worker-kanban-{task_id}-run-{int(run_id)}.scope"
+
+
+def _terminal_scope_has_descendants(unit_name: str) -> bool:
+    """Whether the worker's transient scope remains active after its parent died."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", unit_name, "--property=ActiveState", "--value"],
+            capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "active"
+
+
+def _stop_terminal_scope(unit_name: str) -> bool:
+    """Use the shared cgroup-safe primitive rather than signalling descendants."""
+    from tools.process_registry import _stop_systemd_unit
+    return _stop_systemd_unit(unit_name)
+
+
 def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: list[str]) -> None:
     pid, fingerprint = int(row["worker_pid"]), row["worker_started_at"]
     if pid == os.getpid() or not str(row["claim_lock"] or "").startswith(host_prefix):
@@ -527,6 +549,10 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
     if fingerprint == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
         return  # unproven identity: never signalled; its evidence is cleared once the pid is gone
     alive = _worker_alive(pid, fingerprint)
+    scope_reaped = False
+    unit_name = _terminal_scope_name(row["task_id"], row["id"])
+    if not alive and _terminal_scope_has_descendants(unit_name):
+        scope_reaped = _stop_terminal_scope(unit_name)
     termination = None
     if alive:
         termination = _terminate_reclaimed_worker(
@@ -544,7 +570,12 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
                 conn, row["task_id"], "terminal_worker_reaped",
                 {"pid": pid, "worker_started_at": fingerprint, **termination}, run_id=row["id"],
             )
-    if alive:
+        if scope_reaped:
+            _kb._append_event(
+                conn, row["task_id"], "terminal_scope_reaped",
+                {"unit": unit_name, "worker_pid": pid, "worker_started_at": fingerprint}, run_id=row["id"],
+            )
+    if alive or scope_reaped:
         reaped.append(row["task_id"])
 
 
