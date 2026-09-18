@@ -113,3 +113,32 @@ def test_watchdog_treats_live_verified_completion_metadata_as_activation_evidenc
         conn.commit()
 
         assert kw.run_watchdog(conn, now=now).new_alerts == []
+
+
+def test_watchdog_routes_canonical_stale_running_liveness_diagnostic(kanban_home):
+    now = 1_000_000
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="safe fixture", assignee="worker")
+        conn.execute(
+            "UPDATE tasks SET status = 'running', started_at = ? WHERE id = ?",
+            (now - 3601, task_id),
+        )
+        conn.commit()
+
+        alerts = kw.run_watchdog(conn, now=now).new_alerts
+
+        assert (task_id, "running_liveness_stale") in {
+            (alert.task_id, alert.kind) for alert in alerts
+        }
+
+
+def test_watchdog_treats_authoritative_verified_completion_state_as_activation_evidence(kanban_home):
+    now = 1_000_000
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn, title="release", assignee="ops", body="deployment-required: publish the release"
+        )
+        conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", (now - 3600, task_id))
+        assert kb.record_completion_state(conn, task_id, "verified", {"proof": "live deployment receipt"})
+
+        assert kw.run_watchdog(conn, now=now).new_alerts == []

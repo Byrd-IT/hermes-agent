@@ -22,9 +22,11 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_diagnostics as diagnostics
 
 # The liveness card owns the implementation of the running-worker diagnostic.
-# Accept both names during its rollout without duplicating process-identity
-# checks here.  This watchdog only routes the diagnostic it is given.
-_RUNNING_WITHOUT_WORKER_KINDS = frozenset({"dead_running", "running_without_live_worker"})
+# Route the canonical rule and legacy names without duplicating process-identity
+# checks here. This watchdog only routes the diagnostic it is given.
+_RUNNING_WITHOUT_WORKER_KINDS = frozenset({
+    "dead_running", "running_liveness_stale", "running_without_live_worker",
+})
 _WATCHED_DIAGNOSTIC_KINDS = frozenset({"stranded_in_ready", "stranded_in_review"}) | _RUNNING_WITHOUT_WORKER_KINDS
 _DEPLOYMENT_MARKERS = ("deployment-required", "deployment required", "requires deployment")
 
@@ -61,7 +63,12 @@ def _deployment_required(task: Any) -> bool:
     return any(marker in text for marker in _DEPLOYMENT_MARKERS)
 
 
-def _activation_verified(events: Iterable[Any]) -> bool:
+def _activation_verified(task: Any, events: Iterable[Any]) -> bool:
+    # W/T/D/V writes the current authoritative evidence label onto the task.
+    # ``record_completion_state`` rejects a verified label without textual
+    # proof, so this is stronger than the legacy completion-event metadata.
+    if str(task["completion_state"] or "").lower() == "verified":
+        return True
     for event in events:
         if event["kind"] != "completed":
             continue
@@ -105,7 +112,7 @@ def _conditions(conn, *, now: int, config: dict) -> list[WatchdogAlert]:
         ):
             if diagnostic.kind in _WATCHED_DIAGNOSTIC_KINDS:
                 found.append(WatchdogAlert(task_id, diagnostic.kind, diagnostic.severity, diagnostic.detail))
-        if task["status"] == "done" and _deployment_required(task) and not _activation_verified(events_by[task_id]):
+        if task["status"] == "done" and _deployment_required(task) and not _activation_verified(task, events_by[task_id]):
             found.append(WatchdogAlert(
                 task_id, "activation_missing", "error",
                 "Deployment-required work is marked done but has no live activation evidence. "
