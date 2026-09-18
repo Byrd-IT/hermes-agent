@@ -2048,8 +2048,13 @@ def _end_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
 ) -> Optional[int]:
-    """Close the active run (``status`` defaults to ``outcome``) and clear
-    ``current_run_id``; None when no run was active (never-claimed task).
+    """Apply the finalization invariant for a lifecycle transition.
+
+    Close the active run (``status`` defaults to ``outcome``), close every
+    additional open attempt as ``reconciled_state_divergence``, and clear
+    ``current_run_id``. This is the single finalization path used by lifecycle
+    transitions, so a ready/blocked/done task cannot commit alongside an open
+    attempt. Returns the active run id, or ``None`` for a never-claimed task.
 
     ``worker_pid`` / ``worker_started_at`` / ``claim_lock`` stay on the closed
     row: they are the only evidence left of the OS process once the task row
@@ -2057,24 +2062,50 @@ def _end_run(
     to end a worker that survived its own terminal transition."""
     now = int(time.time())
     run_id = _current_run_id(conn, task_id)
-    if run_id is None:
-        return None
-    conn.execute(
-        """
-        UPDATE task_runs
-           SET status        = ?,
-               outcome       = ?,
-               summary       = ?,
-               error         = ?,
-               metadata      = ?,
-               ended_at      = ?,
-               claim_expires = NULL
-         WHERE id = ?
-           AND ended_at IS NULL
-        """,
-        (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
-    )
-    conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    open_run_rows = conn.execute(
+        "SELECT id FROM task_runs WHERE task_id = ? AND ended_at IS NULL", (task_id,)
+    ).fetchall()
+    divergent_run_ids = [
+        int(row["id"]) for row in open_run_rows if run_id is None or int(row["id"]) != run_id
+    ]
+    if run_id is not None:
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET status        = ?,
+                   outcome       = ?,
+                   summary       = ?,
+                   error         = ?,
+                   metadata      = ?,
+                   ended_at      = ?,
+                   claim_expires = NULL
+             WHERE id = ?
+               AND ended_at IS NULL
+            """,
+            (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
+        )
+    if divergent_run_ids:
+        placeholders = ", ".join("?" for _ in divergent_run_ids)
+        conn.execute(
+            "UPDATE task_runs SET status = 'reconciled_state_divergence', "
+            "outcome = 'reconciled_state_divergence', "
+            "error = ?, ended_at = ?, claim_expires = NULL "
+            f"WHERE id IN ({placeholders}) AND ended_at IS NULL",
+            (
+                f"finalization for task lifecycle outcome {outcome!r} closed divergent open attempt",
+                now,
+                *divergent_run_ids,
+            ),
+        )
+    if run_id is not None or divergent_run_ids:
+        conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    if divergent_run_ids:
+        _append_event(
+            conn,
+            task_id,
+            "reconciled_state_divergence",
+            {"current_run_id": run_id, "closed_run_ids": divergent_run_ids, "source": "finalization"},
+        )
     return run_id
 
 
@@ -2497,6 +2528,7 @@ def _extend_run_claim(conn: sqlite3.Connection, task_id: str, expires: int) -> O
 
 def release_stale_claims(
     conn: sqlite3.Connection, *, signal_fn=None, failure_limit: Optional[int] = None,
+    stale_timeout_seconds: int = 0, reclaim_defer_max_attempts: int = 3,
 ) -> int:
     """Reclaim ``running`` tasks whose claim expired; returns the count reclaimed.
 
@@ -2528,11 +2560,12 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = _host_prefix()
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
-        "       assignee "
-        "FROM tasks "
-        "WHERE status = 'running' AND claim_expires IS NOT NULL "
-        "  AND claim_expires < ?", (now,),
+        "SELECT t.id, t.claim_lock, t.worker_pid, t.worker_started_at, t.claim_expires, "
+        "       t.last_heartbeat_at, t.assignee, "
+        "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running' AND t.claim_expires IS NOT NULL "
+        "  AND t.claim_expires < ?", (now,),
     ).fetchall()
     for row in stale:
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
@@ -2540,9 +2573,17 @@ def release_stale_claims(
         # Backstop: a heartbeat older than the max-stale threshold means no
         # observable progress — reclaim even if the PID is alive (logic loop).
         heartbeat_stale = hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+        active_started_at = _row_get(row, "active_started_at")
+        missing_heartbeat_stale = (
+            hb is None
+            and stale_timeout_seconds > 0
+            and active_started_at is not None
+            and (now - int(active_started_at)) >= stale_timeout_seconds
+        )
+        progress_stale = heartbeat_stale or missing_heartbeat_stale
         started_at = _row_get(row, "worker_started_at")
         if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at)
-                and not heartbeat_stale):
+                and not progress_stale):
             _extend_live_stale_claim(conn, row, now)
             continue
 
@@ -2554,6 +2595,7 @@ def release_stale_claims(
             _defer_reclaim_for_live_worker(
                 conn, row["id"], row["claim_lock"], now, termination,
                 reason="ttl_expired_worker_alive",
+                max_attempts=reclaim_defer_max_attempts,
             )
             continue
         with write_txn(conn):
@@ -2577,7 +2619,7 @@ def release_stale_claims(
                     "last_heartbeat_at": _opt_int(row["last_heartbeat_at"]),
                     "now": now,
                     "host_local": host_local,
-                    "heartbeat_stale": bool(heartbeat_stale),
+                    "heartbeat_stale": bool(progress_stale),
                     "retry_status": retry_status,
                 },
             )
