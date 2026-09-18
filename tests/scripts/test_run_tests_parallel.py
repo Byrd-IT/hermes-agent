@@ -437,6 +437,42 @@ def test_zero_collected_across_run_fails_and_says_so(tmp_path: Path) -> None:
     assert "NOT a pass" in proc.stdout
 
 
+def test_zero_collected_guard_shows_per_file_evidence(tmp_path: Path) -> None:
+    """When the zero-collected guard fires, the per-file pytest output is shown.
+
+    The guard's message tells the developer to "check the per-file output
+    above for the real error" — so the evidence must actually be there. A
+    file whose tests were ALL deselected exits rc=5, which the runner
+    deliberately converts to a per-file pass (platform-gated files); that
+    conversion also removed it from ``failures``, so the guard's most
+    common trigger (a -k/-m filter matching nothing) printed NO evidence
+    for its own advice to point at.
+    """
+    probe_dir = _make_probe_dir(tmp_path)
+    proc = _run_runner(probe_dir, "-k", "zzz_matches_nothing")
+    assert proc.returncode == 1, proc.stdout
+    # The per-file pytest output (with the deselected count) is present.
+    assert "test_flagprobe.py" in proc.stdout, proc.stdout
+    assert "deselected" in proc.stdout, proc.stdout
+
+
+def test_focused_k_selector_collects_and_runs_the_named_test(tmp_path: Path) -> None:
+    """The focused red/green workflow: file + -k <new test name> runs it.
+
+    Contract for the t_d07d27e8 report (a ``-k`` naming an EXISTING test in
+    an explicitly-passed file must collect and run exactly that test, exit 0
+    — a non-matching selector is the developer's signal to fix the name, and
+    is covered by the two tests above).
+    """
+    probe_dir = _make_probe_dir(tmp_path)
+    proc = _run_runner(probe_dir, "-k", "test_beta")
+    assert proc.returncode == 0, proc.stdout
+    assert "1✓" in proc.stdout or "1 passed" in proc.stdout, proc.stdout
+    assert "2✓" not in proc.stdout, (
+        f"both tests ran — -k filter did not apply:\n{proc.stdout}"
+    )
+
+
 
 
 def test_node_id_selector_runs_the_named_test(tmp_path: Path) -> None:
