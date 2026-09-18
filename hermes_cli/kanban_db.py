@@ -996,6 +996,21 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at INTEGER NOT NULL
 );
 
+-- Bounded state for the detection-only Kanban watchdog.  One row per active
+-- (task, condition); resolved rows are pruned by the watchdog after retention.
+-- This prevents a periodic scan from producing a notification storm.
+CREATE TABLE IF NOT EXISTS kanban_watchdog_alerts (
+    task_id       TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    first_seen_at INTEGER NOT NULL,
+    last_seen_at  INTEGER NOT NULL,
+    notified_at   INTEGER NOT NULL,
+    resolved_at   INTEGER,
+    PRIMARY KEY (task_id, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_kanban_watchdog_resolved
+    ON kanban_watchdog_alerts(resolved_at);
+
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
 -- and structured summary all live on the run, not the task. Multiple
