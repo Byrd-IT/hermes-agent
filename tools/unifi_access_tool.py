@@ -42,7 +42,7 @@ def _load_site_config() -> dict:
     global _config_cache, _config_cache_time
     now = time.time()
     if _config_cache is None or (now - _config_cache_time) > _CONFIG_TTL:
-        with open(SITE_CONFIG_PATH) as f:
+        with open(SITE_CONFIG_PATH, encoding="utf-8") as f:
             _config_cache = yaml.safe_load(f)
         _config_cache_time = now
     return _config_cache

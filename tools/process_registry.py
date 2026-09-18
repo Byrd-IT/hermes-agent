@@ -110,11 +110,18 @@ def _configured_worker_memory_max_bytes() -> Optional[int]:
         return None
     if value == "auto" or value is None:
         return None
-    try:
-        parsed = int(value) * 1024 * 1024
-    except (TypeError, ValueError):
+    if isinstance(value, bool):
         parsed = -1
-    if isinstance(value, bool) or parsed < _MIN_WORKER_MEMORY_MAX_BYTES:
+    elif isinstance(value, int):
+        parsed = value * 1024 * 1024
+    elif isinstance(value, str):
+        try:
+            parsed = int(value) * 1024 * 1024
+        except ValueError:
+            parsed = -1
+    else:
+        parsed = -1
+    if parsed < _MIN_WORKER_MEMORY_MAX_BYTES:
         logger.warning(
             "Ignoring invalid terminal.worker_memory_max_mb=%r; "
             "expected 'auto' or an integer representing at least %d MiB",

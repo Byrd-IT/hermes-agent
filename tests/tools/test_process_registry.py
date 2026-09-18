@@ -2610,7 +2610,7 @@ class TestSystemdCgroupIsolation:
 
         assert pr._worker_memory_max_bytes() == 6 * 1024 * 1024 * 1024
 
-    @pytest.mark.parametrize("value", ["invalid", 0, 63, True])
+    @pytest.mark.parametrize("value", ["invalid", 0, 63, True, 8192.5])
     def test_worker_memory_limit_invalid_config_falls_back_to_auto_bound(self, monkeypatch, value):
         import tools.process_registry as pr
 
