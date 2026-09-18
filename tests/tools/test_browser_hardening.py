@@ -161,7 +161,7 @@ class TestChromiumSandboxArgs:
         process = MagicMock(returncode=0)
         process.wait.return_value = None
 
-        def capture_popen(_argv, env, _socket_dir, _tag):
+        def capture_popen(_argv, env, _socket_dir, _tag, _stdin_payload=None):
             captured_env.update(env)
             return process
 
