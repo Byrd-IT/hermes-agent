@@ -102,6 +102,10 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+# Delivery evidence is deliberately separate from lifecycle status.  A task may
+# be done as an implementation handoff without claiming that code is live; an
+# aggregate request opts into the verified gate explicitly.
+COMPLETION_STATES = {"written", "tested", "deployed", "verified"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
@@ -737,6 +741,10 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    completion_state: Optional[str] = None
+    completion_evidence: Optional[dict] = None
+    requires_live_verification: bool = False
+    verification_owner_id: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -754,6 +762,8 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            completion_evidence=_json_or(g("completion_evidence")),
+            requires_live_verification=bool(g("requires_live_verification")),
         )
 
 
@@ -767,6 +777,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
+    "completion_state", "verification_owner_id",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -955,8 +966,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Originating chat/agent session id when the task was created from
     -- inside an agent loop that propagated ``HERMES_SESSION_ID``. NULL
     -- for tasks created from the CLI, dashboard, or any path that doesn't
-    -- set the env var. Indexed so per-session list queries stay cheap on
-    -- larger boards.
+    -- set the env var, and for an id with no ``sessions`` row in this
+    -- profile's state.db (kanban_create verifies before stamping). Indexed
+    -- so per-session list queries stay cheap on larger boards.
     session_id           TEXT,
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
     -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
@@ -970,7 +982,18 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Explicit, evidence-bearing delivery label. NULL preserves legacy tasks
+    -- and means no label was asserted. It is never derived from a green suite,
+    -- merge, or lifecycle status.
+    completion_state     TEXT,
+    completion_evidence  TEXT,
+    -- Aggregate/request tasks opt in to refusing final completion until an
+    -- explicit verified state is recorded with live proof.
+    requires_live_verification INTEGER NOT NULL DEFAULT 0,
+    -- Organizational request owner, intentionally NOT a task_links parent:
+    -- task_links are prerequisite gates and using them here deadlocks releases.
+    verification_owner_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1082,7 +1105,6 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
@@ -1280,6 +1302,8 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    requires_live_verification: bool = False,
+    verification_owner_id: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1300,11 +1324,17 @@ def create_task(
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
     completion_contract = validate_contract(completion_contract)
+    verification_owner_id = str(verification_owner_id).strip() if verification_owner_id else None
+    parents = tuple(p for p in parents if p)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    if verification_owner_id and verification_owner_id not in parents:
+        owner = get_task(conn, verification_owner_id)
+        if owner is None:
+            raise ValueError(f"verification_owner_id does not exist: {verification_owner_id}")
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
     # A project-scoped board anchors every new task to its project's repo
@@ -1344,7 +1374,6 @@ def create_task(
     project_id, project_obj, project_repo, workspace_kind = _resolve_project_link(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
     )
-    parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
@@ -1392,8 +1421,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        requires_live_verification, verification_owner_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1403,6 +1433,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        1 if requires_live_verification else 0, verification_owner_id,
                     ),
                 )
                 for pid in parents:
@@ -1425,6 +1456,8 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "requires_live_verification": bool(requires_live_verification) or None,
+                        "verification_owner_id": verification_owner_id,
                     },
                 )
                 if task_status == "blocked":
@@ -1598,7 +1631,11 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             )
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
-        _append_event(conn, task_id, "assigned", {"assignee": profile})
+        # ``from`` lets the respawn guard tell a real handoff (dev→closer) from
+        # a no-op re-assign or an unassign, which must not lift ``active_pr``.
+        _append_event(
+            conn, task_id, "assigned", {"assignee": profile, "from": row["assignee"]},
+        )
     # Observer fires AFTER commit so subscribers see durable state.
     notify_task_updated(conn, task_id, ("assignee",))
     return True
@@ -1651,10 +1688,22 @@ def set_reasoning_effort(conn: sqlite3.Connection, task_id: str, effort: Optiona
 
 # --- Links ---
 
-def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+def link_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    expected_child_run_id: Optional[int] = None,
+) -> bool:
     """Link ``parent_id -> child_id``. Returns True when the link gated a
     ``ready`` child back to ``todo`` (the new parent is not yet terminal), so
-    callers can surface the demotion instead of a silent status flip."""
+    callers can surface the demotion instead of a silent status flip.
+
+    A running child cannot normally be gated retroactively, so reject the edge
+    rather than record a dependency that did not constrain the active run. The
+    owning worker may link its own active run for a subsequent dependency-block
+    handoff by supplying its trusted ``expected_child_run_id``.
+    """
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     gated = False
@@ -1662,6 +1711,14 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
         missing = _missing_task_ids(conn, [parent_id, child_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
+        child = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (child_id,),
+        ).fetchone()
+        if child["status"] == "running" and (
+            expected_child_run_id is None
+            or child["current_run_id"] != expected_child_run_id
+        ):
+            raise ValueError(f"cannot link {parent_id} -> {child_id}: child is already running")
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
         _link(conn, parent_id, child_id)
@@ -1915,16 +1972,54 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
         if att is None:
             return None
         conn.execute("DELETE FROM task_attachments WHERE id = ?", (attachment_id,))
+        has_remaining_blob_reference = conn.execute(
+            "SELECT 1 FROM task_attachments WHERE stored_path = ? LIMIT 1",
+            (att.stored_path,),
+        ).fetchone() is not None
         _append_event(conn, att.task_id, "attachment_removed", {"filename": att.filename})
-    with contextlib.suppress(OSError):
-        p = Path(att.stored_path)
-        if p.is_file():
-            p.unlink()
+    if not has_remaining_blob_reference:
+        with contextlib.suppress(OSError):
+            p = Path(att.stored_path)
+            if p.is_file():
+                p.unlink()
     return att
 
 
 def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     return [Event.from_row(r) for r in _task_rows(conn, "task_events", task_id, "created_at ASC, id ASC")]
+
+
+def record_completion_state(
+    conn: sqlite3.Connection, task_id: str, state: str, evidence: dict,
+) -> bool:
+    """Record one explicit delivery label and its proof.
+
+    This is intentionally not a state machine that infers or fills predecessor
+    labels: callers must assert each label they mean.  The immutable event log
+    retains every assertion while ``tasks`` holds only the current label for
+    dashboard/list queries.  ``verified`` is accepted only with a textual proof
+    so an empty metadata object cannot masquerade as live observation.
+    """
+    normalized = str(state or "").strip().lower()
+    if normalized not in COMPLETION_STATES:
+        raise ValueError(f"completion state must be one of {sorted(COMPLETION_STATES)}")
+    if not isinstance(evidence, dict) or not evidence:
+        raise ValueError("completion state evidence must be a non-empty object")
+    proof = evidence.get("proof")
+    if not isinstance(proof, str) or not proof.strip():
+        raise ValueError("completion state evidence requires a non-empty 'proof' string")
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET completion_state = ?, completion_evidence = ? WHERE id = ?",
+            (normalized, json.dumps(evidence, ensure_ascii=False), task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn, task_id, "completion_state_recorded",
+            {"state": normalized, "evidence": evidence},
+        )
+    return True
 
 
 def _insert_comment(
@@ -2186,13 +2281,25 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return whether every direct parent is terminal for dependency gating."""
     return conn.execute(
-        # Check if this task has children that still need the workspace. If any child is not yet
-        # done/archived, defer cleanup so the child can read handoff artifacts from the workspace (#33774).
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE l.child_id = ? "
         "AND p.status NOT IN ('done', 'archived') LIMIT 1", (task_id,),
     ).fetchone() is None
+
+
+def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, str]]:
+    """``(parent_id, status)`` for every direct parent :func:`_parents_satisfied`
+    still counts as open (``done`` / ``archived`` release the child), in id
+    order, so a refusal or a board view can name the blockers instead of the
+    caller guessing. Read-only."""
+    rows = conn.execute(
+        "SELECT p.id, p.status FROM task_links l "
+        "JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') "
+        "ORDER BY p.id", (task_id,),
+    ).fetchall()
+    return [(row["id"], row["status"]) for row in rows]
 
 
 def _claim_and_open_run(
@@ -2730,10 +2837,17 @@ def complete_task(
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
         trow = conn.execute(
-            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
+            "SELECT status, claim_lock, worker_pid, worker_started_at, completion_state, "
+            "       requires_live_verification FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = trow["status"] if trow else None
+        if trow and bool(trow["requires_live_verification"]) and trow["completion_state"] != "verified":
+            _append_event(
+                conn, task_id, "completion_refused_missing_live_verification",
+                {"completion_state": trow["completion_state"]},
+            )
+            return False
         # Refuse to close a LIVE worker's run without proof of ownership
         # (expected_run_id) or an explicit human override (force=True); see
         # _claim_is_live for what "live" means.
@@ -3104,8 +3218,11 @@ def block_task(
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
-    :func:`_route_block`). ``transient`` still counts toward the loop breaker
-    so a forever-flaky task escalates. True on any transition."""
+    :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
+    re-kinded to ``needs_input`` (sticky) so ``recompute_ready`` cannot
+    promote it into a context-free respawn. ``transient`` still counts
+    toward the loop breaker so a forever-flaky task escalates. True on any
+    transition."""
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
     with write_txn(conn):
@@ -3115,10 +3232,22 @@ def block_task(
         if cur_row is None:
             return False
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
+        requested_kind = kind
+        rekind_reason = None
+        # ``dependency`` only waits on incomplete parents. A worker filing that
+        # kind with none open would park in ``todo`` and ``recompute_ready``
+        # would promote+respawn it context-free on the next tick. Re-kind to
+        # ``needs_input`` so it is sticky until a human unblocks.
+        if kind == "dependency" and _parents_satisfied(conn, task_id):
+            kind = "needs_input"
+            rekind_reason = "no_open_parent"
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
         )
+        if rekind_reason:
+            payload["requested_kind"] = requested_kind
+            payload["rekind_reason"] = rekind_reason
         sql = f"""
                 UPDATE tasks
                    SET status        = '{new_status}',
@@ -3156,7 +3285,9 @@ def _route_block(
 
     ``dependency`` never enters the human ``blocked`` bucket: it waits in
     ``todo`` for ``recompute_ready``, so a cron never sees a dependency-wait
-    as something to "unblock". Every other kind counts unblock-loop
+    as something to "unblock". Callers that pass ``dependency`` with no
+    incomplete parent are re-kinded to ``needs_input`` before this runs
+    (see :func:`block_task`). Every other kind counts unblock-loop
     recurrences: block_task only fires from running/ready (AFTER an unblock
     returned the task to the pool), so a stored ``block_kind`` equal to the
     incoming one means blocked -> unblocked -> re-block for the same cause

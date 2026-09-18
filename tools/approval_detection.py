@@ -199,6 +199,44 @@ def detect_hardline_command(command: str) -> tuple:
     return (False, None)
 
 
+# ---- Sudo argv-anchoring fragments ---------------------------------------------------------
+# sudo's own flags can only ever be tokens in sudo's OWN argv, before its subcommand. The
+# earlier `\bsudo\b[^;|&\n]*?\s+...` lazy bridge spanned ACROSS the subcommand, so any later
+# flag cluster containing s/a was misattributed to sudo: `sudo ls -la <path>`, `sudo cp -a`,
+# `sudo rsync -a`, `sudo df -a`, `sudo tar -xaf`, `sudo ss -atp` — including inside ssh-wrapped
+# one-liners (card t_6a479602) — hard-blocked as "combined-flag privilege escalation". The
+# fragments below walk ONLY sudo's argv: env assignments, sudo's value-taking options (value
+# consumed, tried BEFORE valueless so `-p 'pw:'` does not strand the quote), sudo's valueless
+# options, then any other long option. The subcommand token matches none of them and ENDS the
+# walk, so subcommand flags can never match. Input is lowercased before matching, so -S/-s and
+# -A/-a collapse.
+#
+# Residue (accepted, documented): attached-quote option values (`-p'pw:'`), an unknown long
+# option carrying a SEPARATE value, and sudo's `--` end-of-options marker end the walk.
+# Note `sudo ls -S` is deliberately NOT flagged any more: there -S is ls's operand, sudo
+# never sees it (the old bridge flagged it — a false positive by sudo semantics).
+_SUDO_ASSIGNMENT = r'[a-z_][a-z0-9_]*=(?:"[^"]*"|\'[^\']*\'|[^-\s;|&][^\s;|&]*)'
+# Value-taking short options (sudo 1.9 man page): -C -D -g -h -p -R -t -T -U -u; attached
+# value (-ualice) folds into the tail. The optional separate value keeps `-p 'pw:' -S` walkable.
+_SUDO_VALUE_FLAG = r'-[cdghprtuy][a-z0-9]*\b(?:\s+[^-\s;|&][^\s;|&]*)?'
+# Valueless short options: -b -e -i -k -n -v (-E/-P/-B/-K fold in after lowering). The class
+# excludes s/a (those letters ARE the privilege flags) and the tail repeats the same class so
+# combined bare groups (-nv, -kn) walk but `-ns`/`-sa` never get consumed here.
+_SUDO_BARE_FLAG = r'-[beiknv][beiknv]*\b'
+# Valueless long options; --preserve-env takes an optional =list.
+_SUDO_BARE_LONG = r'--(?:login|non-interactive|reset-timestamp|remove-timestamp|edit|background|bell|preserve-groups|preserve-env(?:=[a-z0-9_.,-]*)?|version|validate)\b'
+# Value-taking long options, attached (=V) or separate value.
+_SUDO_VALUE_LONG = r'--(?:user|group|host|prompt|chdir|chroot|close-from|command-timeout|type|other-user|file)\b(?:=\S+|\s+[^-\s;|&][^\s;|&]*)?'
+# Any other long option (forwarded/unknown), attached value only. --st*/--a* are EXCLUDED: they
+# are the gated privilege longs and must terminate the walk so the rules below can match them.
+_SUDO_OTHER_LONG = r'--(?!(?:st|a)[a-z]*\b)[a-z][a-z-]*\b(?:=[^\s;|&]+)?'
+_SUDO_ARGV_PREFIX = (
+    r'\bsudo\b'
+    r'(?:\s+(?:' + _SUDO_ASSIGNMENT + r'|' + _SUDO_VALUE_LONG + r'|' + _SUDO_OTHER_LONG
+    + r'|' + _SUDO_VALUE_FLAG + r'|' + _SUDO_BARE_LONG + r'|' + _SUDO_BARE_FLAG + r'))*'
+    r'\s+'
+)
+
 # ---- Dangerous command patterns -----------------------------------------------------------
 DANGEROUS_PATTERNS = [
     (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
@@ -364,7 +402,9 @@ DANGEROUS_PATTERNS = [
     # sequential match: a for-loop building the label from a list defined EARLIER (`for item in 'ai.hermes...'; do
     # launchctl bootout "$label"`) never has "hermes" after the verb, and that slipped past and restarted 4 gateways
     # with zero approval. Erring broad is correct for an approval gate: an extra prompt is cheap.
-    (r'(?=[\s\S]*\blaunchctl\s+(?:stop|kickstart|bootout|unload|kill|disable|remove)\b)(?=[\s\S]*\b(?:hermes|ai\.hermes)\b)', "stop/restart hermes launchd service (kills running agents)"),
+    # Anchor whole-input lookaheads: re.search otherwise rescans every suffix of
+    # long non-matching commands, holding the GIL and starving Gateway threads.
+    (r'\A(?=[\s\S]*\blaunchctl\s+(?:stop|kickstart|bootout|unload|kill|disable|remove)\b)(?=[\s\S]*\b(?:hermes|ai\.hermes)\b)', "stop/restart hermes launchd service (kills running agents)"),
     (rf'\b(cp|mv|install)\b.*\s{_SYSTEM_CONFIG_PATH}', "copy/move file into system config path"),
     (rf'\b(cp|mv|install)\b.*\s["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_COMMAND_TAIL}', "overwrite project env/config file"),
     # cp/mv/install OVERWRITING a credential/SSH/shell-rc/Hermes file (key implant, login-time
@@ -416,13 +456,19 @@ DANGEROUS_PATTERNS = [
     (r'\bchmod\s+\+x\b.*[;&|]+\s*\./', "chmod +x followed by immediate execution"),
     # Sudo stdin/askpass/shell/list-privs flags. The agent has no TTY, so sudo invocations that succeed
     # non-interactively read the password from stdin (-S) or askpass (-A); -s (shell) and -a (list) are gated as
-    # privilege chains (read SUDO_PASSWORD from .env -> sudo -S -s). Plain `sudo cmd` is TTY-bound and excluded. Input
-    # is lowercased, so S/s and A/a collapse. Lazy `[^;|&\n]*?` allows flag args without spanning separators. sudo
+    # privilege chains (read SUDO_PASSWORD from .env -> sudo -S -s). Plain `sudo cmd` is TTY-bound and excluded.
+    # Long flags are matched directly on the command text; short-flag clusters are anchored to sudo's own
+    # argv by _SUDO_ARGV_PREFIX (combined-flag rule below). sudo
     # resolves unambiguous long-flag prefixes: `--stdin` is the only long option starting with "st", `--askpass` the
     # only one starting with "a".
-    (r'\bsudo\b[^;|&\n]*?\s+(?:-s\b|--st[a-z]*\b|-a\b|--a[a-z]*\b)', "sudo with privilege flag (stdin/askpass/shell/list)"),
-    # Combined short-flag form (-nS, -sa, -las).
-    (r'\bsudo\b[^;|&\n]*?\s+-[a-z]*[sa][a-z]*\b', "sudo with combined-flag privilege escalation"),
+    (r'\bsudo\b[^;|&\n]*?\s+(?:--st[a-z]*\b|--a[a-z]*\b)', "sudo with privilege flag (stdin/askpass/shell/list)"),
+    # Combined short-flag form (-nS, -sa, -las). The flag cluster is anchored to sudo's OWN
+    # argv (see _SUDO_ARGV_PREFIX): only VAR=value assignments and sudo's value-taking short
+    # flags may precede it; the subcommand token ends the walk, so subcommand flags like the
+    # -la in `sudo ls -la <path>` (or cp -a, rsync -a, df -a, tar -xaf, ss -atp) can never be
+    # misattributed to sudo again (card t_6a479602). `--stdin`/`--askpass` are also matched by
+    # the long-flag pattern above; the [sa] class here keeps covering their short forms.
+    (_SUDO_ARGV_PREFIX + r'-[a-z]*[sa][a-z]*\b', "sudo with combined-flag privilege escalation"),
     # Package-manager uninstall commands can remove installed software outside
     # the current project (notably `npm uninstall -g`). Treat their destructive
     # subcommands like other state-removing operations while leaving installs
@@ -1411,12 +1457,29 @@ def _command_detection_variants(command: str):
         yield faithful
     # Quoting/escaping can spell an executable in pieces (r\m, r''m). Keep that deobfuscation scoped
     # to command words so arguments don't false-positive.
-    for word_start, word_end, word in _iter_shell_command_word_spans(normalized):
-        deobfuscated = _deobfuscate_shell_word_for_detection(word)
-        if deobfuscated and deobfuscated != word:
-            variant = normalized[:word_start] + deobfuscated + normalized[word_end:]
-            if fresh(variant):
-                yield variant
+    # One variant with EVERY command word deobfuscated, not one full-length variant per word: a heredoc
+    # body of quoted lines has hundreds of quoted command words, and per-word variants made both
+    # detection passes O(words * len) — minutes of GIL-held regex on a 15 KB command (#113535).
+    # Spans arrive out of order (loop/conditional bodies after their keywords) and can nest (a
+    # backtick word and the command inside it), so apply them sorted; spans overlapping an applied
+    # one wait for the next round, one combined variant per nesting level.
+    pending = sorted(
+        ((word_start, word_end, deobfuscated) for word_start, word_end, word in _iter_shell_command_word_spans(normalized)
+         if (deobfuscated := _deobfuscate_shell_word_for_detection(word)) and deobfuscated != word),
+        key=lambda span: span[:2],
+    )
+    while pending:
+        applied, carry, cursor = [], [], 0
+        for span in pending:
+            if span[0] < cursor:
+                carry.append(span)
+            else:
+                applied.append(span)
+                cursor = span[1]
+        variant = _splice(normalized, applied)
+        if fresh(variant):
+            yield variant
+        pending = carry
 
 
 def _is_verification_artifact_cleanup(command: str) -> bool:

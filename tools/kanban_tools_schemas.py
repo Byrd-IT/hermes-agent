@@ -164,6 +164,30 @@ KANBAN_COMPLETE_SCHEMA = _schema(
     [],
 )
 
+KANBAN_RECORD_COMPLETION_STATE_SCHEMA = _schema(
+    "kanban_record_completion_state",
+    (
+        "Record one explicit delivery state with evidence. Written, tested, "
+        "deployed, and verified are independent labels: this never infers a "
+        "higher label. Evidence must include a non-empty textual proof; use "
+        "verified only for observed live proof."
+    ),
+    {
+        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "state": {
+            "type": "string",
+            "enum": ["written", "tested", "deployed", "verified"],
+            "description": "Explicit delivery label to record; no other label is implied.",
+        },
+        "evidence": {
+            "type": "object",
+            "description": "Evidence object containing a non-empty `proof` string.",
+            "additionalProperties": True,
+        },
+    },
+    ["state", "evidence"],
+)
+
 KANBAN_BLOCK_SCHEMA = _schema(
     "kanban_block",
     (
@@ -190,8 +214,9 @@ KANBAN_BLOCK_SCHEMA = _schema(
             "enum": ["dependency", "needs_input", "capability", "transient"],
             "description": (
                 "Why you're blocked. 'dependency' waits in todo and "
-                "resumes automatically; the others surface to a human. "
-                "Omit only if none apply."
+                "resumes automatically when an incomplete parent finishes; "
+                "if no parent is open it is recorded as needs_input instead. "
+                "The others surface to a human. Omit only if none apply."
             ),
         },
     },
@@ -484,6 +509,13 @@ KANBAN_CREATE_SCHEMA = _schema(
             "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
             "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr."
         )),
+        "requires_live_verification": _prop("boolean", (
+            "Keep this aggregate/request task open until an explicit verified state with live proof is recorded. "
+            "Tests and merges never satisfy this gate implicitly."
+        )),
+        "verification_owner_id": _prop("string", (
+            "Optional task id of the organizational verification owner. This is not a prerequisite parent edge."
+        )),
         "goal_max_turns": _prop("integer", (
                 "Turn budget for goal_mode workers. Caps how many "
                 "continuation turns the worker may take before the task "
@@ -527,7 +559,9 @@ KANBAN_LINK_SCHEMA = _schema(
     (
         "Add a parent→child dependency edge after both tasks already "
         "exist. The child won't promote to 'ready' until all parents "
-        "are 'done'. Cycles and self-links are rejected."
+        "are 'done'. Cycles and self-links are rejected. A running child "
+        "is rejected unless the active owning worker is linking its own "
+        "card for a dependency handoff."
     ),
     {
         "parent_id": {"type": "string", "description": "Parent task id."},

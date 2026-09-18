@@ -314,7 +314,9 @@ class SessionMessagesMixin:
         delegation_id = metadata.get("delegation_id")
         if not delegation_id:
             raise ValueError("Delegation delivery requires a stable delegation_id")
-        msg = {"content": content, "display_kind": "async_delegation_complete", "display_metadata": metadata}
+        msg = {"content": content,
+               "display_kind": "hidden" if metadata.get("presentation_suppressed") else "async_delegation_complete",
+               "display_metadata": metadata}
         params = self._message_row_params(session_id, "user", msg, None, time.time(), keep_reasoning=True)
 
         def _do(conn):
@@ -324,7 +326,7 @@ class SessionMessagesMixin:
                     SELECT s.parent_session_id FROM sessions s JOIN lineage l ON s.id = l.id
                     JOIN sessions p ON p.id = s.parent_session_id WHERE p.end_reason = 'compression'
                 ) SELECT m.id FROM messages m JOIN lineage l ON m.session_id = l.id
-                WHERE m.display_kind = 'async_delegation_complete'
+                WHERE m.display_kind IN ('async_delegation_complete', 'hidden')
                 AND json_extract(m.display_metadata, '$.delegation_id') = ?
                 AND coalesce(json_extract(m.display_metadata, '$.delivery_notice'), '') = ? LIMIT 1""",
                 (session_id, delegation_id, metadata.get("delivery_notice", ""))).fetchone()
@@ -681,6 +683,17 @@ class SessionMessagesMixin:
             "UPDATE messages SET api_content = ? WHERE id = ? AND session_id = ? "
             "AND role = 'user' AND active = 1 AND content IS ?",
             (_scrub_surrogates(api_content), row_id, session_id, self._encode_content(content)))
+
+    def set_user_message_content(self, session_id: str, row_id: int, content: Any) -> int:
+        """Rewrite the content of ONE known active user row. Used when a user turn was written at submit
+        time (before the agent ran) and the turn prologue then rewrote the prompt it persists (@-file
+        expansion, native image parts): the early row must show what the transcript will replay, not the
+        raw keystrokes, and the turn must not append a second row for the same input."""
+        if not session_id or isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0:
+            return 0
+        return self._write_rowcount(
+            "UPDATE messages SET content = ? WHERE id = ? AND session_id = ? AND role = 'user' AND active = 1",
+            (self._encode_content(content), row_id, session_id))
 
     def _display_dedupe_key(self, row) -> Tuple[Any, ...]:
         """Historical display identity, including normalized live content from user handoff carriers."""
@@ -1281,10 +1294,11 @@ class SessionMessagesMixin:
             "SELECT 1 FROM messages WHERE session_id = ? AND platform_message_id = ? LIMIT 1",
             (session_id, platform_message_id)) is not None
 
-    def _is_explicit_fork_child_row(self, session: Dict[str, Any]) -> bool:
-        """True when *session* is a branch, delegate, or tool child of its parent. Markers only count when they
-        point at ``parent_session_id``: compression copies ``model_config`` onto the continuation, so
-        presence-only matching would misclassify it (same binding as ``_NON_CONTINUATION_CHILD_FILTER_SQL``)."""
+    def _is_explicit_fork_child_row(self, session: Dict[str, Any], *, include_reset: bool = False) -> bool:
+        """True when *session* is a branch, delegate, or tool child of its parent (``include_reset``: also a
+        reset fork). Markers only count when they point at ``parent_session_id``: compression copies
+        ``model_config`` onto the continuation, so presence-only matching would misclassify it (same binding
+        as ``_NON_CONTINUATION_CHILD_FILTER_SQL``)."""
         if session.get("source") == "tool":
             return True
         cfg = session.get("model_config")
@@ -1296,6 +1310,8 @@ class SessionMessagesMixin:
         if not isinstance(cfg, dict):
             return False
         markers = (cfg.get("_branched_from"), cfg.get("_delegate_from"))
+        if include_reset:
+            markers += (cfg.get("_reset_from"),)
         parent_id = session.get("parent_session_id")
         return parent_id in markers if parent_id else any(m is not None for m in markers)
 

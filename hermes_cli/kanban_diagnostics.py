@@ -533,6 +533,40 @@ def _rule_review_dependency_deadlock(task, events, runs, now, cfg) -> list[Diagn
     )]
 
 
+def _rule_running_with_open_parents(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A ``running`` card with a direct parent that is not ``done``/``archived``:
+    the dependency gate is not holding it (the parent reopened mid-run, or the
+    edge predates the running-child refusal) and ``kanban_complete`` will be
+    refused until the parents finish. Graph-aware; mutates nothing."""
+    if _task_field(task, "status") != "running":
+        return []
+    graph = cfg.get("_graph")
+    if not isinstance(graph, dict):
+        return []
+    open_parents = [
+        parent for parent in (graph.get("parents") or [])
+        if isinstance(parent, dict) and parent.get("id")
+        and parent.get("status") not in ("done", "archived")
+    ]
+    if not open_parents:
+        return []
+    task_id = str(_task_field(task, "id") or "")
+    parent_ids = [str(parent["id"]) for parent in open_parents]
+    seen_at = int(_task_field(task, "started_at", default=0) or 0) or now
+    return [Diagnostic(
+        kind="running_with_open_parents", severity="warning",
+        title=f"Running while {len(parent_ids)} parent(s) are not done",
+        detail="This card is running concurrently with a parent it declares a dependency on, so the "
+               "parent's work is not serialised ahead of it and completion will be refused until every "
+               "parent is done or archived. Finish the parent, or unlink the edge if it was never meant "
+               "to gate this run.",
+        actions=[_cli_hint("Unlink the parent that should not gate this run",
+                           f"hermes kanban unlink {parent_ids[0]} {task_id}")],
+        first_seen_at=seen_at, last_seen_at=now, count=len(parent_ids),
+        data={"open_parents": [{"id": p["id"], "status": p.get("status")} for p in open_parents]},
+    )]
+
+
 def _rule_stuck_in_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Blocked for >= cfg["blocked_stale_hours"] (default 24) with no comment
     or unblock since the last ``blocked`` event."""
@@ -618,6 +652,102 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
         last_seen_at=int(last_cycle_blocked_ts) if last_cycle_blocked_ts else int(now),
         count=cycles,
         data={"cycles": cycles, "window_seconds": int(window_seconds)},
+    )]
+
+
+# The dispatcher treats a missing/stale heartbeat as no observable worker progress
+# after one hour. Keep the diagnostic threshold identical so CLI/dashboard status
+# never calls a record healthy that the next dispatch tick will reclaim.
+_RUNNING_LIVENESS_HEARTBEAT_GAP_SECONDS = 3600
+
+
+def _rule_running_liveness_stale(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Report a ``running`` record that is not evidence of a live worker.
+
+    A local worker PID is evidence only when its spawn fingerprint still
+    matches.  A child left behind by a worker (such as a test HTTP server) is
+    never consulted: it has no recorded worker PID/fingerprint.  Independently,
+    an old or absent heartbeat means no observable task progress even when the
+    recorded process still exists.  Remote claims do not probe a host-local PID
+    number; their heartbeat is still evaluated.
+    """
+    if _task_field(task, "status") != "running":
+        return []
+
+    threshold = _positive_int(
+        cfg.get("running_liveness_heartbeat_seconds"),
+        _RUNNING_LIVENESS_HEARTBEAT_GAP_SECONDS,
+    )
+    started_at = _task_field(task, "started_at")
+    last_heartbeat_at = _task_field(task, "last_heartbeat_at")
+    heartbeat_age = None
+    if last_heartbeat_at is not None:
+        try:
+            heartbeat_age = max(0, now - int(last_heartbeat_at))
+        except (TypeError, ValueError):
+            heartbeat_age = threshold
+    elif started_at is not None:
+        try:
+            heartbeat_age = max(0, now - int(started_at))
+        except (TypeError, ValueError):
+            heartbeat_age = threshold
+    heartbeat_stale = heartbeat_age is not None and heartbeat_age >= threshold
+
+    pid = _task_field(task, "worker_pid")
+    fingerprint = _task_field(task, "worker_started_at")
+    claim_lock = str(_task_field(task, "claim_lock") or "")
+    worker_identity_matches = None
+    try:
+        from hermes_cli import kanban_db as kb
+        local_claim = claim_lock.startswith(kb._host_prefix())
+    except Exception:
+        local_claim = False
+    if local_claim and pid:
+        try:
+            from hermes_cli import kanban_db_dispatch as kbd
+            worker_identity_matches = bool(kbd._worker_alive(int(pid), fingerprint))
+        except Exception:
+            # Diagnostics must not fail closed because /proc is unreadable.
+            worker_identity_matches = None
+
+    if not heartbeat_stale and worker_identity_matches is not False:
+        return []
+
+    failures = []
+    if heartbeat_stale:
+        failures.append(
+            f"no fresh heartbeat for {int(heartbeat_age or 0)}s "
+            f"(limit {threshold}s)"
+        )
+    if worker_identity_matches is False:
+        failures.append("recorded worker PID does not match its spawn identity")
+    task_id = str(_task_field(task, "id") or "<task_id>")
+    return [Diagnostic(
+        kind="running_liveness_stale",
+        severity="error",
+        title="Running record lacks live worker evidence",
+        detail=(
+            "This task must not be treated as actively running: "
+            + "; ".join(failures)
+            + ". A surviving child/test server is not task-worker evidence. "
+              "Inspect the run and reclaim only after confirming the worker state."
+        ),
+        actions=[
+            _cli_hint(f"Inspect task: hermes kanban show {task_id}", f"hermes kanban show {task_id}",
+                      suggested=True),
+            DiagnosticAction(kind="reclaim", label="Reclaim task", payload={}),
+        ],
+        first_seen_at=now,
+        last_seen_at=now,
+        count=1,
+        run_id=_task_field(task, "current_run_id"),
+        data={
+            "worker_pid": pid,
+            "worker_identity_matches": worker_identity_matches,
+            "heartbeat_stale": heartbeat_stale,
+            "heartbeat_age_seconds": heartbeat_age,
+            "heartbeat_limit_seconds": threshold,
+        },
     )]
 
 
@@ -725,8 +855,10 @@ _RULES: list[RuleFn] = [
     _rule_repeated_failures,
     _rule_repeated_crashes,
     _rule_review_dependency_deadlock,
+    _rule_running_with_open_parents,
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
+    _rule_running_liveness_stale,
     _rule_stranded_in_ready,
     _rule_stranded_in_review,
 ]
@@ -829,6 +961,7 @@ DIAGNOSTIC_KINDS = (
     "review_dependency_deadlock",
     "stuck_in_blocked",
     "block_unblock_cycling",
+    "running_liveness_stale",
     "stranded_in_ready",
     "stranded_in_review",
 )

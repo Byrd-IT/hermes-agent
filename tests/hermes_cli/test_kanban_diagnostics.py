@@ -82,6 +82,19 @@ def _run(outcome="completed", run_id=1, error=None):
 
 
 
+def test_running_with_open_parents_fires_only_while_running():
+    """A running card whose parent is not terminal is flagged; the same graph
+    on a ready/todo card (the gate is holding it) and a done parent are not."""
+    graph = {"parents": [{"id": "t_parent", "title": "p", "status": "todo"}], "children": []}
+    diags = kd.compute_task_diagnostics(_task(status="running", started_at=100), [], [], graph=graph)
+    assert [d.kind for d in diags] == ["running_with_open_parents"]
+    assert diags[0].data["open_parents"] == [{"id": "t_parent", "status": "todo"}]
+    assert "hermes kanban unlink t_parent t_demo00" in diags[0].actions[0].payload["command"]
+    assert kd.compute_task_diagnostics(_task(status="todo"), [], [], graph=graph) == []
+    done_graph = {"parents": [{"id": "t_parent", "title": "p", "status": "done"}], "children": []}
+    assert kd.compute_task_diagnostics(_task(status="running"), [], [], graph=done_graph) == []
+
+
 def test_stuck_in_blocked_fires_past_threshold():
     now = int(time.time())
     task = _task(status="blocked")
@@ -199,6 +212,40 @@ def test_stranded_in_ready_fires_when_age_exceeds_threshold():
     assert stranded[0].data["assignee"] == "demo"
 
 
+# ---------------------------------------------------------------------------
+# truthful running liveness
+# ---------------------------------------------------------------------------
+
+
+def test_running_diagnostic_rejects_stale_heartbeat_and_foreign_pid(monkeypatch):
+    """A running row is not live merely because its stale PID now exists.
+
+    This models the two production failures safely: an orphaned child process
+    survives after its worker exits, and a recycled PID belongs to a stranger.
+    The diagnostic must surface both stale heartbeat and mismatched identity.
+    """
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    now = 100_000
+    monkeypatch.setattr(kbd, "_worker_alive", lambda pid, fingerprint: False)
+    task = _task(
+        status="running",
+        claim_lock=f"{kb._host_prefix()}123",
+        worker_pid=4242,
+        worker_started_at="old-boot|10",
+        started_at=now - 2 * 3600,
+        last_heartbeat_at=now - 3601,
+    )
+
+    diags = kd.compute_task_diagnostics(task, [], [], now=now)
+    liveness = [d for d in diags if d.kind == "running_liveness_stale"]
+
+    assert len(liveness) == 1
+    assert liveness[0].severity == "error"
+    assert liveness[0].data["heartbeat_stale"] is True
+    assert liveness[0].data["worker_identity_matches"] is False
+    assert "heartbeat" in liveness[0].detail.lower()
+    assert "identity" in liveness[0].detail.lower()
 
 
 # ---------------------------------------------------------------------------
