@@ -2528,6 +2528,7 @@ def _extend_run_claim(conn: sqlite3.Connection, task_id: str, expires: int) -> O
 
 def release_stale_claims(
     conn: sqlite3.Connection, *, signal_fn=None, failure_limit: Optional[int] = None,
+    stale_timeout_seconds: int = 0, reclaim_defer_max_attempts: int = 3,
 ) -> int:
     """Reclaim ``running`` tasks whose claim expired; returns the count reclaimed.
 
@@ -2559,11 +2560,12 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = _host_prefix()
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
-        "       assignee "
-        "FROM tasks "
-        "WHERE status = 'running' AND claim_expires IS NOT NULL "
-        "  AND claim_expires < ?", (now,),
+        "SELECT t.id, t.claim_lock, t.worker_pid, t.worker_started_at, t.claim_expires, "
+        "       t.last_heartbeat_at, t.assignee, "
+        "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running' AND t.claim_expires IS NOT NULL "
+        "  AND t.claim_expires < ?", (now,),
     ).fetchall()
     for row in stale:
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
@@ -2571,9 +2573,17 @@ def release_stale_claims(
         # Backstop: a heartbeat older than the max-stale threshold means no
         # observable progress — reclaim even if the PID is alive (logic loop).
         heartbeat_stale = hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+        active_started_at = _row_get(row, "active_started_at")
+        missing_heartbeat_stale = (
+            hb is None
+            and stale_timeout_seconds > 0
+            and active_started_at is not None
+            and (now - int(active_started_at)) >= stale_timeout_seconds
+        )
+        progress_stale = heartbeat_stale or missing_heartbeat_stale
         started_at = _row_get(row, "worker_started_at")
         if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at)
-                and not heartbeat_stale):
+                and not progress_stale):
             _extend_live_stale_claim(conn, row, now)
             continue
 
@@ -2585,6 +2595,7 @@ def release_stale_claims(
             _defer_reclaim_for_live_worker(
                 conn, row["id"], row["claim_lock"], now, termination,
                 reason="ttl_expired_worker_alive",
+                max_attempts=reclaim_defer_max_attempts,
             )
             continue
         with write_txn(conn):
@@ -2608,7 +2619,7 @@ def release_stale_claims(
                     "last_heartbeat_at": _opt_int(row["last_heartbeat_at"]),
                     "now": now,
                     "host_local": host_local,
-                    "heartbeat_stale": bool(heartbeat_stale),
+                    "heartbeat_stale": bool(progress_stale),
                     "retry_status": retry_status,
                 },
             )

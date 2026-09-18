@@ -781,6 +781,7 @@ def test_review_dispatch_honors_global_and_per_profile_caps(
         running_id = kb.create_task(conn, title="already running", assignee="builder")
         running = kb.claim_task(conn, running_id)
         assert running is not None
+        kbd._set_worker_pid(conn, running_id, os.getpid())
 
         review_ids: list[str] = []
         for title in ("review one", "review two"):
