@@ -2048,8 +2048,13 @@ def _end_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
 ) -> Optional[int]:
-    """Close the active run (``status`` defaults to ``outcome``) and clear
-    ``current_run_id``; None when no run was active (never-claimed task).
+    """Apply the finalization invariant for a lifecycle transition.
+
+    Close the active run (``status`` defaults to ``outcome``), close every
+    additional open attempt as ``reconciled_state_divergence``, and clear
+    ``current_run_id``. This is the single finalization path used by lifecycle
+    transitions, so a ready/blocked/done task cannot commit alongside an open
+    attempt. Returns the active run id, or ``None`` for a never-claimed task.
 
     ``worker_pid`` / ``worker_started_at`` / ``claim_lock`` stay on the closed
     row: they are the only evidence left of the OS process once the task row
@@ -2057,24 +2062,50 @@ def _end_run(
     to end a worker that survived its own terminal transition."""
     now = int(time.time())
     run_id = _current_run_id(conn, task_id)
-    if run_id is None:
-        return None
-    conn.execute(
-        """
-        UPDATE task_runs
-           SET status        = ?,
-               outcome       = ?,
-               summary       = ?,
-               error         = ?,
-               metadata      = ?,
-               ended_at      = ?,
-               claim_expires = NULL
-         WHERE id = ?
-           AND ended_at IS NULL
-        """,
-        (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
-    )
-    conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    open_run_rows = conn.execute(
+        "SELECT id FROM task_runs WHERE task_id = ? AND ended_at IS NULL", (task_id,)
+    ).fetchall()
+    divergent_run_ids = [
+        int(row["id"]) for row in open_run_rows if run_id is None or int(row["id"]) != run_id
+    ]
+    if run_id is not None:
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET status        = ?,
+                   outcome       = ?,
+                   summary       = ?,
+                   error         = ?,
+                   metadata      = ?,
+                   ended_at      = ?,
+                   claim_expires = NULL
+             WHERE id = ?
+               AND ended_at IS NULL
+            """,
+            (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
+        )
+    if divergent_run_ids:
+        placeholders = ", ".join("?" for _ in divergent_run_ids)
+        conn.execute(
+            "UPDATE task_runs SET status = 'reconciled_state_divergence', "
+            "outcome = 'reconciled_state_divergence', "
+            "error = ?, ended_at = ?, claim_expires = NULL "
+            f"WHERE id IN ({placeholders}) AND ended_at IS NULL",
+            (
+                f"finalization for task lifecycle outcome {outcome!r} closed divergent open attempt",
+                now,
+                *divergent_run_ids,
+            ),
+        )
+    if run_id is not None or divergent_run_ids:
+        conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    if divergent_run_ids:
+        _append_event(
+            conn,
+            task_id,
+            "reconciled_state_divergence",
+            {"current_run_id": run_id, "closed_run_ids": divergent_run_ids, "source": "finalization"},
+        )
     return run_id
 
 

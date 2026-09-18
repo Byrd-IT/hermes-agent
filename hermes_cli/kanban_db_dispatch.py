@@ -106,6 +106,8 @@ class DispatchResult:
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
     claim bookkeeping, dead/gone worker)."""
+    reconciled_state_divergence: list[str] = field(default_factory=list)
+    """Tasks whose lifecycle/run state was repaired before capacity calculation."""
     reaped_terminal_workers: list[str] = field(default_factory=list)
     """Task ids whose worker outlived its closed run and was terminated by
     :func:`reap_terminal_workers`."""
@@ -497,6 +499,80 @@ def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[s
                 row["id"], row["task_id"], exc_info=True,
             )
     return reaped
+
+
+def reconcile_task_run_invariants(conn: sqlite3.Connection) -> list[str]:
+    """Repair task/run divergence before a dispatcher calculates capacity.
+
+    A non-running task cannot retain an open attempt. A running task can retain
+    exactly one open ``running`` attempt, and ``current_run_id`` must reference
+    it. Non-running rows retain their requested lifecycle state; a malformed
+    running row returns to ``ready`` because it has no trustworthy attempt.
+
+    The candidate scan is read-only. Each decision re-reads the task inside its
+    write transaction because lifecycle actions do not share the dispatch tick
+    lock and may complete a task between scan and repair.
+    """
+    candidate_ids = [
+        row["id"]
+        for row in conn.execute(
+            "SELECT id FROM tasks WHERE (status = 'running' AND current_run_id IS NULL) "
+            "OR current_run_id IS NOT NULL "
+            "OR EXISTS (SELECT 1 FROM task_runs r "
+            "           WHERE r.task_id = tasks.id AND r.ended_at IS NULL)"
+        ).fetchall()
+    ]
+    reconciled: list[str] = []
+    now = int(time.time())
+    for task_id in candidate_ids:
+        with _kb.write_txn(conn):
+            task = conn.execute(
+                "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if task is None:
+                continue
+            open_runs = conn.execute(
+                "SELECT id, status FROM task_runs WHERE task_id = ? AND ended_at IS NULL",
+                (task_id,),
+            ).fetchall()
+            current_run_id = _kb._current_run_id(conn, task_id)
+            valid_running_attempt = (
+                task["status"] == "running"
+                and len(open_runs) == 1
+                and current_run_id == int(open_runs[0]["id"])
+                and open_runs[0]["status"] == "running"
+            )
+            if valid_running_attempt:
+                continue
+
+            closed_run_ids = [int(run["id"]) for run in open_runs]
+            if closed_run_ids:
+                conn.execute(
+                    "UPDATE task_runs SET status = 'reconciled_state_divergence', "
+                    "outcome = 'reconciled_state_divergence', error = ?, ended_at = ?, "
+                    "claim_expires = NULL WHERE task_id = ? AND ended_at IS NULL",
+                    (f"task lifecycle is {task['status']!r}, not a valid running attempt", now, task_id),
+                )
+            landing_status = "ready" if task["status"] == "running" else task["status"]
+            conn.execute(
+                "UPDATE tasks SET status = ?, current_run_id = NULL, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+                "last_heartbeat_at = NULL WHERE id = ?",
+                (landing_status, task_id),
+            )
+            _kb._append_event(
+                conn,
+                task_id,
+                "reconciled_state_divergence",
+                {
+                    "task_status": task["status"],
+                    "landing_status": landing_status,
+                    "closed_run_ids": closed_run_ids,
+                    "current_run_id": current_run_id,
+                },
+            )
+            reconciled.append(task_id)
+    return reconciled
 
 
 def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: list[str]) -> None:
@@ -2066,6 +2142,7 @@ def _run_reclaim_phase(
     board: Optional[str] = None,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
+    result.reconciled_state_divergence = reconcile_task_run_invariants(conn)
     reap_worker_zombies()
     result.reaped_terminal_workers = reap_terminal_workers(conn)
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
