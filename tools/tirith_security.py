@@ -541,9 +541,11 @@ def check_command_security(command: str) -> dict:
     action, findings, summary = outcome
     if action == "allow":
         _crash_count = 0  # successful execution resets the circuit breaker
-    # .app is a legitimate gTLD: a warn consisting solely of lookalike_tld findings for .app is a
-    # known false positive and is downgraded to allow. Any other finding keeps the warn.
-    if action == "warn" and findings and all(_is_app_tld_finding(f) for f in findings):
+    # .app and .dev are legitimate gTLDs (Google-operated, and .dev hosts well-known
+    # legitimate services like osv.dev, web.dev, deno.dev): a warn consisting solely of
+    # lookalike_tld findings for these TLDs is a known false positive and is downgraded
+    # to allow. Any other finding keeps the warn.
+    if action == "warn" and findings and all(_is_lookalike_tld_fp_finding(f) for f in findings):
         return _verdict("allow")
     # Redirection tokens and package-manager flag operands ("2>&1", the value of
     # --index-strategy) that tirith mistook for package names produce analysis_incomplete
@@ -586,7 +588,7 @@ def check_command_security(command: str) -> dict:
         if (rescan := _rescan_after_cache_warm(command, tirith_path, timeout, real)) is not None:
             rescan_action, rescan_findings, rescan_summary = rescan
             if rescan_action == "warn" and rescan_findings:
-                rescan_action, rescan_findings = _suppress_app_tld_false_positives(
+                rescan_action, rescan_findings = _suppress_lookalike_tld_false_positives(
                     rescan_action, rescan_findings)
                 rescan_action, rescan_findings = _suppress_phantom_package_findings(
                     command, rescan_action, rescan_findings)
@@ -776,13 +778,13 @@ def _rescan_after_cache_warm(command: str, tirith_path: str, timeout: int,
     return _tirith_check(tirith_path, timeout, command)
 
 
-def _suppress_app_tld_false_positives(action: str, findings: list) -> tuple[str, list]:
-    """Drop .app lookalike_tld findings from a warn; everything dropped -> allow, a partial
+def _suppress_lookalike_tld_false_positives(action: str, findings: list) -> tuple[str, list]:
+    """Drop .app/.dev lookalike_tld findings from a warn; everything dropped -> allow, a partial
     drop keeps the remaining real findings and the warn stands. Warn-only: a block action is
     never downgraded."""
     if action != "warn" or not findings:
         return action, findings
-    kept = [f for f in findings if not _is_app_tld_finding(f)]
+    kept = [f for f in findings if not _is_lookalike_tld_fp_finding(f)]
     if kept == findings:
         return action, findings
     if not kept:
@@ -790,13 +792,24 @@ def _suppress_app_tld_false_positives(action: str, findings: list) -> tuple[str,
     return action, kept
 
 
-def _is_app_tld_finding(finding: dict) -> bool:
-    """True if this finding is a lookalike_tld warning for the .app TLD only."""
+# Well-known legitimate gTLDs that trigger the lookalike_tld heuristic (confusable with a file
+# extension) purely because of their TLD string, not any other signal. .app is Google-operated;
+# .dev is Google-operated and hosts well-known legitimate services (osv.dev — Google's Open
+# Source Vulnerability database, the same service tirith itself queries for package scanning —
+# web.dev, deno.dev). Expand only for TLDs with a real, named legitimate-service track record;
+# this is not a general TLD allowlist.
+_LOOKALIKE_TLD_FALSE_POSITIVE_TLDS = frozenset({".app", ".dev"})
+
+
+def _is_lookalike_tld_fp_finding(finding: dict) -> bool:
+    """True if this finding is a lookalike_tld warning for a known-false-positive TLD
+    (.app, .dev — see _LOOKALIKE_TLD_FALSE_POSITIVE_TLDS)."""
     if not isinstance(finding, dict) or finding.get("rule_id") != "lookalike_tld":
         return False
-    return any(
-        val is not None and ".app" in str(val).lower()
-        for val in (finding.get(k) for k in ("value", "tld", "detail", "description", "message")))
+    values = [str(val).lower() for val in
+              (finding.get(k) for k in ("value", "tld", "detail", "description", "message"))
+              if val is not None]
+    return any(any(tld in val for val in values) for tld in _LOOKALIKE_TLD_FALSE_POSITIVE_TLDS)
 
 
 # ---------------------------------------------------------------------------

@@ -629,7 +629,7 @@ class TestSpawnWarningDedup:
 
 
 # ---------------------------------------------------------------------------
-# .app TLD suppression (issue #24461)
+# .app / .dev TLD suppression (issue #24461, t_acfd1e45)
 # ---------------------------------------------------------------------------
 
 _CFG = {"tirith_enabled": True, "tirith_path": "tirith",
@@ -637,7 +637,7 @@ _CFG = {"tirith_enabled": True, "tirith_path": "tirith",
 
 
 class TestAppTldSuppression:
-    """warn verdicts whose only finding is lookalike_tld/.app are downgraded to allow."""
+    """warn verdicts whose only finding is lookalike_tld/.app or /.dev are downgraded to allow."""
 
     @patch("tools.tirith_security.subprocess.run")
     @patch("tools.tirith_security._load_security_config")
@@ -647,6 +647,20 @@ class TestAppTldSuppression:
                      "message": "Domain uses '.app' TLD which can be confused with file extensions"}]
         mock_run.return_value = _mock_run(2, _json_stdout(findings, ".app TLD warning"))
         result = check_command_security("curl https://example.app")
+        assert result["action"] == "allow"
+        assert result["findings"] == []
+        assert result["summary"] == ""
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_dev_only_warn_downgraded_to_allow(self, mock_cfg, mock_run):
+        """osv.dev (Google's OSV database) must not be blocked as a lookalike-TLD false positive."""
+        mock_cfg.return_value = _CFG
+        findings = [{"rule_id": "lookalike_tld", "value": ".dev",
+                     "message": "Domain uses '.dev' TLD which can be confused with file extensions",
+                     "evidence": [{"raw": "osv.dev", "type": "url"}]}]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings, ".dev TLD warning"))
+        result = check_command_security("curl -sS -m 5 https://osv.dev")
         assert result["action"] == "allow"
         assert result["findings"] == []
         assert result["summary"] == ""
@@ -677,17 +691,20 @@ class TestAppTldSuppression:
 
 
 class TestIsAppTldFinding:
-    """Unit tests for the _is_app_tld_finding helper."""
+    """Unit tests for the _is_lookalike_tld_fp_finding helper."""
 
     @pytest.mark.parametrize("finding, expected", [
         ({"rule_id": "lookalike_tld", "value": ".APP"}, True),   # case-insensitive
         ({"rule_id": "lookalike_tld", "message": "Domain uses '.app' TLD"}, True),
+        ({"rule_id": "lookalike_tld", "value": ".dev"}, True),
+        ({"rule_id": "lookalike_tld", "message": "Domain uses '.dev' TLD"}, True),
+        ({"rule_id": "lookalike_tld", "evidence": [{"raw": "osv.dev", "type": "url"}]}, False),  # not in scanned keys
         ({"rule_id": "shortened_url", "value": ".app"}, False),  # wrong rule_id
         ({"rule_id": "lookalike_tld", "value": ".zip"}, False),  # other TLD
     ])
     def test_app_tld_detection(self, finding, expected):
-        from tools.tirith_security import _is_app_tld_finding
-        assert _is_app_tld_finding(finding) is expected
+        from tools.tirith_security import _is_lookalike_tld_fp_finding
+        assert _is_lookalike_tld_fp_finding(finding) is expected
 
 
 # ---------------------------------------------------------------------------
