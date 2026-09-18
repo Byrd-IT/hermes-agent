@@ -2490,18 +2490,27 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = _host_prefix()
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
-        "       assignee "
-        "FROM tasks "
-        "WHERE status = 'running' AND claim_expires IS NOT NULL "
-        "  AND claim_expires < ?", (now,),
+        "SELECT t.id, t.claim_lock, t.worker_pid, t.worker_started_at, t.claim_expires, "
+        "       t.last_heartbeat_at, t.assignee, COALESCE(r.started_at, t.started_at) AS active_started_at "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running' AND t.claim_expires IS NOT NULL "
+        "  AND t.claim_expires < ?", (now,),
     ).fetchall()
     for row in stale:
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
         hb = row["last_heartbeat_at"]
-        # Backstop: a heartbeat older than the max-stale threshold means no
-        # observable progress — reclaim even if the PID is alive (logic loop).
-        heartbeat_stale = hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+        # Backstop: no observable progress after the initial grace means
+        # reclaim even if the PID is alive.  NULL must not renew forever: it
+        # is the absence of proof, not a special "healthy" heartbeat.
+        active_started_at = _row_get(row, "active_started_at")
+        heartbeat_stale = (
+            (hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS)
+            or (
+                hb is None
+                and active_started_at is not None
+                and (now - int(active_started_at)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+            )
+        )
         started_at = _row_get(row, "worker_started_at")
         if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at)
                 and not heartbeat_stale):

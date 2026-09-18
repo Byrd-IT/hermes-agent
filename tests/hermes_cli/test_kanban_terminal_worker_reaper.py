@@ -222,3 +222,100 @@ def test_terminal_scope_with_orphan_descendant_is_reaped(conn, monkeypatch):
     assert "terminal_scope_reaped" in [
         event["kind"] for event in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))
     ]
+
+
+def test_running_task_with_divergent_open_runs_is_requeued_before_capacity(conn):
+    """A running row can consume a slot only through one current live attempt."""
+    tid = kb.create_task(conn, title="duplicate active attempts", assignee="coder")
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None
+    first_run = claimed.current_run_id
+    conn.execute(
+        "INSERT INTO task_runs (task_id, profile, status, started_at) VALUES (?, ?, 'running', ?)",
+        (tid, "coder", int(time.time())),
+    )
+    conn.commit()
+
+    reconciled = kbd.reconcile_task_run_invariants(conn)
+
+    task = conn.execute(
+        "SELECT status, current_run_id, claim_lock, worker_pid FROM tasks WHERE id=?", (tid,)
+    ).fetchone()
+    open_runs = conn.execute(
+        "SELECT id FROM task_runs WHERE task_id=? AND ended_at IS NULL", (tid,)
+    ).fetchall()
+    assert reconciled == [tid]
+    assert dict(task) == {"status": "ready", "current_run_id": None, "claim_lock": None, "worker_pid": None}
+    assert open_runs == []
+    assert first_run is not None
+
+
+def test_only_fingerprint_verified_workers_consume_capacity(conn, monkeypatch):
+    """A stale running row or a surviving scope is not dispatcher capacity."""
+    from gateway.status import get_process_start_time
+
+    stale = kb.create_task(conn, title="dead worker", assignee="coder")
+    kb.claim_task(conn, stale)
+    conn.execute("UPDATE tasks SET worker_pid=424242, worker_started_at='old-boot|1' WHERE id=?", (stale,))
+
+    live = kb.create_task(conn, title="live worker", assignee="coder")
+    kb.claim_task(conn, live)
+    conn.execute(
+        "UPDATE tasks SET worker_pid=?, worker_started_at=? WHERE id=?",
+        (os.getpid(), get_process_start_time(os.getpid()), live),
+    )
+    conn.commit()
+    monkeypatch.setattr(kbd, "_terminal_scope_has_descendants", lambda _unit: True)
+
+    assert kbd.count_running_tasks(conn) == 1
+
+
+def test_null_heartbeat_stops_extending_after_initial_grace(conn, monkeypatch):
+    """A live PID without any progress signal cannot renew its lease forever."""
+    tid = kb.create_task(conn, title="missing heartbeat", assignee="coder")
+    kb.claim_task(conn, tid)
+    now = int(time.time())
+    conn.execute(
+        "UPDATE tasks SET worker_pid=?, worker_started_at='verified', started_at=?, claim_expires=?, "
+        "last_heartbeat_at=NULL WHERE id=?",
+        (424242, now - kbd._STALE_HEARTBEAT_GAP_SECONDS - 1, now - 1, tid),
+    )
+    conn.execute(
+        "UPDATE task_runs SET started_at=? WHERE id=(SELECT current_run_id FROM tasks WHERE id=?)",
+        (now - kbd._STALE_HEARTBEAT_GAP_SECONDS - 1, tid),
+    )
+    conn.commit()
+    monkeypatch.setattr(kb, "_worker_alive", lambda *_args: True)
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", lambda *_args, **_kwargs: {
+        "host_local": True, "termination_attempted": True, "terminated": True,
+    })
+
+    assert kb.release_stale_claims(conn) == 1
+    row = conn.execute("SELECT status, current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()
+    assert dict(row) == {"status": "ready", "current_run_id": None}
+
+
+def test_reclaim_deferral_escalates_instead_of_renewing_forever(conn):
+    """A repeatedly unkillable stale worker receives one durable escalation."""
+    tid = kb.create_task(conn, title="unkillable", assignee="coder")
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None
+    run_id = claimed.current_run_id
+    now = int(time.time())
+    conn.execute("UPDATE tasks SET claim_expires=? WHERE id=?", (now - 1, tid))
+    for _ in range(kbd.MAX_RECLAIM_DEFER_ATTEMPTS):
+        kb._append_event(
+            conn, tid, "reclaim_deferred", {"reason": "heartbeat_stale_worker_alive"}, run_id=run_id,
+        )
+    conn.commit()
+
+    kbd._defer_reclaim_for_live_worker(
+        conn, tid, kb._claimer_id(), now,
+        {"host_local": True, "termination_attempted": True, "terminated": False},
+        reason="heartbeat_stale_worker_alive",
+    )
+
+    row = conn.execute("SELECT claim_expires FROM tasks WHERE id=?", (tid,)).fetchone()
+    kinds = [event["kind"] for event in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))]
+    assert row["claim_expires"] == now - 1
+    assert kinds.count("reclaim_escalated") == 1

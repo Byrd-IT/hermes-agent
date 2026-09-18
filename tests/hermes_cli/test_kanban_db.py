@@ -1547,6 +1547,7 @@ def test_dispatch_max_in_progress_blocks_review_when_at_limit(
     with kbc.connect() as conn:
         running = kb.create_task(conn, title="running", assignee="alice")
         kb.claim_task(conn, running)
+        kbd._set_worker_pid(conn, running, __import__("os").getpid())
         review = kb.create_task(conn, title="review", assignee="bob")
         _set_task_status(conn, review, "review")
         res = kbd.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=1)

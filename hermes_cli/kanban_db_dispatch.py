@@ -485,8 +485,8 @@ def reconcile_task_run_invariants(conn: sqlite3.Connection) -> list[str]:
     authoritative; only the divergent attempt and active claim fields change.
     """
     rows = conn.execute(
-        "SELECT id, status FROM tasks WHERE status != 'running' AND (current_run_id IS NOT NULL "
-        "OR EXISTS (SELECT 1 FROM task_runs r WHERE r.task_id = tasks.id AND r.ended_at IS NULL))"
+        "SELECT id, status, current_run_id FROM tasks WHERE current_run_id IS NOT NULL "
+        "OR EXISTS (SELECT 1 FROM task_runs r WHERE r.task_id = tasks.id AND r.ended_at IS NULL)"
     ).fetchall()
     reconciled: list[str] = []
     now = int(time.time())
@@ -494,10 +494,16 @@ def reconcile_task_run_invariants(conn: sqlite3.Connection) -> list[str]:
         task_id = row["id"]
         with _kb.write_txn(conn):
             open_runs = conn.execute(
-                "SELECT id FROM task_runs WHERE task_id=? AND ended_at IS NULL", (task_id,)
+                "SELECT id, status FROM task_runs WHERE task_id=? AND ended_at IS NULL", (task_id,)
             ).fetchall()
             current = _kb._current_run_id(conn, task_id)
-            if not open_runs and current is None:
+            valid_running_run = (
+                row["status"] == "running"
+                and len(open_runs) == 1
+                and current == int(open_runs[0]["id"])
+                and open_runs[0]["status"] == "running"
+            )
+            if valid_running_run:
                 continue
             run_ids = [int(run["id"]) for run in open_runs]
             conn.execute(
@@ -506,15 +512,19 @@ def reconcile_task_run_invariants(conn: sqlite3.Connection) -> list[str]:
                 "WHERE task_id=? AND ended_at IS NULL",
                 (f"task lifecycle is {row['status']!r}, not running", now, task_id),
             )
+            landing_status = "ready" if row["status"] == "running" else row["status"]
             conn.execute(
-                "UPDATE tasks SET current_run_id=NULL, claim_lock=NULL, claim_expires=NULL, "
+                "UPDATE tasks SET status=?, current_run_id=NULL, claim_lock=NULL, claim_expires=NULL, "
                 "worker_pid=NULL, worker_started_at=NULL, last_heartbeat_at=NULL "
-                "WHERE id=? AND status != 'running'",
-                (task_id,),
+                "WHERE id=?",
+                (landing_status, task_id),
             )
             _kb._append_event(
                 conn, task_id, "reconciled_state_divergence",
-                {"task_status": row["status"], "closed_run_ids": run_ids, "current_run_id": current},
+                {
+                    "task_status": row["status"], "landing_status": landing_status,
+                    "closed_run_ids": run_ids, "current_run_id": current,
+                },
             )
             reconciled.append(task_id)
     return reconciled
@@ -594,6 +604,10 @@ def _worker_survived_termination(termination: dict) -> bool:
     )
 
 
+MAX_RECLAIM_DEFER_ATTEMPTS = 3
+"""Bound retries for a fingerprint-verified worker that survives termination."""
+
+
 def _defer_reclaim_for_live_worker(
     conn: sqlite3.Connection,
     task_id: str,
@@ -605,13 +619,32 @@ def _defer_reclaim_for_live_worker(
 ) -> None:
     """Hold a claim whose worker survived termination instead of releasing it.
 
-    Extends ``claim_expires`` by ``RECLAIM_DEFER_GRACE_SECONDS`` so the task
-    stays ``running`` (no duplicate spawn) and records ``reclaim_deferred``.
-    The next tick retries the kill; not spawning a duplicate is what lets the
-    throttled worker finally die.
+    Extends ``claim_expires`` by ``RECLAIM_DEFER_GRACE_SECONDS`` while bounded
+    recovery is still safe. After the budget is exhausted, leave the expired
+    claim in place (preventing duplicate dispatch) and record one durable
+    escalation rather than renewing a silent stuck lease forever.
     """
     grace = now + _kb.RECLAIM_DEFER_GRACE_SECONDS
     with _kb.write_txn(conn):
+        run_id = _kb._current_run_id(conn, task_id)
+        attempts = 0
+        if run_id is not None:
+            attempts = int(conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id=? AND run_id=? "
+                "AND kind='reclaim_deferred'",
+                (task_id, run_id),
+            ).fetchone()[0])
+            if attempts >= MAX_RECLAIM_DEFER_ATTEMPTS:
+                prior = conn.execute(
+                    "SELECT 1 FROM task_events WHERE task_id=? AND run_id=? "
+                    "AND kind='reclaim_escalated' LIMIT 1",
+                    (task_id, run_id),
+                ).fetchone()
+                if prior is None:
+                    payload = {"reason": reason, "attempts": attempts, "claim_lock": claim_lock}
+                    payload.update(termination)
+                    _kb._append_event(conn, task_id, "reclaim_escalated", payload, run_id=run_id)
+                return
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
             "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
@@ -619,10 +652,12 @@ def _defer_reclaim_for_live_worker(
         )
         if cur.rowcount != 1:
             return
-        run_id = _kb._current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute("UPDATE task_runs SET claim_expires = ? WHERE id = ?", (grace, run_id))
-        payload = {"reason": reason, "claim_lock": claim_lock, "claim_expires_now": grace}
+        payload = {
+            "reason": reason, "attempt": attempts + 1, "claim_lock": claim_lock,
+            "claim_expires_now": grace,
+        }
         payload.update(termination)
         _kb._append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
 
@@ -1765,18 +1800,17 @@ def configured_max_in_progress() -> Optional[int]:
 
 
 def count_running_tasks(conn: sqlite3.Connection) -> int:
-    """Number of tasks in ``status='running'``.
+    """Number of fingerprint-verified live workers in ``status='running'``.
 
     Used by the multi-board sweep to count OTHER boards' workers against the
     host-level budget — the memory-derived cap bounds the machine, not the
     board. Fails open to 0 so a broken board doesn't brick dispatch on healthy ones.
     """
     try:
-        return int(
-            conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-            ).fetchone()[0]
-        )
+        rows = conn.execute(
+            "SELECT worker_pid, worker_started_at FROM tasks WHERE status = 'running'"
+        ).fetchall()
+        return sum(_worker_alive(row["worker_pid"], row["worker_started_at"]) for row in rows)
     except Exception:
         return 0
 
@@ -2238,11 +2272,12 @@ def _dispatch_once_locked(
     per_profile_running: dict[str, int] = {}
     if per_profile_cap is not None:
         for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
+            "SELECT assignee, worker_pid, worker_started_at FROM tasks "
+            "WHERE status = 'running' AND assignee IS NOT NULL"
         ):
-            per_profile_running[prow["assignee"]] = int(prow["n"])
+            if _worker_alive(prow["worker_pid"], prow["worker_started_at"]):
+                assignee = prow["assignee"]
+                per_profile_running[assignee] = per_profile_running.get(assignee, 0) + 1
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,

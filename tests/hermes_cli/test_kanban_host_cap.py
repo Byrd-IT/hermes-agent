@@ -142,6 +142,8 @@ def test_max_in_progress_counts_other_boards(
         for title in ("busy-1", "busy-2"):
             tid = kb.create_task(conn, title=title, assignee="alice")
             assert kb.claim_task(conn, tid) is not None
+            # Capacity is proven by a PID/fingerprint pair, not the DB state.
+            kbd._set_worker_pid(conn, tid, __import__("os").getpid())
 
     spawns: list = []
     with kbc.connect() as conn:
@@ -163,6 +165,7 @@ def test_max_in_progress_partial_budget_across_boards(
     with kbc.connect(board="second") as conn:
         tid = kb.create_task(conn, title="busy", assignee="alice")
         assert kb.claim_task(conn, tid) is not None
+        kbd._set_worker_pid(conn, tid, __import__("os").getpid())
 
     spawns: list = []
     with kbc.connect() as conn:
