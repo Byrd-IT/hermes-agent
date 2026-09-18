@@ -975,6 +975,16 @@ class TestSharedBoardPaths:
         default_home.mkdir()
         self._set_home(monkeypatch, tmp_path, default_home)
 
+        # Env-stripping is spawn-mechanics-agnostic: run OUTSIDE a managed
+        # gateway (no INVOCATION_ID, probe says not supervised) so the
+        # restart-safe scope helper takes its in_process path and the
+        # current_run_id requirement is not consulted — this test exercises
+        # the spawn directly, outside a claim.
+        import tools.process_registry as _pr
+        monkeypatch.setattr(_pr, "_is_supervised_gateway_process", lambda: False)
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        monkeypatch.setattr(_pr, "_systemd_run_user_scope_available", lambda: False)
+
         from gateway import session_context as sc
 
         # A dispatcher can launch before the gateway binds its first session.
