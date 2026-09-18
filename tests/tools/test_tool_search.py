@@ -1018,3 +1018,26 @@ class TestDeferredCallSchemaProbe:
         }, calls)
 
         assert validate_deferred_call_args(name, {"payload": {"anything": True}}) is None
+
+
+def test_tool_call_schema_states_single_local_entry_rule():
+    """The calls-array schema must state the single-local-entry rule in the property
+    description itself. The tool-level description has said this since 13fc2e1044, but
+    that text is easily ignored; models weight the per-property description when
+    emitting arguments. Ambiguous property text ('One local invocation, or one or more
+    connector invocations') drove a real multi-entry local-MCP batch (t_e03f393f)."""
+    import json as _json
+
+    from tools.tool_search import bridge_tool_schemas, TOOL_CALL_NAME
+
+    schemas = bridge_tool_schemas(0)
+    schema = next(s for s in schemas
+                  if s.get("function", {}).get("name") == TOOL_CALL_NAME)
+    calls = schema["function"]["parameters"]["properties"]["calls"]
+    desc = calls["description"]
+    # Must be valid JSON-schema-shaped and machine-checkable.
+    _json.dumps(schema)
+    assert "ONE entry" in desc
+    assert "connectors__" in desc
+    assert "Never mix" in desc
+    assert desc != "One local invocation, or one or more connector invocations. Never mix local and connector tools."
