@@ -121,16 +121,27 @@ def _conditions(conn, *, now: int, config: dict) -> list[WatchdogAlert]:
     return found
 
 
-def run_watchdog(conn, *, now: int | None = None, config: dict | None = None, retention_days: int = 30) -> WatchdogResult:
+def run_watchdog(conn, *, now: int | None = None, config: dict | None = None, retention_days: int = 30,
+                 detect_only: bool = False) -> WatchdogResult:
     """Detect and route new stale conditions, returning quiet empty results when healthy.
 
     ``conn`` is intentionally caller-supplied so cron/CLI and fixture tests use
     the same board connection.  Notification delivery remains asynchronous in
     the existing gateway notifier after the inserted event commits.
+
+    With ``detect_only=True`` the pass is strictly read-only: conditions are
+    computed but alert rows and ``watchdog_alert`` events are not written, so
+    it also runs in descendant contexts whose board is write-fenced (e.g. a
+    ``delegate_task`` child post-check).  Alert routing still happens on the
+    next unfenced run.
     """
     now = int(time.time() if now is None else now)
     config = config or {}
     conditions = _conditions(conn, now=now, config=config)
+    if detect_only:
+        # The condition scan above is pure SELECTs; skip the alert-table
+        # reconcile entirely so fenced contexts never touch ``write_txn``.
+        return WatchdogResult(conditions, 0, 0)
     active = {(alert.task_id, alert.kind): alert for alert in conditions}
     new_alerts: list[WatchdogAlert] = []
     with kb.write_txn(conn):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -142,3 +143,68 @@ def test_watchdog_treats_authoritative_verified_completion_state_as_activation_e
         assert kb.record_completion_state(conn, task_id, "verified", {"proof": "live deployment receipt"})
 
         assert kw.run_watchdog(conn, now=now).new_alerts == []
+
+
+def test_watchdog_detect_only_makes_no_board_writes(kanban_home):
+    """The fenced-context validation path must be strictly read-only, and must
+    not consume the alert: the next unfenced run still routes it once."""
+    now = 1_000_000
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="safe fixture", assignee="worker")
+        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (now - 3600, task_id))
+        conn.execute("UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'created'", (now - 3600, task_id))
+        conn.commit()
+
+        def _board_snapshot():
+            tables = [r["name"] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )]
+            return {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in tables}
+
+        before = _board_snapshot()
+        first = kw.run_watchdog(conn, now=now, detect_only=True)
+        second = kw.run_watchdog(conn, now=now + 60, detect_only=True)
+        after = _board_snapshot()
+
+        assert [(a.task_id, a.kind) for a in first.new_alerts] == [(task_id, "stranded_in_ready")]
+        # No suppression across dry runs: every pass reports the live condition.
+        assert [(a.task_id, a.kind) for a in second.new_alerts] == [(task_id, "stranded_in_ready")]
+        assert after == before
+        assert conn.execute("SELECT COUNT(*) FROM kanban_watchdog_alerts").fetchone()[0] == 0
+        assert [row["kind"] for row in _events(conn, task_id)].count("watchdog_alert") == 0
+
+        # The dry run did not consume the alert: an unfenced run still routes it.
+        routed = kw.run_watchdog(conn, now=now + 120)
+        assert [(a.task_id, a.kind) for a in routed.new_alerts] == [(task_id, "stranded_in_ready")]
+        assert [row["kind"] for row in _events(conn, task_id)].count("watchdog_alert") == 1
+
+
+def test_watchdog_dry_run_cli_works_in_fenced_descendant_context(kanban_home):
+    """A delegate descendant (marker env) must get real watchdog output from
+    ``watchdog --dry-run`` while the default write pass stays fenced."""
+    from hermes_cli import kanban as kc
+
+    import json
+
+    now = 1_000_000
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="safe fixture", assignee="worker")
+        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (now - 3600, task_id))
+        conn.execute("UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'created'", (now - 3600, task_id))
+        conn.commit()
+
+    monkeymarker = str(kb.kanban_home())
+    os.environ["HERMES_DELEGATED_CHILD_CONTEXT"] = monkeymarker
+    try:
+        dry = json.loads(kc.run_slash("watchdog --dry-run --json"))
+        assert [(a["task_id"], a["kind"]) for a in dry["new_alerts"]] == [(task_id, "stranded_in_ready")]
+        assert dry["resolved_count"] == 0 and dry["pruned_count"] == 0
+
+        refused = kc.run_slash("watchdog")
+        assert "delegate_task child contexts cannot mutate" in refused
+    finally:
+        os.environ.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+
+    # The fenced dry run wrote nothing, so an unfenced run still routes the alert.
+    with kbc.connect_closing() as conn:
+        assert [row["kind"] for row in _events(conn, task_id)].count("watchdog_alert") == 0

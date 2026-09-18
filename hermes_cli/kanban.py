@@ -709,8 +709,14 @@ def _cmd_watchdog(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_diagnostics as kd
     diagnostics_config = kd.config_from_runtime_config(raw_config)
     retention_days = max(1, int(getattr(args, "retention_days", 30)))
+    # ``--dry-run`` is the fenced-context validation path: computing conditions
+    # is pure SELECTs, while the default pass persists alert rows/events and
+    # therefore legitimately requires an unfenced writer.
+    detect_only = bool(getattr(args, "dry_run", False))
     with kbc.connect_closing() as conn:
-        result = watchdog.run_watchdog(conn, config=diagnostics_config, retention_days=retention_days)
+        result = watchdog.run_watchdog(
+            conn, config=diagnostics_config, retention_days=retention_days, detect_only=detect_only,
+        )
     payload = {
         "new_alerts": [alert.__dict__ for alert in result.new_alerts],
         "resolved_count": result.resolved_count,
