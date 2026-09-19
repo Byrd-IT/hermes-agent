@@ -634,8 +634,7 @@ _FP_BRACE_NESTED_TITLE = "Nested executable body could not be resolved"
 _FP_BRACE_GAP_TITLE = "nested command analysis was incomplete"
 _FP_BRACE_WRAPPER_TITLE = "could not resolve destructive command wrapper"
 _FP_BRACE_SIMPLE_READONLY = frozenset({
-    "cat", "date", "df", "du", "echo", "egrep", "fgrep", "grep", "head", "ls", "rg",
-    "stat", "tail", "wc",
+    "cat", "df", "du", "echo", "egrep", "fgrep", "grep", "head", "ls", "stat", "tail", "wc",
 })
 _FP_BRACE_FORBIDDEN_FIND = frozenset({"-delete", "-exec", "-execdir", "-ok", "-okdir",
                                       "-fprint", "-fprint0", "-fprintf", "-fls"})
@@ -666,8 +665,10 @@ def _brace_capture_leaf_is_readonly(argv: list[str]) -> bool:
     if not argv:
         return False
     head, args = argv[0], argv[1:]
+    if head == "date":
+        return not args
     if head in _FP_BRACE_SIMPLE_READONLY:
-        return not (head == "date" and any(arg in {"-s", "--set"} for arg in args))
+        return True
     if head == "find":
         return not any(arg in _FP_BRACE_FORBIDDEN_FIND for arg in args)
     if head == "racadm":

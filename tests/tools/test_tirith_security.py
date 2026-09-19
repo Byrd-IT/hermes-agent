@@ -904,6 +904,33 @@ def test_live_original_readonly_brace_evidence_bundle_allows(monkeypatch):
     assert check_command_security(command)["action"] == "allow"
 
 
+@pytest.mark.skipif(not os.path.exists(_REAL_TIRITH), reason="live tirith binary not present")
+@pytest.mark.parametrize("leaf", [
+    "date --set 2026-01-01",
+    "date --set=2026-01-01",
+    "date 010112342026",
+    "rg --pre /bin/true needle /tmp",
+    "rg --pre=/bin/true needle /tmp",
+    "rg --hostname-bin /bin/true needle /tmp",
+    "rg --hostname-bin=/bin/true needle /tmp",
+])
+def test_live_mutating_or_process_spawning_brace_leaves_block_without_rescan(monkeypatch, leaf):
+    """Rejected leaves must retain the original live Tirith block, not get a clean rescan."""
+    monkeypatch.setenv("TIRITH_ENABLED", "true")
+    _tirith_mod._resolved_path = _REAL_TIRITH
+    real_run, invocations = _tirith_mod.subprocess.run, []
+
+    def record_run(*args, **kwargs):
+        invocations.append(args[0][-1])
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(_tirith_mod.subprocess, "run", record_run)
+    command = "{ " + leaf + "; } > /tmp/evidence 2>&1"
+
+    assert check_command_security(command)["action"] == "block"
+    assert invocations == [command]
+
+
 class TestMkdtempOSErrorNoSpace:
     """When tempfile.mkdtemp raises OSError (e.g. disk full), _install_tirith
     must return (None, "no_space") instead of propagating the exception.
