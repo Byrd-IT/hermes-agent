@@ -1050,6 +1050,8 @@ _FP_LOOP_BLOCK = {"rule_id": "analysis_incomplete", "severity": "high",
                   "title": "Nested executable body could not be resolved"}
 _FP_LOOP_GAP = {"rule_id": "analysis_incomplete", "severity": "high",
                 "title": "nested command analysis was incomplete"}
+_FP_BRACE_WRAPPER = {"rule_id": "analysis_incomplete", "severity": "high",
+                     "title": "could not resolve destructive command wrapper"}
 
 _LOOP_FP_CFG = {"tirith_enabled": True, "tirith_path": "tirith",
                 "tirith_timeout": 5, "tirith_fail_open": True}
@@ -1059,6 +1061,13 @@ _FP_LOOP_CMD = ("while [ ! -f /tmp/tpwd_repro_done ]; do sleep 30; "
                 "ls /home/brandonabyrd/projects/supervisor/logs | grep 2026-09-16; done")
 _FP_LOOP_REWRITTEN = ("while test ! -f /tmp/tpwd_repro_done; do sleep 30; "
                       "ls /home/brandonabyrd/projects/supervisor/logs | grep 2026-09-16; done")
+_FP_BRACE_CAPTURE_CMD = (
+    "{ date; echo '--- disk usage ---'; du -sh /var; echo '--- sensors ---'; "
+    "ipmitool sensor; find /tmp -maxdepth 1 -type f | grep evidence; } "
+    "> /tmp/tirith-evidence.txt 2>&1 | grep .")
+_FP_BRACE_CAPTURE_RESCANNED = (
+    "date; echo '--- disk usage ---'; du -sh /var; echo '--- sensors ---'; "
+    "ipmitool sensor; find /tmp -maxdepth 1 -type f | grep evidence | grep .")
 
 
 class TestLoopAnalysisIncompleteSuppressor:
@@ -1080,6 +1089,44 @@ class TestLoopAnalysisIncompleteSuppressor:
         # First scan = original text, second = the rewritten copy.
         cmds = [c.args[0][-1] for c in mock_run.call_args_list]
         assert cmds == [_FP_LOOP_CMD, _FP_LOOP_REWRITTEN]
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_benign_brace_group_evidence_capture_downgrades_to_allow(self, mock_cfg, mock_run):
+        mock_cfg.return_value = dict(self.CFG)
+        mock_run.side_effect = [
+            _mock_run(1, _json_stdout(
+                [dict(_FP_LOOP_BLOCK), dict(_FP_LOOP_GAP), dict(_FP_BRACE_WRAPPER)], "nested")),
+            _mock_run(0, _json_stdout())]
+        result = check_command_security(_FP_BRACE_CAPTURE_CMD)
+        assert result["action"] == "allow"
+        cmds = [c.args[0][-1] for c in mock_run.call_args_list]
+        assert cmds == [_FP_BRACE_CAPTURE_CMD, _FP_BRACE_CAPTURE_RESCANNED]
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_destructive_brace_group_capture_keeps_block(self, mock_cfg, mock_run):
+        mock_cfg.return_value = dict(self.CFG)
+        mock_run.return_value = _mock_run(1, _json_stdout(
+            [dict(_FP_LOOP_BLOCK), dict(_FP_LOOP_GAP), dict(_FP_BRACE_WRAPPER)], "nested"))
+        cmd = "{ date; rm -rf /tmp/tirith-delete; } > /tmp/tirith-evidence.txt 2>&1"
+        result = check_command_security(cmd)
+        assert result["action"] == "block"
+        assert mock_run.call_count == 1
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_wrapper_and_curl_config_brace_groups_keep_block(self, mock_cfg, mock_run):
+        mock_cfg.return_value = dict(self.CFG)
+        mock_run.return_value = _mock_run(1, _json_stdout(
+            [dict(_FP_LOOP_BLOCK), dict(_FP_LOOP_GAP), dict(_FP_BRACE_WRAPPER)], "nested"))
+        commands = [
+            "{ env rm -rf /tmp/tirith-delete; } > /tmp/tirith-evidence.txt 2>&1",
+            "{ curl --head --config /tmp/tirith-curl.conf https://example.test; } "
+            "> /tmp/tirith-evidence.txt 2>&1"]
+        for command in commands:
+            assert check_command_security(command)["action"] == "block"
+        assert mock_run.call_count == len(commands)
 
     @patch("tools.tirith_security.subprocess.run")
     @patch("tools.tirith_security._load_security_config")
@@ -1331,6 +1378,13 @@ class TestLoopSuppressorLiveBinary:
 
     def test_benign_watcher_loop_allows(self):
         assert self._check(_FP_LOOP_CMD)["action"] == "allow"
+
+    def test_benign_brace_group_evidence_capture_allows(self):
+        assert self._check(_FP_BRACE_CAPTURE_CMD)["action"] == "allow"
+
+    def test_destructive_brace_group_capture_still_blocks(self):
+        cmd = "{ date; rm -rf /tmp/tirith-live-delete; } > /tmp/tirith-evidence.txt 2>&1"
+        assert self._check(cmd)["action"] == "block"
 
     def test_destructive_watcher_still_blocks(self):
         cmd = "while [ ! -f /tmp/tpwd_live_done ]; do sudo rm -rf /opt/tpwd_live_gone; sleep 1; done"

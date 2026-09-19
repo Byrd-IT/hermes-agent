@@ -594,6 +594,17 @@ def check_command_security(command: str) -> dict:
         action, findings = _suppress_phantom_package_findings(command, action, findings)
         if action == "allow":
             return _verdict("allow")
+    # Tirith 0.4.2 cannot resolve a simple brace group that captures a fixed
+    # evidence bundle. A narrow parser proves every command is observational,
+    # strips only the capture wrapper for a second scan, and preserves every
+    # other finding or unparseable form as a fail-closed block.
+    if action == "block" and _is_brace_capture_analysis_fp_block(findings):
+        if (rewritten := _rewrite_brace_capture_for_rescan(command)) is not None:
+            rescan = _tirith_check(tirith_path, timeout, rewritten)
+            if rescan is not None and rescan[0] == "allow":
+                _crash_count = 0
+                return _verdict("allow", "brace-group evidence capture downgraded after "
+                                         "read-only-leaf rescan")
     # tirith 0.4.2 hard-blocks while/until bracket-test compounds with two
     # analysis_incomplete HIGH findings even when every leaf command is
     # read-only -- a false positive that kills the command outright in
@@ -919,6 +930,86 @@ def _is_loop_analysis_fp_block(findings: list) -> bool:
             return False
         titles.add(str(f.get("title", "")))
     return titles == {_FP_LOOP_BLOCK_TITLE, _FP_LOOP_GAP_TITLE}
+
+
+# A capture group must be one literal group, one conventional file target, and
+# an optional literal read-only filter. No variable, substitution, nested group,
+# or extra redirection is accepted: if the grammar does not prove the shape,
+# Tirith's original block stands.
+_FP_BRACE_CAPTURE = re.compile(
+    r"^\s*\{\s*(?P<body>[^{}]*?)\s*;\s*\}\s*"
+    r">\s*(?P<target>(?:/)?[A-Za-z0-9._/-]+)\s+2>&1"
+    r"(?:\s*\|\s*(?P<filter>[^{};]+))?\s*$", re.DOTALL)
+_FP_BRACE_WRAPPER_TITLE = "could not resolve destructive command wrapper"
+_FP_BRACE_FORBIDDEN_FIND = frozenset({"-delete", "-exec", "-execdir", "-ok", "-okdir",
+                                      "-fprint", "-fprint0", "-fprintf", "-fls"})
+
+
+def _is_brace_capture_analysis_fp_block(findings: list) -> bool:
+    """True only for Tirith's complete three-finding brace-group gap.
+
+    The wrapper finding is analysis-incomplete rather than evidence that a
+    destructive leaf was found. Requiring this exact all-HIGH set prevents a
+    real Tirith rule from being hidden by the narrowly scoped rescan.
+    """
+    if not isinstance(findings, list) or len(findings) != 3:
+        return False
+    titles = set()
+    for finding in findings:
+        if not isinstance(finding, dict) or finding.get("rule_id") != "analysis_incomplete" \
+                or str(finding.get("severity", "")).lower() != "high":
+            return False
+        titles.add(str(finding.get("title", "")))
+    return titles == {_FP_LOOP_BLOCK_TITLE, _FP_LOOP_GAP_TITLE, _FP_BRACE_WRAPPER_TITLE}
+
+
+def _brace_capture_leaf_is_readonly(argv: list[str]) -> bool:
+    """Allow only static observational commands admitted in an evidence group."""
+    if not argv:
+        return False
+    head, args = argv[0], argv[1:]
+    if head in _FP_READONLY_LEAVES and head != "env":
+        return not (head == "date" and any(arg in ("-s", "--set") for arg in args))
+    if head == "find":
+        return not any(arg in _FP_BRACE_FORBIDDEN_FIND for arg in args)
+    if head == "racadm":
+        return len(args) >= 2 and args[:2] == ["raid", "get"]
+    if head == "ipmitool":
+        return bool(args) and args[0] == "sensor" and "thresh" not in args
+    if head == "curl":
+        write_or_method_flags = ("-d", "--data", "--data-raw", "--data-binary", "-F", "--form",
+                                 "-T", "--upload-file", "-o", "--output", "-O", "--remote-name",
+                                 "-X", "--request", "-K", "--config")
+        return ("-I" in args or "--head" in args) and not any(
+            arg == flag or arg.startswith(f"{flag}=") for arg in args for flag in write_or_method_flags)
+    return False
+
+
+def _rewrite_brace_capture_for_rescan(command: str) -> str | None:
+    """Return a safe-to-rescan capture body, otherwise None (fail closed).
+
+    This does not rewrite the command sent to the shell. It is an alternate
+    scanner input used only after every original leaf has been statically
+    classified as read-only and the original scan reported the exact brace-gap
+    findings. The capture redirection is intentionally omitted because it is
+    the grouping syntax Tirith cannot analyze, not an executed replacement.
+    """
+    match = _FP_BRACE_CAPTURE.fullmatch(command)
+    if not match:
+        return None
+    body, filter_text = match.group("body").strip(), match.group("filter")
+    filter_text = filter_text.strip() if filter_text else ""
+    candidate = body if not filter_text else f"{body} | {filter_text}"
+    if (any(char in candidate for char in "$`\\()<>") or not candidate or "&&" in candidate
+            or "||" in candidate or "&" in candidate):
+        return None
+    try:
+        segments = [shlex.split(segment, posix=True) for segment in re.split(r"[;|\n]+", candidate)]
+    except ValueError:
+        return None
+    if not segments or any(not _brace_capture_leaf_is_readonly(argv) for argv in segments):
+        return None
+    return candidate
 
 
 def _fp_quoted_spans(command: str) -> list[tuple[int, int]]:
