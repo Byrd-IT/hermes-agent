@@ -965,6 +965,38 @@ class TestSafeCursorHunkSelection:
         assert fo.files["providers.py"] == original
         assert "hunk 2" in (result.error or "").lower()
 
+    def test_repeated_later_hunks_apply_successive_duplicate_blocks(self):
+        """An explicit sequence of identical later hunks means successive sites.
+
+        A single broad later hunk stays fail-closed; two or more identical hunks
+        explicitly encode the cursor-ordered sequence required by the V4A repro.
+        """
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: providers.py\n"
+            "@@ anchor @@\n"
+            "-anchor = old\n"
+            "+anchor = new\n"
+            "@@\n"
+            "-value = old\n"
+            "+value = first\n"
+            "@@\n"
+            "-value = old\n"
+            "+value = second\n"
+            "*** End Patch\n"
+        )
+        ops, err = parse_v4a_patch(patch)
+        assert err is None
+        original = "anchor = old\nvalue = old\nvalue = old\nvalue = old\n"
+        fo = _DictFileOps({"providers.py": original})
+
+        result = apply_v4a_operations(ops, fo)
+
+        assert result.success is True, result.error
+        assert fo.files["providers.py"] == (
+            "anchor = new\nvalue = first\nvalue = second\nvalue = old\n"
+        )
+
     def test_already_applied_later_hunk_does_not_hide_remaining_source_match(self, monkeypatch):
         import tools.fuzzy_match as fuzzy_match
 
