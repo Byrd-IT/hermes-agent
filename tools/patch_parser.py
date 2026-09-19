@@ -251,6 +251,16 @@ def _validate_operations(operations: List[PatchOperation], file_ops: Any) -> Lis
             return
         assert simulated is not None
         cursor = 0
+        changed_hunk_patterns = [
+            "\n".join(search_lines)
+            for candidate in op.hunks
+            for search_lines, replace_lines in [_split_hunk(candidate)]
+            if search_lines and search_lines != replace_lines
+        ]
+        repeated_changed_hunk_patterns = {
+            pattern for pattern in changed_hunk_patterns
+            if changed_hunk_patterns.count(pattern) > 1
+        }
         for hunk_index, hunk in enumerate(op.hunks, start=1):
             search_lines, replace_lines = _split_hunk(hunk)
             location = _seek_hunk(simulated, search_lines, cursor)
@@ -280,11 +290,13 @@ def _validate_operations(operations: List[PatchOperation], file_ops: Any) -> Lis
                     "include unique context lines in its search text")
                 continue
             # A later unanchored hunk cannot safely skip one of several identical
-            # source blocks.  Cursor order locates the *next* block, not the block
-            # a human may have meant; reject atomically instead of silently editing
-            # that next block.  A first hunk deliberately starts at offset zero.
-            if cursor and not hunk.context_hint and _count_occurrences(
-                    simulated[cursor:], search_pattern) > 1:
+            # source blocks. An explicit run of identical changed hunks encodes a
+            # cursor-ordered sequence, so it applies successively; a lone broad
+            # hunk rejects atomically instead of silently editing the next block.
+            # A first hunk deliberately starts at offset zero.
+            if (cursor and not hunk.context_hint
+                    and search_pattern not in repeated_changed_hunk_patterns
+                    and _count_occurrences(simulated[cursor:], search_pattern) > 1):
                 errors.append(
                     f"{op.file_path}: hunk {hunk_index} (no hint) is ambiguous after the "
                     "previous hunk — include unique context lines in its search text")
