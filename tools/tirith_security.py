@@ -616,6 +616,22 @@ def check_command_security(command: str) -> dict:
                     _crash_count = 0
                     return _verdict("allow", "bracket-test loop downgraded after "
                                              "read-only-leaf rescan")
+    # Tirith 0.4.2 can also lose coverage only after a long quote-delimited
+    # `node -e` body becomes the final leaf of an && compound. Do not inspect
+    # the JavaScript or assume an interpreter is safe: require a strict literal
+    # read-only prefix and a fresh clean scanner verdict for the exact node leaf.
+    # A variable executable, startup flag, shell metacharacter, extra leaf, bad
+    # quote, or non-read-only prefix fails the matcher and keeps the block.
+    if action == "block" and _is_loop_analysis_fp_block(findings):
+        node_leaf = _compound_inline_node_leaf(command)
+        if node_leaf is not None:
+            rescan = _tirith_check(tirith_path, timeout, node_leaf)
+            if rescan is not None:
+                r_action, r_findings, r_summary = rescan
+                if r_action == "allow":
+                    _crash_count = 0
+                    return _verdict("allow", "compound inline node body allowed after "
+                                             "read-only-prefix leaf rescan")
     # tirith <= 0.4.2 runs every package's threat-intel lookups under one small per-run wall-clock
     # budget, so `npm install a b` warns "deadline exhausted" for all packages even when upstreams
     # are healthy — the budget is spent before later packages finish their first lookup. Successful
@@ -887,6 +903,84 @@ _FP_READONLY_LEAVES = frozenset({
     "tty", "true", "false", "test", "[", "[[", "sleep", "seq", "printf",
     "echo", "env", "printenv",
 })
+
+# `sha256sum` is a read-only digest utility, but it was not needed in loop
+# watcher bodies and therefore is deliberately scoped to the node-compound
+# prefix gate below.
+_FP_NODE_COMPOUND_READONLY_LEAVES = _FP_READONLY_LEAVES | frozenset({"sha256sum"})
+
+
+def _split_top_level_andand(command: str) -> list[str] | None:
+    """Split a simple && compound without interpreting quoted content.
+
+    The node inline-body suppressor needs a structural boundary, not a JavaScript
+    parser. Reject every top-level shell form except &&, and preserve the exact
+    quoted final leaf for its independent live Tirith rescan.
+    """
+    parts: list[str] = []
+    start, i, quote = 0, 0, None
+    while i < len(command):
+        char = command[i]
+        if quote is not None:
+            if quote == '"' and char == "\\":
+                i += 2
+                continue
+            if char == quote:
+                quote = None
+            i += 1
+            continue
+        if char in ("'", '"'):
+            quote = char
+        elif char == "\\":
+            return None
+        elif char == "&":
+            if command[i + 1:i + 2] != "&":
+                return None
+            part = command[start:i].strip()
+            if not part:
+                return None
+            parts.append(part)
+            start, i = i + 2, i + 2
+            continue
+        elif char in ";|<>`$(){}#\n":
+            return None
+        i += 1
+    if quote is not None:
+        return None
+    last = command[start:].strip()
+    if not last:
+        return None
+    parts.append(last)
+    return parts
+
+
+def _compound_inline_node_leaf(command: str) -> str | None:
+    """Return an independently-scannable exact ``node -e`` final leaf only when
+    all earlier && leaves are literal read-only commands. This never examines or
+    classifies the JavaScript body: the exact leaf must earn a fresh Tirith allow.
+    """
+    parts = _split_top_level_andand(command)
+    if parts is None or len(parts) < 2:
+        return None
+    prefix, node_leaf = parts[:-1], parts[-1]
+    for leaf in prefix:
+        # Dynamic/escaped prefix arguments and assignments are deliberately out
+        # of scope: this proof is for literal read-only leaves only.
+        if any(char in leaf for char in "$`\\(){}"):
+            return None
+        try:
+            tokens = shlex.split(leaf, posix=True)
+        except ValueError:
+            return None
+        if not tokens or tokens[0] not in _FP_NODE_COMPOUND_READONLY_LEAVES:
+            return None
+    try:
+        node_tokens = shlex.split(node_leaf, posix=True)
+    except ValueError:
+        return None
+    if len(node_tokens) < 3 or node_tokens[:2] != ["node", "-e"]:
+        return None
+    return node_leaf
 
 # Shell reserved words that only structure a compound command; stripped from
 # segment starts before the leaf head is read.

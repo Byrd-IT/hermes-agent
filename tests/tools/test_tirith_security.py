@@ -1301,6 +1301,76 @@ class TestLoopAnalysisIncompleteSuppressor:
                      "title": "some other title"}]) is False
 
 
+# ---------------------------------------------------------------------------
+# analysis_incomplete compound inline-node false positive (t_209ebf24)
+# ---------------------------------------------------------------------------
+
+_FP_NODE_COMPOUND_CMD = (
+    "wc -l /tmp/geo.jsonl && sha256sum /tmp/geo.jsonl && du -h /tmp/geo.jsonl && "
+    "node -e \"const fs=require('fs'); let n=0; const types={}; "
+    "for(const l of fs.readFileSync('/tmp/geo.jsonl','utf8').trim().split('\\\\n')) "
+    "{ const f=JSON.parse(l); n++; types[f.properties?.siteType || 'unknown']="
+    "(types[f.properties?.siteType || 'unknown']||0)+1; } "
+    "console.log(JSON.stringify({features:n,siteTypes:types}));\" /tmp/geo.jsonl"
+)
+_FP_NODE_LEAF = _FP_NODE_COMPOUND_CMD.rsplit(" && ", 1)[1]
+
+
+class TestCompoundInlineNodeAnalysisIncompleteSuppressor:
+    CFG = _LOOP_FP_CFG
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_readonly_compound_with_scanner_clean_inline_node_leaf_allows(self, mock_cfg, mock_run):
+        # Tirith 0.4.2 blocks only the compound form when the quote-delimited node
+        # body crosses its retained nested-body budget; the same literal node leaf
+        # independently scans clean. The wrapper may downgrade only after it proves
+        # the prefix is read-only and receives that clean live rescan.
+        mock_cfg.return_value = dict(self.CFG)
+        mock_run.side_effect = [
+            _mock_run(1, _json_stdout([dict(_FP_LOOP_BLOCK), dict(_FP_LOOP_GAP)], "nested")),
+            _mock_run(0, _json_stdout()),
+        ]
+        result = check_command_security(_FP_NODE_COMPOUND_CMD)
+        assert result["action"] == "allow"
+        assert result["findings"] == []
+        assert [call.args[0][-1] for call in mock_run.call_args_list] == [
+            _FP_NODE_COMPOUND_CMD, _FP_NODE_LEAF]
+
+    @pytest.mark.parametrize("command", [
+        "rm -rf /tmp/geo && node -e \"console.log('x')\" /tmp/geo",
+        "wc -l /tmp/geo && $node -e \"console.log('x')\" /tmp/geo",
+        "wc -l /tmp/geo && node --require /tmp/hook -e \"console.log('x')\" /tmp/geo",
+        "X=\"rm -rf /home\"; $X",
+    ])
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_unproven_or_dynamic_shape_keeps_block_without_rescan(self, mock_cfg, mock_run, command):
+        # Controls for the fail-closed contract: only literal read-only prefixes
+        # and an exact literal node -e position qualify.
+        mock_cfg.return_value = dict(self.CFG)
+        mock_run.return_value = _mock_run(
+            1, _json_stdout([dict(_FP_LOOP_BLOCK), dict(_FP_LOOP_GAP)], "nested")
+        )
+        assert check_command_security(command)["action"] == "block"
+        assert mock_run.call_count == 1
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_node_leaf_rescan_block_keeps_original_block(self, mock_cfg, mock_run):
+        mock_cfg.return_value = dict(self.CFG)
+        mock_run.side_effect = [
+            _mock_run(1, _json_stdout([dict(_FP_LOOP_BLOCK), dict(_FP_LOOP_GAP)], "nested")),
+            _mock_run(1, _json_stdout([{"rule_id": "curl_pipe_shell", "severity": "high"}], "real")),
+        ]
+        result = check_command_security(_FP_NODE_COMPOUND_CMD)
+        assert result["action"] == "block"
+        assert [finding["rule_id"] for finding in result["findings"]] == [
+            "analysis_incomplete", "analysis_incomplete"]
+        assert [call.args[0][-1] for call in mock_run.call_args_list] == [
+            _FP_NODE_COMPOUND_CMD, _FP_NODE_LEAF]
+
+
 _REAL_TIRITH = "/home/brandonabyrd/.hermes/profiles/ops-infra/bin/tirith"
 
 
@@ -1350,3 +1420,11 @@ class TestLoopSuppressorLiveBinary:
 
     def test_plain_readonly_loop_still_allows(self):
         assert self._check("echo hello")["action"] == "allow"
+
+    def test_large_inline_node_compound_allows_after_leaf_rescan(self):
+        # Raw Tirith 0.4.2 blocks this exact shape; the wrapper's fresh scan of
+        # the exact final leaf is the required evidence before it allows it.
+        assert self._check(_FP_NODE_COMPOUND_CMD)["action"] == "allow"
+
+    def test_dynamic_executable_control_remains_blocked(self):
+        assert self._check('X="rm -rf /home"; $X')["action"] == "block"
