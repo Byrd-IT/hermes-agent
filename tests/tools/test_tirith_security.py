@@ -1128,6 +1128,34 @@ class TestLoopAnalysisIncompleteSuppressor:
             assert check_command_security(command)["action"] == "block"
         assert mock_run.call_count == len(commands)
 
+    @pytest.mark.parametrize("curl_args", [
+        "--cookie-jar /tmp/tirith-cookies",
+        "--cookie-jar=/tmp/tirith-cookies",
+        "-c /tmp/tirith-cookies",
+        "--dump-header /tmp/tirith-headers",
+        "--trace /tmp/tirith-trace",
+        "--trace-ascii /tmp/tirith-trace",
+        "--stderr /tmp/tirith-stderr",
+        "--hsts /tmp/tirith-hsts",
+        "--alt-svc /tmp/tirith-altsvc",
+        "--etag-save /tmp/tirith-etag",
+        "--libcurl /tmp/tirith-source.c",
+        "--ssl-keylog-file /tmp/tirith-keylog",
+    ])
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_curl_local_artifact_flags_block_without_rescan(self, mock_cfg, mock_run, curl_args):
+        """Curl options that create local artifacts must not pass the read-only gate."""
+        mock_cfg.return_value = dict(self.CFG)
+        findings = [dict(_FP_LOOP_BLOCK), dict(_FP_LOOP_GAP), dict(_FP_BRACE_WRAPPER)]
+        mock_run.return_value = _mock_run(1, _json_stdout(findings, "nested"))
+        command = "{ curl --head " + curl_args + " https://example.test; } > /tmp/evidence 2>&1"
+
+        result = check_command_security(command)
+
+        assert result["action"] == "block"
+        assert mock_run.call_count == 1
+
     @patch("tools.tirith_security.subprocess.run")
     @patch("tools.tirith_security._load_security_config")
     def test_mixed_findings_not_downgraded(self, mock_cfg, mock_run):

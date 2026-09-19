@@ -977,11 +977,19 @@ def _brace_capture_leaf_is_readonly(argv: list[str]) -> bool:
     if head == "ipmitool":
         return bool(args) and args[0] == "sensor" and "thresh" not in args
     if head == "curl":
-        write_or_method_flags = ("-d", "--data", "--data-raw", "--data-binary", "-F", "--form",
-                                 "-T", "--upload-file", "-o", "--output", "-O", "--remote-name",
-                                 "-X", "--request", "-K", "--config")
-        return ("-I" in args or "--head" in args) and not any(
-            arg == flag or arg.startswith(f"{flag}=") for arg in args for flag in write_or_method_flags)
+        # This is deliberately a positive allowlist. Curl has many options that
+        # create local state (cookie/HSTS/Alt-Svc/ETag caches, diagnostics,
+        # generated source, key logs) or change the request. Brace evidence
+        # captures need only HEAD plus presentation/transport switches; every
+        # value-taking or unrecognized option fails closed.
+        safe_head_flags = frozenset({
+            "-I", "--head", "-s", "--silent", "-S", "--show-error", "-v", "--verbose",
+            "-f", "--fail", "--fail-early", "--fail-with-body", "-L", "--location",
+            "-k", "--insecure", "--compressed", "--no-progress-meter", "-4", "--ipv4",
+            "-6", "--ipv6", "-g", "--globoff",
+        })
+        return ("-I" in args or "--head" in args) and all(
+            arg in safe_head_flags or not arg.startswith("-") for arg in args)
     return False
 
 
