@@ -28,7 +28,7 @@ async def test_xai_streamer_opens_local_socket_with_authorization(monkeypatch):
     socket = next(iter(server.sockets))
     streaming_url = f"ws://127.0.0.1:{socket.getsockname()[1]}"
     xai_http = ModuleType("tools.xai_http")
-    xai_http.resolve_xai_http_credentials = lambda: {"api_key": "xai-test-key"}  # type: ignore[attr-defined]
+    xai_http.resolve_xai_http_credentials = lambda **kw: {"api_key": "xai-test-key"}  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "tools.xai_http", xai_http)
 
     try:
