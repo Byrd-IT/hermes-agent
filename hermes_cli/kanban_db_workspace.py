@@ -7,6 +7,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -427,11 +428,42 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _provision_npm_workspace_dependencies(worktree: Path) -> None:
+    """Install locked dependencies once for an npm-workspace worktree."""
+    package_json = worktree / "package.json"
+    package_lock = worktree / "package-lock.json"
+    if (worktree / "node_modules").exists() or not package_json.is_file() or not package_lock.is_file():
+        return
+    try:
+        package = json.loads(package_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not package.get("workspaces"):
+        return
+    npm = shutil.which("npm")
+    if npm is None:
+        raise RuntimeError(f"npm is required to provision workspace dependencies in {worktree}")
+    result = subprocess.run(
+        [npm, "ci", "--maxsockets", "3"],
+        cwd=worktree,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=300,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"npm ci failed while provisioning {worktree}: {detail}")
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None and _git_common_dir(target) == repo_common:
+        _provision_npm_workspace_dependencies(target)
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
@@ -444,6 +476,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
+    _provision_npm_workspace_dependencies(target)
 
 
 def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str]:
@@ -495,6 +528,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
+            _provision_npm_workspace_dependencies(requested_resolved)
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT task's
         # branch (decompose children inherit the root's workspace_path
