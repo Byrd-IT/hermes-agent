@@ -40,13 +40,16 @@ def test_otlp_attrs_redact_strings_and_never_export_profile():
     assert "user@example.com" not in str(attrs)
 
 
-def test_resource_attributes_are_allowlisted_and_sanitized():
+def test_resource_attributes_are_sanitized_not_key_allowlisted():
+    """Custom operator keys (e.g. a `profile` label) pass through; only the VALUE shape and
+    a bounded key-name pattern are enforced — see t_0fc1cfb7 (profile silently dropped)."""
     from agent.monitoring.otlp_exporter import _safe_resource_attributes
 
     attrs = _safe_resource_attributes({
         "service.name": "hermes-gateway",
         "service.instance.id": "install-1",
         "deployment.environment.name": "staging",
+        "profile": "task-manager",
         "user.email": "user@example.com",
         "authorization": "Bearer top-secret-token-0123456789",
         "custom.request.id": "unbounded",
@@ -56,9 +59,30 @@ def test_resource_attributes_are_allowlisted_and_sanitized():
         "service.name": "hermes-gateway",
         "service.instance.id": attrs["service.instance.id"],
         "deployment.environment.name": "staging",
+        "profile": "task-manager",
+        "custom.request.id": "unbounded",
     }
     assert attrs["service.instance.id"].startswith("sha256:")
     assert "install-1" not in attrs["service.instance.id"]
+    # value-shape sanitization still rejects an email (@) and a spaced bearer token
+    assert "user.email" not in attrs
+    assert "authorization" not in attrs
+
+
+def test_resource_attribute_keys_bounded_by_pattern_and_count():
+    from agent.monitoring.otlp_exporter import _safe_resource_attributes
+
+    attrs = _safe_resource_attributes({
+        "Not-Lowercase": "x",
+        "way.too.many.dotted.segments.here": "x",
+        "": "x",
+        **{f"k{i}": "v" for i in range(40)},
+    })
+
+    assert "Not-Lowercase" not in attrs
+    assert "way.too.many.dotted.segments.here" not in attrs
+    assert "" not in attrs
+    assert len(attrs) <= 16
 
 
 
