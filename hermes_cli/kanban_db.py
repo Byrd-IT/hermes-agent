@@ -115,6 +115,17 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# Repo-bound coding cards must not dispatch into an empty scratch workspace.
+# The website entry carries its explicit root because the ops board defaults to
+# Hermes Agent; a worktree without that root would target the wrong repository.
+_AUTO_WORKTREE_REPOS = (
+    ("/usr/local/lib/hermes-agent", None),
+    ("/home/brandonabyrd/projects/Byrd-IT-Website", "/home/brandonabyrd/projects/Byrd-IT-Website"),
+)
+_READ_ONLY_TASK_TEXT_RE = re.compile(
+    r"\b(read[- ]only|do not (edit|modify|commit|touch)|no code change)\b", re.I,
+)
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """``VALID_REASONING_EFFORTS`` or ``"none"`` (thinking off), case-insensitive;
@@ -1352,18 +1363,18 @@ def create_task(
         except Exception:
             pass
     if workspace_kind is None:
-        # Byrd-IT: a card that names the PRODUCTION Hermes install gets a linked
-        # worktree, never scratch. Scratch has no repo, so the worker reaches into
-        # /usr/local/lib/hermes-agent and `git checkout -b`s the checkout every
-        # gateway executes (t_86acfa96, 2026-09-17: production on a feature branch
-        # ~5h). Lives here so BOTH create surfaces (CLI + kanban_create tool) get it.
-        # An explicit workspace_kind, workspace_path, or project still wins; cards
-        # that say read-only / do-not-edit stay scratch.
+        # Lives here so BOTH create surfaces (CLI + kanban_create tool) get it.
+        # Explicit workspace_kind, workspace_path, or project still wins (#106342).
         _text = f"{title}\n{body or ''}"
-        if (workspace_path is None and project_id is None
-                and "/usr/local/lib/hermes-agent" in _text
-                and not re.search(r"\b(read[- ]only|do not (edit|modify|commit|touch)|no code change)\b", _text, re.I)):
-            workspace_kind = "worktree"
+        if workspace_path is None and project_id is None and not _READ_ONLY_TASK_TEXT_RE.search(_text):
+            for repo_marker, repo_root in _AUTO_WORKTREE_REPOS:
+                if repo_marker in _text:
+                    workspace_kind = "worktree"
+                    if repo_root is not None:
+                        workspace_path = repo_root
+                    break
+            else:
+                workspace_kind = "scratch"
         else:
             workspace_kind = "scratch"
     if workspace_kind not in VALID_WORKSPACE_KINDS:
