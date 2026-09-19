@@ -1156,6 +1156,64 @@ class TestLoopAnalysisIncompleteSuppressor:
         assert result["action"] == "block"
         assert mock_run.call_count == 1
 
+    @pytest.mark.parametrize("curl_args", [
+        "--head https://example.test",
+        "-I https://example.test",
+    ])
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_curl_without_first_disable_blocks_without_rescan(self, mock_cfg, mock_run, curl_args):
+        """Curl may read a default curlrc unless -q/--disable is its first argument."""
+        mock_cfg.return_value = dict(self.CFG)
+        findings = [dict(_FP_LOOP_BLOCK), dict(_FP_LOOP_GAP), dict(_FP_BRACE_WRAPPER)]
+        mock_run.return_value = _mock_run(1, _json_stdout(findings, "nested"))
+        command = "{ curl " + curl_args + "; } > /tmp/evidence 2>&1"
+
+        result = check_command_security(command)
+
+        assert result["action"] == "block"
+        assert mock_run.call_count == 1
+
+    @pytest.mark.parametrize("curl_args", [
+        "--head --disable https://example.test",
+        "-I -q https://example.test",
+    ])
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_curl_with_late_disable_blocks_without_rescan(self, mock_cfg, mock_run, curl_args):
+        """Curl honors -q/--disable only when it is its first command-line argument."""
+        mock_cfg.return_value = dict(self.CFG)
+        findings = [dict(_FP_LOOP_BLOCK), dict(_FP_LOOP_GAP), dict(_FP_BRACE_WRAPPER)]
+        mock_run.return_value = _mock_run(1, _json_stdout(findings, "nested"))
+        command = "{ curl " + curl_args + "; } > /tmp/evidence 2>&1"
+
+        result = check_command_security(command)
+
+        assert result["action"] == "block"
+        assert mock_run.call_count == 1
+
+    @pytest.mark.parametrize("curl_args", [
+        "-q --head https://example.test",
+        "--disable -I https://example.test",
+    ])
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_curl_with_first_disable_downgrades_after_clean_rescan(self, mock_cfg, mock_run, curl_args):
+        """The narrowly allowed curl form disables curlrc before a HEAD capture."""
+        mock_cfg.return_value = dict(self.CFG)
+        findings = [dict(_FP_LOOP_BLOCK), dict(_FP_LOOP_GAP), dict(_FP_BRACE_WRAPPER)]
+        mock_run.side_effect = [
+            _mock_run(1, _json_stdout(findings, "nested")),
+            _mock_run(0, _json_stdout()),
+        ]
+        command = "{ curl " + curl_args + "; } > /tmp/evidence 2>&1"
+
+        result = check_command_security(command)
+
+        assert result["action"] == "allow"
+        assert mock_run.call_count == 2
+        assert mock_run.call_args_list[1].args[0][-1] == "curl " + curl_args
+
     @patch("tools.tirith_security.subprocess.run")
     @patch("tools.tirith_security._load_security_config")
     def test_mixed_findings_not_downgraded(self, mock_cfg, mock_run):

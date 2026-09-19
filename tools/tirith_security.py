@@ -977,6 +977,13 @@ def _brace_capture_leaf_is_readonly(argv: list[str]) -> bool:
     if head == "ipmitool":
         return bool(args) and args[0] == "sensor" and "thresh" not in args
     if head == "curl":
+        # Curl reads a default config file unless -q/--disable is its first
+        # argument. That file can opt into local-output state, so the capture
+        # gate must establish this execution property before allowing any
+        # otherwise-safe HEAD arguments.
+        if not args or args[0] not in {"-q", "--disable"}:
+            return False
+        head_args = args[1:]
         # This is deliberately a positive allowlist. Curl has many options that
         # create local state (cookie/HSTS/Alt-Svc/ETag caches, diagnostics,
         # generated source, key logs) or change the request. Brace evidence
@@ -988,8 +995,8 @@ def _brace_capture_leaf_is_readonly(argv: list[str]) -> bool:
             "-k", "--insecure", "--compressed", "--no-progress-meter", "-4", "--ipv4",
             "-6", "--ipv6", "-g", "--globoff",
         })
-        return ("-I" in args or "--head" in args) and all(
-            arg in safe_head_flags or not arg.startswith("-") for arg in args)
+        return ("-I" in head_args or "--head" in head_args) and all(
+            arg in safe_head_flags or not arg.startswith("-") for arg in head_args)
     return False
 
 
