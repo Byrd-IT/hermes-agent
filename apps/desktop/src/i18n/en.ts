@@ -3,45 +3,6 @@ import { FIELD_DESCRIPTIONS, FIELD_LABELS } from '@/app/settings/constants'
 import type { Translations } from './types'
 
 export const en: Translations = {
-  catalog: {
-    listView: 'List view',
-    cardView: 'Card view',
-    installTitle: (name: string) => `Install “${name}”?`,
-    installDescription: 'This skill will be available in new sessions. Only install sources you trust.',
-    installTo: 'Install to',
-    thisComputer: 'This computer',
-    installing: 'Installing…',
-    installComplete: (name: string) => `“${name}” installed`,
-    destinationChanged: 'The destination changed. Close this dialog and open the install link again.',
-    browse: 'Browse',
-    installed: 'Installed',
-    searchSkills: 'Search skills',
-    searchPlugins: 'Search plugins',
-    allSources: 'All sources',
-    allCategories: 'All categories',
-    about: 'About',
-    author: 'Author',
-    source: 'Source',
-    category: 'Category',
-    version: 'Version',
-    platforms: 'Platforms',
-    requires: 'Requires',
-    tools: 'Tools',
-    hooks: 'Hooks',
-    repository: 'Repository',
-    documentation: 'Documentation',
-    noResults: 'No matches',
-    tryAnother: 'Try another search or clear your filters.',
-    clearFilters: 'Clear filters',
-    loadFailed: 'Could not load the catalog',
-    retry: 'Try again',
-    more: 'Show more',
-    pinned: 'Reviewed commit',
-    snapshotHint: 'From the Hermes catalog. Browsing never contacts source repositories.',
-    installHint: 'Review the source before installing. Changes apply to new sessions.',
-    results: (count: number) => `${count.toLocaleString()} result${count === 1 ? '' : 's'}`,
-    back: 'Back to results'
-  },
   connectors: {
     title: 'Connect your apps',
     connect: 'Connect',
@@ -421,7 +382,7 @@ export const en: Translations = {
       'nav.commandCenter': 'Open command center',
       'nav.settings': 'Open settings',
       'nav.profiles': 'Open profiles',
-      'nav.skills': 'Open skills',
+      'nav.capabilities': 'Open skills',
       'nav.messaging': 'Open messaging',
       'nav.artifacts': 'Open artifacts',
       'nav.cron': 'Open scheduled jobs',
@@ -769,6 +730,8 @@ export const en: Translations = {
       colorModeDesc: 'Pick a fixed mode or let Hermes follow your system setting.',
       toolViewTitle: 'Tool Call Display',
       toolViewDesc: 'Product hides raw tool payloads; Technical shows full input/output.',
+      hideCodeDiffsTitle: 'Hide code diffs',
+      hideCodeDiffsDesc: 'Show file edits as inline tool rows with added/removed line counts, without the code.',
       reasoningCollapsedTitle: 'Collapse thinking by default',
       reasoningCollapsedDesc: 'Keep streamed reasoning available without expanding it until you open it.',
       uiScaleTitle: 'UI Scale',
@@ -2054,7 +2017,7 @@ export const en: Translations = {
     nav: {
       newChat: { title: 'New session', detail: 'Start a fresh session' },
       settings: { title: 'Settings', detail: 'Configure Hermes desktop' },
-      skills: { title: 'Capabilities', detail: 'Skills, tools, MCP servers, and plugins' },
+      capabilities: { title: 'Capabilities', detail: 'Skills, tools, MCP servers, and plugins' },
       messaging: { title: 'Messaging', detail: 'Set up Telegram, Slack, Discord, and more' },
       artifacts: { title: 'Artifacts', detail: 'Browse generated outputs' }
     },
@@ -2774,7 +2737,7 @@ export const en: Translations = {
     profileRail: 'Profile rail',
     nav: {
       'new-session': 'New session',
-      skills: 'Capabilities',
+      capabilities: 'Capabilities',
       messaging: 'Messaging',
       artifacts: 'Artifacts',
       cron: 'Scheduled jobs'
@@ -3659,6 +3622,7 @@ export const en: Translations = {
       xhigh: 'Extra High',
       max: 'Max',
       ultra: 'Ultra',
+      sendsOnRoute: (level: string) => `sends ${level} on this route`,
       updateFailed: 'Model option update failed',
       fastFailed: 'Fast mode update failed'
     },
@@ -4096,6 +4060,11 @@ export const en: Translations = {
           title: 'The reply was cut off',
           body: 'The connection dropped before the reply finished. Retry to send it again.'
         },
+        upstream_blocked: {
+          title: 'A firewall blocked the request',
+          body: provider =>
+            `A firewall or CDN in front of ${provider} blocked the request before it reached the model — your key is probably fine. Set a User-Agent header via the provider's extra_headers in Settings, or switch provider, then send your message again.`
+        },
         ssl_cert_verification: {
           title: 'Secure connection failed',
           body: provider =>
@@ -4195,6 +4164,10 @@ export const en: Translations = {
       errorGenericProvider: 'The AI service',
       errorToastTitle: "Hermes couldn't finish the reply",
       errorRetry: 'Retry',
+      errorLimitResets: time => `Limit resets at ${time}`,
+      errorRetryAtReset: time => `Retry when the limit resets (${time})`,
+      errorRetryScheduled: (time, wait) => `Retrying at ${time} — in ${wait}`,
+      errorRetryScheduledCancel: 'Cancel',
       errorStartNewSession: 'Start new session',
       errorSwitchProvider: 'Switch provider',
       errorChooseModel: 'Choose a model',
