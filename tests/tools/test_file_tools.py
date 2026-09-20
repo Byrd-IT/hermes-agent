@@ -111,7 +111,46 @@ class TestWriteFileHandler:
 
 class TestPatchHandler:
 
+    @pytest.mark.parametrize("old_string,new_string", [
+        ("Authorization: ApiKey ***", "Authorization: ApiKey $ES_API_KEY"),
+        ("token = $TOKEN", "token = «redacted-vault-secret»"),
+    ])
+    @patch("tools.file_tools._get_file_ops")
+    def test_replace_rejects_masked_credential_literals(self, mock_get, old_string, new_string):
+        """Display-only redactions must not become fuzzy-match input or file bytes."""
+        from tools.file_tools import patch_tool
 
+        result = json.loads(patch_tool(
+            mode="replace", path="/tmp/config.txt", old_string=old_string, new_string=new_string,
+        ))
+
+        assert "error" in result
+        assert "masked credential" in result["error"].lower()
+        assert "credential-vault" in result["error"]
+        mock_get.assert_not_called()
+
+
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_patch_v4a_rejects_masked_credential_literal_in_hunk(self, mock_get):
+        """V4A control lines use ``***``; only hunk content is forbidden."""
+        from tools.file_tools import patch_tool
+
+        result = json.loads(patch_tool(
+            mode="patch",
+            patch=(
+                "*** Begin Patch\n"
+                "*** Update File: /tmp/config.txt\n"
+                "@@ @@\n"
+                "-Authorization: ApiKey ***\n"
+                "+Authorization: ApiKey $ES_API_KEY\n"
+                "*** End Patch\n"
+            ),
+        ))
+
+        assert "error" in result
+        assert "masked credential" in result["error"].lower()
+        mock_get.assert_not_called()
 
 
     @patch("tools.file_tools._get_file_ops")
