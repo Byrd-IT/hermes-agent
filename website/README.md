@@ -23,14 +23,27 @@ This website is built using [Docusaurus](https://docusaurus.io/), a modern stati
 
 ## Installation
 
+`website/` is a **standalone npm project, not a root npm workspace**. In a fresh
+worktree (no `website/node_modules`), bootstrap it before any Docusaurus command
+(`npm run build:fast`, `npm start`, etc.) or `docusaurus: not found` (exit 127) is
+expected:
+
 ```bash
-yarn
+npm ci --maxsockets 3
+```
+
+Do **not** use `npm --workspace website ...` from the repo root — it fails with
+"No workspaces found" because `website/` is deliberately excluded from the root
+`package.json` `workspaces` array.
+
+```bash
+npm ci
 ```
 
 ## Local Development
 
 ```bash
-yarn start
+npm start
 ```
 
 This command starts a local development server and opens up a browser window. Most changes are reflected live without having to restart the server.
