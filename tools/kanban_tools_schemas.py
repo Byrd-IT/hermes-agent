@@ -339,7 +339,10 @@ KANBAN_ATTACH_SCHEMA = _schema(
         "Use for genuine file artifacts the next worker or a human should "
         "be able to download — generated reports, images, exports. The "
         "file is stored as a real attachment (not a comment link) under "
-        "the task's attachments dir, capped at 25 MB. Prefer "
+        "the task's attachments dir, capped at 25 MB. Inline base64 above "
+        "about 1–2 KB is unsafe because model emission can silently corrupt "
+        "otherwise valid bytes; use kanban_attach_file for a local workspace "
+        "path, kanban_complete(artifacts=[...]) at completion, or "
         "kanban_attach_url when you only have a URL."
     ),
     {
@@ -355,6 +358,24 @@ KANBAN_ATTACH_SCHEMA = _schema(
         "content_type": _prop("string", "Optional MIME type (e.g. 'application/pdf')."),
     },
     ["filename", "content_base64"],
+)
+
+KANBAN_ATTACH_FILE_SCHEMA = _schema(
+    "kanban_attach_file",
+    (
+        "Attach a local file by absolute path without passing its bytes through model "
+        "output. source_path must resolve inside the calling task's workspace or the "
+        "Kanban attachments directory; it is copied server-side, capped at 25 MB. "
+        "Use this for files larger than about 1–2 KB; see KB "
+        "kanban-attach-inline-base64-truncation-pitfall-t451f6599."
+    ),
+    {
+        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "source_path": _prop("string", "Absolute local source file path within an allowed Kanban scope."),
+        "filename": _prop("string", "Optional stored filename; defaults to source_path's leaf name."),
+        "content_type": _prop("string", "Optional MIME type (e.g. 'application/pdf')."),
+    },
+    ["source_path"],
 )
 
 KANBAN_ATTACH_URL_SCHEMA = _schema(

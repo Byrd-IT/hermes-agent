@@ -8,6 +8,7 @@ shlex quoting of JSON metadata, structured-JSON failures). Humans use CLI/dashbo
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -22,7 +23,7 @@ from hermes_cli.goals import judge_goal
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
-    KANBAN_ATTACH_SCHEMA,
+    KANBAN_ATTACH_FILE_SCHEMA, KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_RECORD_COMPLETION_STATE_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA,
@@ -866,7 +867,8 @@ def _store_attachment(board, tid, filename, data, content_type) -> str:
         att_id = kb.store_attachment_bytes(
             conn, tid, str(filename), data,
             content_type=content_type, uploaded_by="agent", board=board)
-        return _ok(task_id=tid, attachment_id=att_id, size=len(data))
+        return _ok(task_id=tid, attachment_id=att_id, size=len(data),
+                   sha256=hashlib.sha256(data).hexdigest())
 
 
 @_kanban_handler("kanban_attach")
@@ -881,6 +883,60 @@ def _handle_attach(args: dict, **kw) -> str:
         data = base64.b64decode(str(content_b64), validate=True)
     except (binascii.Error, ValueError) as e:
         raise _Reject(f"content_base64 is not valid base64: {e}")
+    return _store_attachment(args.get("board"), tid, filename, data, args.get("content_type"))
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    """Whether resolved ``path`` is contained by resolved ``root``."""
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _read_scoped_attachment_source(board: Optional[str], tid: str, raw_path: object) -> tuple[Path, bytes]:
+    """Read a regular source file only from this task's workspace or board attachments.
+
+    Resolving both the source and roots closes symlink escapes before bytes enter the
+    shared attachment writer. The durable board attachment root is intentionally
+    included so workers can reattach prior task evidence without using model-emitted
+    base64; arbitrary host paths remain unavailable to this tool.
+    """
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise _Reject("source_path is required")
+    source = Path(raw_path.strip()).expanduser()
+    _check(source.is_absolute(), "source_path must be an absolute path")
+    try:
+        resolved_source = source.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise _Reject(f"source_path cannot be resolved: {exc}")
+    _check(resolved_source.is_file(), "source_path must name a regular file")
+
+    with _board(board) as (kb, conn):
+        task = _existing_task(kb, conn, tid)
+        workspace_path = getattr(task, "workspace_path", None)
+        roots = [kb.attachments_root(board=board).resolve()]
+        if workspace_path:
+            try:
+                roots.append(Path(workspace_path).expanduser().resolve(strict=True))
+            except (OSError, RuntimeError, ValueError):
+                # A stale workspace must not broaden the attachment read scope.
+                pass
+    _check(any(_path_is_within(resolved_source, root) for root in roots),
+           "source_path must be inside this task's workspace or the Kanban attachments directory")
+    try:
+        return resolved_source, resolved_source.read_bytes()
+    except OSError as exc:
+        raise _Reject(f"could not read source_path: {exc}")
+
+
+@_kanban_handler("kanban_attach_file")
+def _handle_attach_file(args: dict, **kw) -> str:
+    """Attach a scoped local file without routing its bytes through model output."""
+    tid = _worker_guard("kanban_attach_file", args)
+    source, data = _read_scoped_attachment_source(args.get("board"), tid, args.get("source_path"))
+    filename = args.get("filename") or source.name
     return _store_attachment(args.get("board"), tid, filename, data, args.get("content_type"))
 
 
@@ -1199,6 +1255,7 @@ _TOOLS = (
     ("kanban_heartbeat", KANBAN_HEARTBEAT_SCHEMA, _handle_heartbeat, "💓"),
     ("kanban_comment", KANBAN_COMMENT_SCHEMA, _handle_comment, "💬"),
     ("kanban_attach", KANBAN_ATTACH_SCHEMA, _handle_attach, "📎"),
+    ("kanban_attach_file", KANBAN_ATTACH_FILE_SCHEMA, _handle_attach_file, "📎"),
     ("kanban_attach_url", KANBAN_ATTACH_URL_SCHEMA, _handle_attach_url, "📎"),
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),

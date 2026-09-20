@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -1385,3 +1386,69 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+def test_attach_file_round_trips_workspace_bytes_and_returns_sha256(worker_env, monkeypatch, tmp_path):
+    """Server-side path attach preserves a multi-KB workspace file byte-for-byte."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools.registry import registry
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    payload = (b"path-based attachment\n" * 200)
+    source = workspace / "evidence.bin"
+    source.write_bytes(payload)
+    with kbc.connect() as conn:
+        kb.set_workspace_path(conn, worker_env, str(workspace))
+
+    out = registry.dispatch("kanban_attach_file", {"source_path": str(source)})
+    assert isinstance(out, str)
+    data = json.loads(out)
+    assert data["ok"] is True, out
+    assert data["size"] == len(payload)
+    assert data["sha256"] == hashlib.sha256(payload).hexdigest()
+    with kbc.connect() as conn:
+        attachment = kb.get_attachment(conn, data["attachment_id"])
+    assert attachment is not None
+    from pathlib import Path
+    assert Path(attachment.stored_path).read_bytes() == payload
+
+
+def test_attach_file_rejects_outside_scope_and_non_file_source(worker_env, monkeypatch, tmp_path):
+    """Path attach never becomes an arbitrary local-file reader."""
+    from tools import kanban_tools as kt
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"not allowed")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+
+    outside_result = json.loads(kt._handle_attach_file({"source_path": str(outside)}))
+    assert "error" in outside_result
+    assert "workspace" in outside_result["error"]
+    directory_result = json.loads(kt._handle_attach_file({"source_path": str(workspace)}))
+    assert "error" in directory_result
+    assert "regular file" in directory_result["error"]
+
+
+def test_attach_file_rejects_missing_source(worker_env, tmp_path):
+    """A vanished/corrupt source cannot create a metadata row or attachment blob."""
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_attach_file({"source_path": str(tmp_path / "missing.bin")}))
+    assert "error" in result
+    assert "cannot be resolved" in result["error"]
+
+
+def test_attach_inline_returns_stored_sha256(worker_env):
+    """Small inline payloads retain existing semantics and now carry an integrity receipt."""
+    import base64
+    from tools import kanban_tools as kt
+
+    payload = b"small inline payload"
+    out = kt._handle_attach({"filename": "small.txt", "content_base64": base64.b64encode(payload).decode()})
+    data = json.loads(out)
+    assert data["ok"] is True, out
+    assert data["sha256"] == hashlib.sha256(payload).hexdigest()
