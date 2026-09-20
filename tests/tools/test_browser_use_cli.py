@@ -1037,8 +1037,46 @@ class TestBrowserExec:
         result = json.loads(bu_cli.browser_exec('print("hi")'))
         assert result["success"] is True
         assert result["exit_code"] == 0
-        assert 'got:print("hi")' in result["output"]
+        assert result["output"].endswith('print("hi")\n')
         assert "session" not in result
+
+    def test_workspace_helpers_are_importable_and_auto_imported(self, tmp_path, monkeypatch):
+        """Exercise the real stdin command path through a fresh Python harness.
+
+        Browser Harness itself executes submitted code in its globals, so this
+        fake CLI deliberately uses the same ``exec`` shape rather than merely
+        inspecting the code it receives.
+        """
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "agent_helpers.py").write_text(
+            "def greeting(name):\n    return f'hello {name}'\n",
+            encoding="utf-8",
+        )
+        cli = _fake_cli(tmp_path, "python3 -c 'import sys; exec(sys.stdin.read(), {})'\n")
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        monkeypatch.setattr(bu_cli, "_workspace_dir", lambda task_id: str(workspace))
+
+        result = json.loads(bu_cli.browser_exec(
+            "import agent_helpers\nprint(greeting('Ada'))\nprint(agent_helpers.greeting('Lin'))"
+        ))
+
+        assert result["success"] is True
+        assert result["output"].splitlines() == ["hello Ada", "hello Lin"]
+        assert result["workspace"] == str(workspace)
+
+    def test_workspace_bootstrap_preserves_ordinary_browser_exec_code(self, tmp_path, monkeypatch):
+        """No helper file is required; ordinary Python remains executable."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        cli = _fake_cli(tmp_path, "python3 -c 'import sys; exec(sys.stdin.read(), {})'\n")
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        monkeypatch.setattr(bu_cli, "_workspace_dir", lambda task_id: str(workspace))
+
+        result = json.loads(bu_cli.browser_exec("print('ordinary browser exec')"))
+
+        assert result["success"] is True
+        assert result["output"].strip() == "ordinary browser exec"
 
     def test_session_sets_bu_name(self, tmp_path, monkeypatch):
         cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:$BU_NAME"\n')

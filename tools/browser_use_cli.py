@@ -72,6 +72,35 @@ _hermes_ensure_own_tab()
 del _hermes_ensure_own_tab
 """
 
+
+def _workspace_helpers_preamble(code: str, workspace: str) -> str:
+    """Load the workspace helper module before running caller code in the harness.
+
+    Browser Harness executes the submitted program with ``exec(code, globals())``;
+    unlike its built-in helpers, it has no awareness of Hermes' per-task workspace.
+    Load the optional module by its exact path, expose it as ``agent_helpers``, and
+    mirror ``from agent_helpers import *`` for its public names.
+    """
+    return """\
+# hermes: load optional workspace helpers into the Browser Harness globals
+import importlib.util as _hermes_importlib_util
+import sys as _hermes_sys
+from pathlib import Path as _hermes_Path
+_hermes_helpers_path = _hermes_Path({workspace!r}) / "agent_helpers.py"
+if _hermes_helpers_path.is_file():
+    _hermes_spec = _hermes_importlib_util.spec_from_file_location("agent_helpers", _hermes_helpers_path)
+    if _hermes_spec is None or _hermes_spec.loader is None:
+        raise ImportError(f"Cannot load workspace helpers from {{_hermes_helpers_path}}")
+    _hermes_module = _hermes_importlib_util.module_from_spec(_hermes_spec)
+    _hermes_sys.modules["agent_helpers"] = _hermes_module
+    _hermes_spec.loader.exec_module(_hermes_module)
+    _hermes_names = getattr(_hermes_module, "__all__", None)
+    if _hermes_names is None:
+        _hermes_names = (name for name in vars(_hermes_module) if not name.startswith("_"))
+    globals().update({{name: getattr(_hermes_module, name) for name in _hermes_names}})
+    agent_helpers = _hermes_module
+""".format(workspace=workspace) + code
+
 _DEFAULT_TIMEOUT_S = 300
 _MIN_TIMEOUT_S = 5
 _MAX_TIMEOUT_S = 1800
@@ -680,6 +709,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     workspace = _workspace_dir(task_id)
     if workspace:
         env["BH_AGENT_WORKSPACE"] = workspace
+        code = _workspace_helpers_preamble(code, workspace)
 
     # BU_AUTOSPAWN makes the CLI start a Browser Use cloud browser when no local
     # Chrome/CDP endpoint is reachable (their API key authenticates it)
