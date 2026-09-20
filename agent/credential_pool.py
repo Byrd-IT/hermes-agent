@@ -40,6 +40,7 @@ from hermes_cli.auth import (
     _resolve_zai_base_url,
     _save_auth_store,
     _save_provider_state,
+    _coerce_credential_priority,
     _store_provider_state,
     read_credential_pool,
     write_credential_pool,
@@ -234,6 +235,7 @@ class PooledCredential:
     def __post_init__(self):
         if self.extra is None:
             self.extra = {}
+        self.priority = _coerce_credential_priority(self.priority)
         self.auth_type = _normalize_pool_auth_type(self.provider, self.access_token, self.auth_type)
 
     def __getattr__(self, name: str):
@@ -341,7 +343,7 @@ def _codex_entry_tracks_singleton(entry: PooledCredential, singleton_tokens: Dic
 
 
 def _next_priority(entries: List[PooledCredential]) -> int:
-    return max((entry.priority for entry in entries), default=-1) + 1
+    return max((_coerce_credential_priority(entry.priority) for entry in entries), default=-1) + 1
 
 
 def _is_manual_source(source: str) -> bool:
@@ -772,7 +774,7 @@ class _RefreshDone(Exception):
 class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin):
     def __init__(self, provider: str, entries: List[PooledCredential]):
         self.provider = provider
-        self._entries = sorted(entries, key=lambda entry: entry.priority)
+        self._entries = sorted(entries, key=lambda entry: _coerce_credential_priority(entry.priority))
         self._current_id: Optional[str] = None
         self._strategy = get_pool_strategy(provider)
         # RLock: _replace_entry/_persist self-acquire it so the DEFERRED
@@ -2166,13 +2168,13 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
         return False
     manual_entries = sorted(
         (entry for entry in entries if _is_manual_source(entry.source)),
-        key=lambda entry: entry.priority,
+        key=lambda entry: _coerce_credential_priority(entry.priority),
     )
     seeded_entries = sorted(
         (entry for entry in entries if not _is_manual_source(entry.source)),
         key=lambda entry: (
             _ANTHROPIC_SOURCE_RANK.get(entry.source, len(_ANTHROPIC_SOURCE_RANK)),
-            entry.priority,
+            _coerce_credential_priority(entry.priority),
             entry.label,
         ),
     )
@@ -2683,6 +2685,12 @@ def load_pool(provider: str) -> CredentialPool:
         for payload in raw_entries
     )
     changed |= raw_needs_auth_normalization
+    changed |= any(
+        isinstance(payload, dict)
+        and (not isinstance(payload.get("priority", 0), int)
+             or payload.get("priority", 0) != _coerce_credential_priority(payload.get("priority", 0)))
+        for payload in raw_entries
+    )
 
     if provider.startswith(CUSTOM_POOL_PREFIX):
         custom_changed, custom_sources = _seed_custom_pool(provider, entries)
@@ -2703,7 +2711,9 @@ def load_pool(provider: str) -> CredentialPool:
         new_ids = {entry.id for entry in entries}
         write_credential_pool(
             provider,
-            [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
+            [entry.to_dict() for entry in sorted(
+                entries, key=lambda item: _coerce_credential_priority(item.priority)
+            )],
             removed_ids=disk_ids - new_ids,
         )
     return CredentialPool(provider, entries)

@@ -828,6 +828,24 @@ def _entry_ids(entries: Iterable[Any]) -> Dict[str, Dict[str, Any]]:
     return {e.get("id"): e for e in entries if isinstance(e, dict) and e.get("id")}
 
 
+def _coerce_credential_priority(value: Any) -> int:
+    """Return a durable integer priority for legacy or externally-seeded pool rows."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _normalize_credential_pool_entry_priority(entry: Any) -> Any:
+    """Copy a pool row with its priority normalized at the auth-store boundary."""
+    if not isinstance(entry, dict):
+        return entry
+    priority = _coerce_credential_priority(entry.get("priority", 0))
+    if isinstance(entry.get("priority"), int) and entry["priority"] == priority:
+        return entry
+    return {**entry, "priority": priority}
+
+
 def write_credential_pool(
     provider_id: str, entries: List[Dict[str, Any]], *,
     removed_ids: Optional[Iterable[str]] = None,
@@ -846,7 +864,9 @@ def write_credential_pool(
         auth_store = _load_auth_store()
         pool = _store_section(auth_store, "credential_pool")
         sanitized = [
-            sanitize_borrowed_credential_payload(e, provider_id) if isinstance(e, dict) else e
+            _normalize_credential_pool_entry_priority(
+                sanitize_borrowed_credential_payload(e, provider_id)
+            ) if isinstance(e, dict) else e
             for e in entries]
         existing_list = pool.get(provider_id)
         existing_list = existing_list if isinstance(existing_list, list) else []
@@ -855,14 +875,16 @@ def write_credential_pool(
         status_cleared = {cid for cid in (status_cleared_ids or ()) if cid}
         merged: List[Dict[str, Any]] = [
             _merge_disk_cooldown_state(
-                e, None if e.get("id") in status_cleared else existing_by_id.get(e.get("id")), provider_id,
+                e, None if e.get("id") in status_cleared else existing_by_id.get(str(e.get("id") or "")), provider_id,
             )
             if isinstance(e, dict) else e
             for e in sanitized]
         for disk_entry in existing_list:
             disk_id = disk_entry.get("id") if isinstance(disk_entry, dict) else None
             if disk_id and disk_id not in new_ids and disk_id not in removed:
-                merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
+                merged.append(_normalize_credential_pool_entry_priority(
+                    sanitize_borrowed_credential_payload(disk_entry, provider_id)
+                ))
         pool[provider_id] = merged
         return _save_auth_store(auth_store)
 

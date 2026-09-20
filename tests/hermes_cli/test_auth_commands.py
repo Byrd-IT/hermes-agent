@@ -333,6 +333,63 @@ def test_auth_list_shows_entry_id_and_priority(tmp_path, monkeypatch, capsys):
     assert "id=ef56gh priority=1" in out
 
 
+def test_auth_list_coerces_mixed_priority_types_and_repairs_disk(tmp_path, monkeypatch, capsys):
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "string-priority",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": "0",
+                        "source": "manual",
+                        "access_token": "secret-1",
+                    },
+                    {
+                        "id": "integer-priority",
+                        "label": "backup",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "secret-2",
+                    },
+                ]
+            },
+        },
+    )
+
+    from hermes_cli.auth_commands import auth_list_command
+
+    auth_list_command(type("Args", (), {"provider": "openrouter"})())
+
+    assert "openrouter (2 credentials):" in capsys.readouterr().out
+    assert [entry["priority"] for entry in json.loads(
+        (hermes_home / "auth.json").read_text(encoding="utf-8")
+    )["credential_pool"]["openrouter"]] == [0, 1]
+
+
+def test_write_credential_pool_normalizes_priority_to_int(tmp_path, monkeypatch):
+    from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+
+    write_credential_pool(
+        "openrouter",
+        [
+            {"id": "string-priority", "priority": "0", "source": "manual"},
+            {"id": "integer-priority", "priority": 1, "source": "manual"},
+        ],
+    )
+
+    assert [entry["priority"] for entry in read_credential_pool("openrouter")] == [0, 1]
+
+
 def test_interactive_auth_add_accepts_non_registry_configured_provider(
     tmp_path, monkeypatch
 ):
