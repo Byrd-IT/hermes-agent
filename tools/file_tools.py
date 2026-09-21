@@ -147,6 +147,43 @@ def _file_ops_uses_host_paths(file_ops) -> bool:
 _V4A_SINGLE_HEADER_RE = re.compile(r'^(\*\*\*\s*(Update|Add|Delete)\s+File:\s*)(.+)$', re.MULTILINE)
 _V4A_MOVE_HEADER_RE = re.compile(r'^(\*\*\*\s*Move\s+File:\s*)(.+?)\s*->\s*(.+)$', re.MULTILINE)
 
+# The redactor returns ``***`` for short secrets and this exact marker for
+# vault-filled values. Those display-only replacements must never become file
+# content through a fuzzy patch whose source was a redacted tool result.
+_MASKED_SECRET_MARKERS = ("***", "«redacted-vault-secret»")
+
+
+def _masked_secret_edit_error() -> str:
+    """Explain why a display-redacted patch payload is refused."""
+    return (
+        "Refused to apply an edit containing a masked credential literal. "
+        "Masked tool output is display-only and must not be written to files. "
+        "Use the credential-vault or configuration path for secrets instead."
+    )
+
+
+def _contains_masked_secret_marker(*values: str | None) -> bool:
+    """Whether patch text contains a display-only secret redaction marker."""
+    return any(
+        isinstance(value, str) and any(marker in value for marker in _MASKED_SECRET_MARKERS)
+        for value in values
+    )
+
+
+def _v4a_contains_masked_secret_marker(patch: str) -> bool:
+    """Inspect V4A edit content without mistaking its ``***`` control lines for data."""
+    from tools.patch_parser import parse_v4a_patch
+
+    operations, _parse_error = parse_v4a_patch(patch)
+    return any(
+        _contains_masked_secret_marker(
+            hunk.context_hint,
+            *(line.content for line in hunk.lines),
+        )
+        for operation in operations
+        for hunk in operation.hunks
+    )
+
 
 def _rewrite_v4a_patch_paths_for_host(patch: str, path_to_resolved: dict, file_ops) -> str:
     """Rewrite V4A file headers to the resolved host paths (host backends only).
@@ -929,6 +966,10 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     ``cross_profile``: same semantics as ``write_file``'s flag (mirror-guard
     bypass only; unadvertised).
     """
+    if mode == "replace" and _contains_masked_secret_marker(old_string, new_string):
+        return tool_error(_masked_secret_edit_error())
+    if mode == "patch" and patch and _v4a_contains_masked_secret_marker(patch):
+        return tool_error(_masked_secret_edit_error())
     _paths_to_check = [path] if path else []
     _content_write_paths = list(_paths_to_check)
     if mode == "patch" and patch:
