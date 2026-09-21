@@ -150,7 +150,8 @@ _V4A_MOVE_HEADER_RE = re.compile(r'^(\*\*\*\s*Move\s+File:\s*)(.+?)\s*->\s*(.+)$
 # The redactor returns ``***`` for short secrets and this exact marker for
 # vault-filled values. Those display-only replacements must never become file
 # content through a fuzzy patch whose source was a redacted tool result.
-_MASKED_SECRET_MARKERS = ("***", "«redacted-vault-secret»")
+_MASKED_SECRET_MARKER = "***"
+_VAULT_MASKED_SECRET_MARKER = "«redacted-vault-secret»"
 
 
 def _masked_secret_edit_error() -> str:
@@ -165,7 +166,8 @@ def _masked_secret_edit_error() -> str:
 def _contains_masked_secret_marker(*values: str | None) -> bool:
     """Whether patch text contains a display-only secret redaction marker."""
     return any(
-        isinstance(value, str) and any(marker in value for marker in _MASKED_SECRET_MARKERS)
+        isinstance(value, str)
+        and (value == _MASKED_SECRET_MARKER or _VAULT_MASKED_SECRET_MARKER in value)
         for value in values
     )
 
@@ -177,8 +179,8 @@ def _v4a_contains_masked_secret_marker(patch: str) -> bool:
     operations, _parse_error = parse_v4a_patch(patch)
     return any(
         _contains_masked_secret_marker(
-            hunk.context_hint,
-            *(line.content for line in hunk.lines),
+            (hunk.context_hint or "").strip(),
+            *(line.content.strip() for line in hunk.lines),
         )
         for operation in operations
         for hunk in operation.hunks

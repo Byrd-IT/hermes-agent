@@ -165,8 +165,8 @@ class TestPatchHandler:
         mock_ops.patch_replace.assert_called_once_with("/tmp/f.py", "foo", "bar", False)
 
     @pytest.mark.parametrize("old_string,new_string", [
-        ("Authorization: ApiKey ***", "Authorization: ApiKey $ES_API_KEY"),
-        ("token = $TOKEN", "token = «redacted-vault-secret»"),
+        ("***", "replacement"),
+        ("token = $TOKEN", "prefix «redacted-vault-secret» suffix"),
     ])
     @patch("tools.file_tools._get_file_ops")
     def test_replace_rejects_masked_credential_literals(self, mock_get, old_string, new_string):
@@ -197,8 +197,13 @@ class TestPatchHandler:
         mock_ops.patch_v4a.assert_called_once()
 
     @patch("tools.file_tools._get_file_ops")
-    def test_patch_v4a_rejects_masked_credential_literal_in_hunk(self, mock_get):
-        """V4A control lines use ``***``; only hunk content is forbidden."""
+    def test_patch_v4a_allows_format_mention_in_hunk_content(self, mock_get):
+        """Embedded V4A syntax is ordinary code, not a redacted secret."""
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"status": "ok"}
+        mock_ops.patch_v4a.return_value = result_obj
+        mock_get.return_value = mock_ops
         from tools.file_tools import patch_tool
 
         result = json.loads(patch_tool(
@@ -207,8 +212,29 @@ class TestPatchHandler:
                 "*** Begin Patch\n"
                 "*** Update File: /tmp/config.txt\n"
                 "@@ @@\n"
-                "-Authorization: ApiKey ***\n"
-                "+Authorization: ApiKey $ES_API_KEY\n"
+                "-assert \"old value\" in output\n"
+                "+assert \"*** End Patch\" in output\n"
+                "*** End Patch\n"
+            ),
+        ))
+
+        assert result["status"] == "ok"
+        mock_ops.patch_v4a.assert_called_once()
+
+    @pytest.mark.parametrize("hunk_line", ["+***", "+token = prefix «redacted-vault-secret» suffix"])
+    @patch("tools.file_tools._get_file_ops")
+    def test_patch_v4a_rejects_masked_credential_literal_in_hunk(self, mock_get, hunk_line):
+        """Only a whole masked value or the vault marker is forbidden in V4A content."""
+        from tools.file_tools import patch_tool
+
+        result = json.loads(patch_tool(
+            mode="patch",
+            patch=(
+                "*** Begin Patch\n"
+                "*** Update File: /tmp/config.txt\n"
+                "@@ @@\n"
+                "-existing value\n"
+                f"{hunk_line}\n"
                 "*** End Patch\n"
             ),
         ))
