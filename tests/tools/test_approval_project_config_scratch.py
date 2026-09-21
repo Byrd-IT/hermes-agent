@@ -96,6 +96,16 @@ class TestScratchWorkspaceDestinationsAllowed:
         assert detect_dangerous_command(f"cat {source_config} > {scratch}/config.yaml") == (False, None, None)
         assert detect_dangerous_command(f"cat {source_config} | tee {scratch}/.env") == (False, None, None)
 
+    @pytest.mark.parametrize("command_template", [
+        "printf x | tee {scratch}/.env {scratch}/config.yaml",
+        "printf x | tee -a {scratch}/.env {scratch}/config.yaml",
+        "printf x | tee --append {scratch}/.env {scratch}/config.yaml",
+        "printf x | tee -- {scratch}/.env {scratch}/config.yaml",
+        "printf x > {scratch}/.env > {scratch}/config.yaml",
+    ])
+    def test_all_scratch_multi_target_writes_are_exempt(self, scratch, command_template):
+        assert detect_dangerous_command(command_template.format(scratch=scratch)) == (False, None, None)
+
     def test_redirection_relative_destination_with_pinned_cwd(self, scratch, monkeypatch):
         monkeypatch.chdir(scratch)
         assert detect_dangerous_command("echo key=val > .env") == (False, None, None)
@@ -137,6 +147,22 @@ class TestScratchWorkspaceDestinationsAllowed:
 # ---------------------------------------------------------------------------
 
 class TestScratchGuardSafety:
+    @pytest.mark.parametrize("command_template", [
+        "printf x | tee {protected}/.env {scratch}/.env",
+        "printf x | tee {scratch}/.env {protected}/.env",
+        "printf x | tee -a {protected}/.env {scratch}/.env",
+        "printf x | tee --append {scratch}/.env {protected}/.env",
+        "printf x | tee -- {protected}/.env {scratch}/.env",
+        "printf x > {protected}/config.yaml > {scratch}/config.yaml",
+    ])
+    def test_multi_target_write_with_protected_destination_stays_flagged(
+            self, scratch, tmp_path, command_template):
+        protected = tmp_path / "project"
+        is_dangerous, _, description = detect_dangerous_command(
+            command_template.format(protected=protected, scratch=scratch)
+        )
+        assert is_dangerous, description
+
     def test_symlink_escape_outside_scratch_still_flagged(self, scratch, source_config, tmp_path):
         """A symlink INSIDE the workspace pointing OUT: the destination resolves
         outside every root, so the historical flag must survive."""

@@ -213,8 +213,14 @@ def _replace_hunk(content: str, hunk: Hunk, search_pattern: str, replacement: st
 
     # Keep validation and apply parity: both retry ambiguous global matches near
     # an explicit hunk hint before reporting failure.
-    hint_pos = content.find(hunk.context_hint) if hunk.context_hint else -1
     hint_window_ambiguous = False
+    hint_pos = -1
+    if error and hunk.context_hint:
+        occurrences, ambiguity = _hint_ambiguity(content, hunk.context_hint)
+        if ambiguity:
+            return content, 0, ambiguity, cursor
+        if occurrences == 1:
+            hint_pos = content.find(hunk.context_hint)
     if error and hint_pos != -1:
         window_start = max(0, hint_pos - 500)
         window_end = min(len(content), hint_pos + 2000)

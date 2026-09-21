@@ -1605,12 +1605,62 @@ def _effective_cwd_for_segments(command: str, roots: tuple) -> str:
     return cwd
 
 
+def _scratch_write_destinations(argv: list[str], pattern_description: str) -> tuple[str, ...] | None:
+    """Conservatively parse every write destination in one shell segment.
+
+    ``None`` means parsing was incomplete and callers must retain the approval
+    requirement. ``tee`` writes every non-option operand; shell redirections
+    each write their following operand. Other project-write rules retain the
+    historical final-operand convention.
+    """
+    destinations: list[str] = []
+    saw_write_syntax = False
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in {">", ">>"}:
+            saw_write_syntax = True
+            if index + 1 >= len(argv) or argv[index + 1] in {"|", ">", ">>"}:
+                return None
+            destinations.append(argv[index + 1])
+            index += 2
+            continue
+        if token != "tee":
+            index += 1
+            continue
+
+        saw_write_syntax = True
+        index += 1
+        end_of_options = False
+        tee_destinations: list[str] = []
+        while index < len(argv) and argv[index] not in {"|", ">", ">>"}:
+            operand = argv[index]
+            if not end_of_options and operand == "--":
+                end_of_options = True
+            elif not end_of_options and operand in {"-a", "--append"}:
+                pass
+            elif not end_of_options and operand.startswith("-"):
+                return None
+            else:
+                tee_destinations.append(operand)
+            index += 1
+        if not tee_destinations:
+            return None
+        destinations.extend(tee_destinations)
+
+    if saw_write_syntax:
+        return tuple(destinations)
+    if pattern_description == "overwrite project env/config file":
+        return (argv[-1],)
+    return None
+
+
 def _scratch_scrub_project_config_match(command: str, pattern_description: str) -> bool:
     """True keeps the historical flag; False skips the project-rule match.
 
     Returns False only when the matched rule is one of the project env/config
-    write rules, kanban scratch roots are configured, and the LAST command
-    segment's destination operand resolves under a root. Anything ambiguous
+    write rules, kanban scratch roots are configured, and EVERY conclusively
+    parsed destination operand resolves under a root. Anything ambiguous
     (parse failure, expansion metachars, multi-segment command) stays flagged.
     """
     if pattern_description not in _PROJECT_WRITE_DESCRIPTIONS:
@@ -1630,9 +1680,12 @@ def _scratch_scrub_project_config_match(command: str, pattern_description: str) 
         return True
     if len(argv) < 2:
         return True
-    destination = argv[-1]
+    destinations = _scratch_write_destinations(argv, pattern_description)
+    if not destinations:
+        return True
     cwd = _effective_cwd_for_segments(command, roots)
-    if _destination_resolves_under_scratch(destination, roots, cwd):
+    if all(_destination_resolves_under_scratch(destination, roots, cwd)
+           for destination in destinations):
         return False
     return True
 

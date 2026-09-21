@@ -935,6 +935,37 @@ class TestSafeCursorHunkSelection:
         assert "include unique context lines" in (error or "").lower()
         assert "add a unique @@ hint @@" not in (error or "").lower()
 
+    def test_duplicate_hint_window_rejects_atomically_after_preceding_hunk(self):
+        """A duplicate fallback hint must not select its first window silently."""
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: providers.py\n"
+            "@@ prologue @@\n"
+            "-prologue = old\n"
+            "+prologue = new\n"
+            "@@ duplicated hint @@\n"
+            "-value =  old\n"
+            "+value = new\n"
+            "*** End Patch\n"
+        )
+        ops, err = parse_v4a_patch(patch)
+        assert err is None
+        original = (
+            "prologue = old\n"
+            "duplicated hint\n"
+            "value = old\n"
+            + ("padding\n" * 400)
+            + "duplicated hint\n"
+            "value = old\n"
+        )
+        fo = _DictFileOps({"providers.py": original})
+
+        result = apply_v4a_operations(ops, fo)
+
+        assert result.success is False
+        assert fo.files["providers.py"] == original
+        assert "context hint 'duplicated hint' is ambiguous" in (result.error or "")
+
     def test_later_broad_hunk_with_remaining_duplicates_rejects_atomically(self):
         patch = (
             "*** Begin Patch\n"
