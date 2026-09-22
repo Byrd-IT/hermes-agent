@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 from collections.abc import MutableMapping
 from contextvars import ContextVar, Token
@@ -1112,6 +1113,42 @@ def apply_secure_dir_policy(path) -> None:
         mode = int(explicit_mode or "700", 8)
     except ValueError:
         mode = 0o700
+    # A chmod on a directory with a POSIX ACL resets the ACL mask to the chmod's group
+    # bits, silently voiding any named-user grants (e.g. a web user traversing HERMES_HOME).
+    # When an ACL is present with named-user entries, skip the chmod if it would only narrow
+    # the mask; keep it when it would widen permissions beyond the operator's configured mode.
+    # (Byrd-IT patch; KB QvKRt6ABoiu35iVggyXX; re-applied by secure_dir_acl_guard.sh)
+    try:
+        if path is not None and os.path.isdir(str(path)):
+            has_named_user_acl = False
+            acl_mask = None
+            try:
+                raw = subprocess.run(
+                    ["getfacl", "-p", "--absolute-names", str(path)],
+                    capture_output=True, text=True, timeout=5, check=True,
+                ).stdout
+                for line in raw.splitlines():
+                    line = line.strip()
+                    if line.startswith("user:") and not line.startswith(("user::", "user:default")):
+                        has_named_user_acl = True
+                    elif line.startswith("mask:"):
+                        parts = line.split(":", 2)
+                        if len(parts) == 3 and parts[2].strip():
+                            acl_mask = parts[2].strip()
+            except (OSError, subprocess.SubprocessError):
+                pass  # getfacl unavailable or failed -> fall through to plain chmod
+            if has_named_user_acl and acl_mask:
+                group_rwx = bool(mode & 0o070)
+                would_narrow = (
+                    ("w" in acl_mask and not group_rwx)
+                    or ("r" in acl_mask and not mode & 0o040)
+                    or ("x" in acl_mask and not mode & 0o010)
+                )
+                if would_narrow:
+                    _chown_to_hermes_uid(path)
+                    return  # preserve the operator's ACL grants; skip this chmod
+    except NameError:
+        pass
     try:
         os.chmod(path, mode)
     except (OSError, NotImplementedError):
