@@ -98,6 +98,31 @@ if _hermes_home_points_at_production(os.environ.get("HERMES_HOME", "")):
     os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
     atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
 
+
+def _relocate_tempdir_outside_real_root() -> None:
+    """Move the process temp dir out of the live Hermes root.
+
+    Every Hermes agent process exports ``TMPDIR=<root>/profiles/<p>/cache/scratch``,
+    so pytest launched by an agent inherits a temp dir INSIDE ``~/.hermes``. Any
+    test that builds a HERMES_HOME with ``tempfile.mkdtemp()`` then gets a home
+    under the real root, which ``get_default_hermes_root()`` folds back to the
+    real root — pytest fixture cards landed on the live ops board this way.
+    """
+    from hermes_state_guard import _real_platform_state_root
+
+    real_root = _real_platform_state_root()
+    if real_root is None or not Path(tempfile.gettempdir()).resolve().is_relative_to(real_root):
+        return
+    base = Path("/var/tmp") if os.name != "nt" and os.path.isdir("/var/tmp") else real_root.parent  # no-tmp: ok — disk-backed FHS root
+    safe = Path(tempfile.mkdtemp(prefix="hermes-pytest-tmpdir-", dir=base))
+    for var in ("TMPDIR", "TMP", "TEMP"):
+        os.environ[var] = str(safe)
+    tempfile.tempdir = str(safe)
+    atexit.register(shutil.rmtree, str(safe), True)
+
+
+_relocate_tempdir_outside_real_root()
+
 # Subprocess-surviving isolation marker (#82770). PYTEST_CURRENT_TEST /
 # PYTEST_VERSION are pytest's own vars, and tests that spawn children
 # routinely rebuild the child env and strip them ("the subprocess must look

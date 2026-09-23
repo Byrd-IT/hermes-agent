@@ -15,9 +15,12 @@ import pytest
 
 
 @pytest.fixture()
-def isolated_kanban_home_with_profiles(monkeypatch):
+def isolated_kanban_home_with_profiles(tmp_path, monkeypatch):
     """Spin up a fresh HERMES_HOME with kanban DB + alpha/beta profiles."""
-    test_home = tempfile.mkdtemp(prefix="kanban_per_profile_cap_test_")
+    # tmp_path, never tempfile.mkdtemp(): agent processes export TMPDIR inside
+    # ~/.hermes, and a HERMES_HOME under the real root folds back to the LIVE board.
+    test_home = str(tmp_path / "hermes_home")
+    os.makedirs(test_home, exist_ok=True)
     for prof in ("alpha", "beta", "default"):
         os.makedirs(os.path.join(test_home, "profiles", prof), exist_ok=True)
         with open(os.path.join(test_home, "profiles", prof, "config.yaml"), "w") as fh:

@@ -18,9 +18,12 @@ import pytest
 
 
 @pytest.fixture()
-def isolated_kanban_home(monkeypatch):
+def isolated_kanban_home(tmp_path, monkeypatch):
     """Spin up a fresh HERMES_HOME with a clean kanban DB."""
-    test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
+    # tmp_path, never tempfile.mkdtemp(): agent processes export TMPDIR inside
+    # ~/.hermes, and a HERMES_HOME under the real root folds back to the LIVE board.
+    test_home = str(tmp_path / "hermes_home")
+    os.makedirs(test_home, exist_ok=True)
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
     evicted_modules = {

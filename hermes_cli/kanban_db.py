@@ -508,10 +508,74 @@ def _board_path(
     return board_dir(slug) / leaf
 
 
+def _kanban_guard_bypassed() -> bool:
+    """Same opt-outs as the state.db guard: the env twin (spawned children) or the
+    ``hermes_state._STATE_DB_GUARD_BYPASS`` flag set by ``live_system_guard_bypass``."""
+    if os.environ.get("HERMES_STATE_DB_GUARD_BYPASS"):
+        return True
+    hs = sys.modules.get("hermes_state")
+    return bool(getattr(hs, "_STATE_DB_GUARD_BYPASS", False))
+
+
+def _live_kanban_root() -> Optional[Path]:
+    """The OS user's real ``~/.hermes`` from the passwd entry, not ``$HOME``: tests
+    legitimately repoint HOME at a tmp dir, and that tmp ``.hermes`` is not live."""
+    try:
+        import pwd
+        return (Path(pwd.getpwuid(os.getuid()).pw_dir) / ".hermes").resolve()
+    except (ImportError, KeyError, OSError, AttributeError):
+        return None  # Windows / no passwd entry: caller falls back to the platform root
+
+
+def ensure_kanban_test_isolation(path: Path) -> Path:
+    """Raise when a test-context process resolves a LIVE kanban DB; returns *path*.
+
+    Twin of ``hermes_state._ensure_test_isolation``. Lives in the resolver itself
+    (not only in a conftest monkeypatch) because tests evict and re-import
+    ``hermes_cli`` after the autouse fixtures ran, and a HERMES_HOME that lands
+    *under* the real root (e.g. ``tempfile.mkdtemp()`` with the agent-exported
+    ``TMPDIR=<root>/profiles/<p>/cache/scratch``) makes ``get_default_hermes_root()``
+    fold back to the real root — which is how pytest fixture cards landed on the
+    live ops board. Protected: ``<root>/kanban.db*`` and everything under
+    ``<root>/kanban/``.
+    """
+    from hermes_state_guard import _in_test_context, _real_platform_state_root
+
+    if _kanban_guard_bypassed() or not _in_test_context():
+        return path
+    root = _live_kanban_root() or _real_platform_state_root()
+    if root is None:
+        return path
+    try:
+        resolved = Path(path).expanduser().resolve()
+    except Exception:
+        return path
+    live = resolved.parent == root and resolved.name.startswith("kanban.db")
+    if not live:
+        try:
+            resolved.relative_to(root / "kanban")
+            live = True
+        except ValueError:
+            live = False
+    if live:
+        raise RuntimeError(
+            f"live-system guard: test resolved the LIVE kanban DB {resolved} (under real "
+            f"Hermes root {root}). Tests must use a HERMES_HOME outside the real root "
+            "(use pytest's tmp_path, not tempfile.mkdtemp(): agent processes export "
+            "TMPDIR inside ~/.hermes). If a test genuinely needs the live board, mark it "
+            "@pytest.mark.live_system_guard_bypass, or export HERMES_STATE_DB_GUARD_BYPASS=1 "
+            "in a spawned child."
+        )
+    return path
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
     """``kanban.db`` path: ``HERMES_KANBAN_DB`` pins it (injected into workers);
-    ``default`` -> ``<root>/kanban.db`` (back-compat), else the board dir."""
-    return _board_path("HERMES_KANBAN_DB", board, ("kanban.db",), "kanban.db")
+    ``default`` -> ``<root>/kanban.db`` (back-compat), else the board dir.
+    Under test context a live-board result raises (:func:`ensure_kanban_test_isolation`)."""
+    return ensure_kanban_test_isolation(
+        _board_path("HERMES_KANBAN_DB", board, ("kanban.db",), "kanban.db")
+    )
 
 
 def workspaces_root(board: Optional[str] = None) -> Path:
