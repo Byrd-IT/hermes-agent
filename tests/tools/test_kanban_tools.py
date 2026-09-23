@@ -907,6 +907,16 @@ def test_kanban_guidance_prompt_size_bounded():
     )
 
 
+def test_kanban_guidance_scratch_workspace_is_not_a_repo():
+    """Scratch workspaces are empty non-git dirs; guidance must say so, so
+    reviewers don't run `git status` in them and hit `not a git repository`
+    (ops t_289e9cad)."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "non-git" in KANBAN_GUIDANCE
+    assert "git -C <repo>" in KANBAN_GUIDANCE
+
+
 def test_kanban_guidance_orchestrator_decision_ownership():
     """The orchestrator section must carry the split-brain prevention
     contract: decisions are made by the orchestrator before fan-out and
