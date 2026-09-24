@@ -7,6 +7,7 @@ import types
 import io
 import contextlib
 from argparse import Namespace
+from pathlib import Path
 
 import pytest
 
@@ -1279,6 +1280,12 @@ class TestDoctorStaleMaxIterationsDrift:
 
         monkeypatch.setattr(doctor_mod, "HERMES_HOME", hermes_home)
         monkeypatch.setattr(doctor_mod, "get_hermes_home", lambda: hermes_home)
+        # fix=True also runs the command-link repair, which relinks
+        # Path.home()/.local/bin/hermes at PROJECT_ROOT's venv: keep both in tmp.
+        project = tmp_path / "project"
+        project.mkdir(exist_ok=True)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
         # Point the config helpers at the temp home.
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         if os_environ_value is not None:

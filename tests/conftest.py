@@ -844,6 +844,42 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
     return None
 
 
+# ── Operator command-link guard ─────────────────────────────────────────────
+# HOME is deliberately NOT redirected (see module docstring), so any code path
+# that "repairs" the command link (``hermes doctor --fix`` →
+# ``doctor_platform._check_command_installation``) relinks the operator's REAL
+# ``~/.local/bin/hermes`` at whichever checkout's venv is running the tests. A
+# full-suite run in a worktree silently repointed a production launcher that
+# way. Deny-list the real directory (captured at import, before any test
+# patches ``Path.home``) for every link/unlink/rename primitive.
+
+_REAL_LOCAL_BIN = os.path.abspath(os.path.expanduser("~/.local/bin"))
+
+
+def _targets_real_local_bin(path) -> bool:
+    try:
+        return os.path.dirname(os.path.abspath(os.fspath(path))) == _REAL_LOCAL_BIN
+    except TypeError:
+        return False
+
+
+@pytest.fixture(autouse=True)
+def _real_local_bin_guard(monkeypatch):
+    def _guard(name, orig, path_arg_index):
+        def _guarded(*args, **kwargs):
+            if kwargs.get("dir_fd") is None and len(args) > path_arg_index \
+                    and _targets_real_local_bin(args[path_arg_index]):
+                raise PermissionError(
+                    f"test tried os.{name} on the operator's real "
+                    f"{args[path_arg_index]!s}; patch Path.home()/PROJECT_ROOT to tmp_path"
+                )
+            return orig(*args, **kwargs)
+        return _guarded
+
+    for name, idx in (("symlink", 1), ("unlink", 0), ("remove", 0), ("replace", 1), ("rename", 1)):
+        monkeypatch.setattr(os, name, _guard(name, getattr(os, name), idx))
+
+
 # ── Kanban write guard (#69283) ─────────────────────────────────────────────
 # When hermetic isolation is bypassed (stale checkout, wrong rootdir, direct
 # invocation), kanban writes silently pollute the real ~/.hermes. This autouse
