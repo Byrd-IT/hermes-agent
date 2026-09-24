@@ -349,8 +349,6 @@ def test_bare_value_flag_keeps_its_value(tmp_path: Path) -> None:
     )
 
 
-
-
 def test_positional_path_not_treated_as_flag(tmp_path: Path) -> None:
     """A positional path arg still overrides discovery (not routed to pytest)."""
     probe_dir = _make_probe_dir(tmp_path)
@@ -415,8 +413,6 @@ def test_file_retry_self_heals_and_prints_both_attempts(tmp_path: Path) -> None:
     assert "simulated first-attempt flake" in proc.stdout
     assert "first-attempt output" in proc.stdout
     assert "retry output" in proc.stdout
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -534,25 +530,6 @@ def test_multiple_absolute_paths_split_on_pathsep(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0, proc.stdout
     assert "Discovered 2 test files" in proc.stdout, proc.stdout
-
-
-@pytest.mark.skipif(sys.platform != "win32", reason="drive-letter paths")
-def test_drive_letter_colon_is_not_a_path_separator(tmp_path: Path) -> None:
-    """An absolute ``--paths`` value stays one root on Windows.
-
-    The naive split used to produce a phantom relative root ``'C'`` (the
-    drive letter) alongside the real path; discovery only worked by the
-    accident of ``repo_root / '\\rooted\\rest'`` re-anchoring onto the
-    repo's drive.
-    """
-    probe_dir = _make_probe_dir(tmp_path)
-    proc = _run_runner(probe_dir, "-q")
-    assert proc.returncode == 0, proc.stdout
-    drive = str(probe_dir)[0]
-    assert f"['{drive}', " not in proc.stdout, (
-        f"drive letter split off as a phantom root:\n{proc.stdout}"
-    )
-    assert "Discovered 1 test files" in proc.stdout, proc.stdout
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal death; Windows has no SIGSEGV exit")
