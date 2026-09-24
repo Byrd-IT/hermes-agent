@@ -1199,10 +1199,10 @@ def apply_secure_dir_policy(path, *, home: str | Path | None = None) -> None:
             has_named_user_acl = False
             acl_mask = None
             try:
-                raw = subprocess.run(
+                raw = getattr(subprocess.run(
                     ["getfacl", "-p", "--absolute-names", str(path)],
                     capture_output=True, text=True, timeout=5, check=True,
-                ).stdout
+                ), "stdout", None) or ""
                 for line in raw.splitlines():
                     line = line.strip()
                     if line.startswith("user:") and not line.startswith(("user::", "user:default")):
