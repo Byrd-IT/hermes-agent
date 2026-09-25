@@ -211,6 +211,40 @@ def test_config_and_constants_share_one_policy_implementation(tmp_path, monkeypa
     assert stat.S_IMODE(os.stat(f).st_mode) == 0o640
 
 
+@pytest.mark.linux_only
+def test_named_user_acl_mask_survives_policy_without_spawning_a_process(tmp_path, monkeypatch):
+    """A named-user ACL grant on HERMES_HOME (e.g. a web user) must survive the policy chmod, and
+    the ACL check must not shell out: apply_secure_dir_policy runs on every config load, including
+    under code that fakes subprocess (the getfacl version leaked into cron's Popen stubs)."""
+    from hermes_constants import apply_secure_dir_policy
+
+    for var in ("HERMES_MANAGED", "HERMES_CONTAINER", "HERMES_SKIP_CHMOD", "HERMES_UID", "HERMES_GID"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("HERMES_HOME_MODE", "0710")
+    target = tmp_path / "shared"
+    target.mkdir(mode=0o700)
+
+    def entry(tag, perm, ident=0xFFFFFFFF):
+        return tag.to_bytes(2, "little") + perm.to_bytes(2, "little") + ident.to_bytes(4, "little")
+
+    acl = (2).to_bytes(4, "little") + entry(0x01, 7) + entry(0x02, 7, 65534) \
+        + entry(0x04, 0) + entry(0x10, 7) + entry(0x20, 0)
+    try:
+        os.setxattr(target, "system.posix_acl_access", acl)
+    except OSError as exc:
+        pytest.skip(f"filesystem without POSIX ACLs: {exc}")
+
+    def no_spawn(*_a, **_k):
+        raise AssertionError("ACL check spawned a process")
+
+    monkeypatch.setattr(subprocess, "run", no_spawn)
+    monkeypatch.setattr(subprocess, "Popen", no_spawn)
+    apply_secure_dir_policy(target)
+
+    assert stat.S_IMODE(os.stat(target).st_mode) & 0o070 == 0o070  # group bits == ACL mask rwx
+
+
 def test_prune_reaps_process_living_in_idle_entry_and_spares_live_tree(tmp_path):
     """A process whose cwd is inside an idle entry is gone by the time the entry is
     (a lane's headless browsers survived for days with a deleted cwd); one living in a
