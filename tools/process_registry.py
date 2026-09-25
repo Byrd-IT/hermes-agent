@@ -150,7 +150,7 @@ def _enclosing_cgroup_memory_max_bytes() -> Optional[int]:
         v2 = next((ln for ln in lines if ln.startswith("0::")), None)
         if v2 is not None:
             relative = v2.partition("::")[2].lstrip("/")
-            raw_limit = (Path("/sys/fs/cgroup") / relative / "memory.max").read_text(encoding="utf-8").strip()
+            raw_limit = (Path("/sys/fs/cgroup") / relative / "memory.max").read_text(encoding="utf-8-sig").strip()
             if raw_limit.isdigit() and int(raw_limit) >= _MIN_WORKER_MEMORY_MAX_BYTES:
                 return int(raw_limit)
     return None
@@ -603,6 +603,8 @@ class ProcessSession:
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
+    _reader_finish_requested: threading.Event = field(default_factory=threading.Event, repr=False)
+    _reader_selectable: bool = field(default=False, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (use_pty=True)
 
     def __post_init__(self):
@@ -1428,6 +1430,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 fd = None
             if fd is not None:
                 import select as _select
+                session._reader_selectable = True
             idle_after_exit = 0
             while True:
                 if fd is not None:
@@ -1436,6 +1439,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     except (ValueError, OSError):
                         break  # fd already closed
                     if not ready:
+                        if session._reader_finish_requested.is_set():
+                            break
                         # Direct child gone and pipe idle ~200ms: a few more cycles for a
                         # buffered tail, then stop rather than wait forever on an orphaned
                         # grandchild's pipe.
@@ -1450,6 +1455,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     break  # true EOF — all writers closed
                 if chunk:
                     _append_chunk(chunk)
+                if session._reader_finish_requested.is_set():
+                    break
                 idle_after_exit = 0
         except Exception as e:
             logger.debug("Process stdout reader ended: %s", e)
@@ -1958,6 +1965,26 @@ class ProcessRegistry(ProcessCheckpointMixin):
             return
         if rc is None:
             return  # Direct child still running — reader block is legitimate.
+        reader = session._reader_thread
+        if (
+            not _IS_WINDOWS
+            and session._reader_selectable
+            and reader is not None
+            and reader.is_alive()
+        ):
+            # The reader owns the pipe and completion payload. Asking it to
+            # finish avoids a competing TextIOWrapper read here racing the
+            # reader, publishing an empty owner-stamped result, then closing
+            # the pipe before the buffered tail is ingested. It wakes within
+            # the reader's bounded select interval (or after one final chunk).
+            session._reader_finish_requested.set()
+            with session._lock:
+                session.mark_exited(rc)
+            logger.info(
+                "Reconciled session %s: direct child exited with code %s; "
+                "reader will publish the owned completion after its final drain.",
+                session.id, rc)
+            return
         # Best-effort non-blocking drain of whatever the reader hasn't consumed.
         stdout = getattr(proc, "stdout", None)
         if stdout is not None and not _IS_WINDOWS:
@@ -2492,6 +2519,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
         tracked = self._running.keys() | self._finished.keys()
         self._completion_consumed &= tracked
         self._poll_observed &= tracked
+
 
 
 

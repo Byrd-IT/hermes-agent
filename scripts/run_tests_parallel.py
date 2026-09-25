@@ -34,7 +34,7 @@ Usage:
     pytest failure. Tokens after ``--`` are never validated.
 
 Environment:
-    HERMES_TEST_WORKERS  Override worker count (default: os.cpu_count()*2,
+    HERMES_TEST_WORKERS  Override worker count (default: os.cpu_count(),
                          clamped to fit a detected cgroup memory.max cap —
                          see _default_job_count())
     HERMES_TEST_PATHS    Override discovery roots (colon-sep; on Windows
@@ -60,6 +60,12 @@ from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# The CI lane selector owns the platforms() spec resolver; share it so the
+# "skipped on this host" note and the lanes can never disagree.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from scripts.ci.list_os_marked_tests import gated_specs, spec_hosts  # noqa: E402
+
+
 def _sweep_killed_run_roots(root: str) -> None:
     """Remove per-file temp roots older runs left behind. Each attempt deletes its own root
     in ``finally``, but a runner that is SIGKILLed (a tool timeout, a stray pkill) never gets
@@ -82,18 +88,24 @@ def _rmtree_force(path: str) -> None:
             pass
     shutil.rmtree(path, onerror=_chmod_retry)
 
-
 def _runner_scratch_root() -> str:
     """Per-run temp roots live on DISK, never the system temp dir: a full-suite run writes
     gigabytes of tmp_path fixtures and /tmp is RAM-backed tmpfs on many Linux hosts. /var/tmp is
     the FHS disk-backed temp root and is used because the alternatives fail tests that assume
     the root's shape: under the Hermes home conftest relocates the basetemp; under a dot-dir
     (~/.cache) the hidden-dir search tests see every fixture as hidden; anything longer than
-    the old /tmp root pushes AF_UNIX test sockets past sun_path."""
+    the old /tmp root pushes AF_UNIX test sockets past sun_path.
+
+    The name is per-USER because a fixed literal in a world-writable sticky dir belongs to
+    whoever created it first: a root-owned root (a container or system-service run) makes every
+    later makedirs/mkdtemp here fail with EPERM for every other user on the host, with no way
+    back that does not need root. Keying by uid means no run is blocked by another's leftovers.
+    """
+    name = "hermes-pytest" + (f"-{os.getuid()}" if hasattr(os, "getuid") else "")
     if os.name == "nt" or not os.path.isdir("/var/tmp"):  # no-tmp: ok — probing the disk-backed FHS root
-        root = os.path.join(tempfile.gettempdir(), "hermes-pytest")
+        root = os.path.join(tempfile.gettempdir(), name)
     else:
-        root = "/var/tmp/hermes-pytest"  # no-tmp: ok — /var/tmp is disk-backed by FHS, never tmpfs
+        root = f"/var/tmp/{name}"  # no-tmp: ok — /var/tmp is disk-backed by FHS, never tmpfs
     os.makedirs(root, exist_ok=True)
     return root
 
@@ -188,7 +200,7 @@ def _default_job_count() -> int:
 
     ``HERMES_TEST_WORKERS`` is an explicit override and is always honored
     verbatim, uncapped — the caller stated intent. Absent that, the
-    historical default is ``cpu_count() * 2``, but when this process is
+    default is one worker per core (``cpu_count()``, upstream), but when this process is
     running inside a cgroup with a finite ``memory.max`` (the systemd-run
     ``--scope --property MemoryMax=`` wrapper every local kanban-worker
     subprocess tree runs under), that default is clamped so the spawned
@@ -197,7 +209,7 @@ def _default_job_count() -> int:
     env_override = os.environ.get("HERMES_TEST_WORKERS", "").strip()
     if env_override:
         return int(env_override)
-    cpu_default = (os.cpu_count() or 4) * 2
+    cpu_default = os.cpu_count() or 4
     mem_max = _cgroup_memory_max_bytes()
     if mem_max is None:
         return cpu_default
@@ -270,42 +282,42 @@ def _read_files_from(spec: str) -> List[str]:
         text = sys.stdin.read()
     else:
         try:
-            text = Path(spec).read_text(encoding="utf-8")
+            text = Path(spec).read_text(encoding="utf-8-sig")
         except OSError as exc:
             print(f"error: --files-from: cannot read {spec!r}: {exc}", file=sys.stderr)
             sys.exit(2)
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
-_OS_MARKERS = {
-    "linux_only": ("linux", "the main Linux CI lane"),
-    "macos_only": ("darwin", "the tests-os CI lane (macos-latest)"),
-    "windows_only": ("win32", "the tests-os CI lane (windows-latest)"),
+# Lane names keyed the way platforms() specs resolve (scripts/ci/list_os_marked_tests.py
+# shares the resolver with the CI selector so the note and the lanes never disagree).
+_HOST_LANE = {"linux": "linux", "darwin": "macos", "win32": "windows"}
+_LANES = {
+    "linux": "the main Linux CI lane",
+    "macos": "the macOS Python-tests lane",
+    "windows": "the Windows Python-tests lane",
 }
 
 
 def _off_host_marker_files(files: List[Path]) -> dict[str, int]:
-    """Count discovered files referencing each marker for an OS we are not on.
+    """Count discovered files carrying a platforms() spec that excludes this host.
 
-    Whole-word text match, same approach as scripts/ci/list_os_marked_tests.py:
+    Text-level scan, same resolver as scripts/ci/list_os_marked_tests.py:
     over-counting a prose mention is harmless here (the note is informational);
     what matters is never reporting 0 while gated tests exist.
     """
-    off_host = {
-        marker: re.compile(rf"\b{marker}\b")
-        for marker, (host_prefix, _) in _OS_MARKERS.items()
-        if not sys.platform.startswith(host_prefix)
-    }
-    counts = {marker: 0 for marker in off_host}
+    host = _HOST_LANE.get(sys.platform, sys.platform)
+    counts: dict[str, int] = {}
     for path in files:
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
         except OSError:
             continue
-        for marker, pattern in off_host.items():
-            if pattern.search(text):
-                counts[marker] += 1
-    return {marker: n for marker, n in counts.items() if n}
+        for spec in gated_specs(text):
+            hosts = spec_hosts(spec)
+            if hosts and host not in hosts:
+                counts[spec] = counts.get(spec, 0) + 1
+    return counts
 
 
 def _approximately_count_tests(
@@ -324,7 +336,7 @@ def _approximately_count_tests(
     results = {}
 
     for path in files:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             contents = f.read()
         results[path] = contents.count("def test_")
 
@@ -667,6 +679,9 @@ def _run_one_file_once(
         # behind; make them writable and retry instead of skipping them.
         _rmtree_force(temproot)
 
+    if rc not in (0, 5) and not output.strip():
+        output = f"pytest child exited {rc} (0x{rc & 0xffffffff:08x}) with no output: {file}\n"
+
     if rc == 5:
         # No tests collected in THIS file — legitimate per-file: a
         # platform-gated or fully-marker-filtered file (e.g. a win32-only
@@ -882,7 +897,7 @@ def _load_durations(repo_root: Path) -> dict[str, float]:
     if not path.is_file():
         return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8-sig"))
     except (json.JSONDecodeError, OSError) as e:
         print("[ERROR] Failed to load json durations file! {e}")
         return {}
@@ -1064,7 +1079,7 @@ def main() -> int:
         default=_default_job_count(),
         help=(
             "Parallel worker count (default: $HERMES_TEST_WORKERS, else "
-            "cpu_count*2 clamped to fit a detected cgroup memory.max cap)"
+            "cpu_count clamped to fit a detected cgroup memory.max cap)"
         ),
     )
     parser.add_argument(
@@ -1486,16 +1501,16 @@ def main() -> int:
 
     # Host-OS gating note: tests marked for another OS were skipped by the
     # conftest hook, not run. Say so explicitly — a green local run on Linux
-    # proves nothing about the macos_only/windows_only tests, and the reader
+    # proves nothing about the platforms("windows") tests, and the reader
     # should know where they DO run rather than misreading skips as coverage.
     off_host = _off_host_marker_files(files)
     if off_host:
         print()
-        for marker, n in sorted(off_host.items()):
-            _, lane = _OS_MARKERS[marker]
+        for spec, n in sorted(off_host.items()):
+            lanes = ", ".join(_LANES[lane] for lane in sorted(spec_hosts(spec)))
             print(
-                f"  note: {marker} tests (in {n} file{'s' if n != 1 else ''}) were "
-                f"SKIPPED on this host ({sys.platform}); they run on {lane}."
+                f"  note: platforms({spec!r}) tests (in {n} file{'s' if n != 1 else ''}) were "
+                f"SKIPPED on this host ({sys.platform}); they run on {lanes}."
             )
 
     # Zero tests collected across the WHOLE run is NOT a pass. Per-file rc=5
