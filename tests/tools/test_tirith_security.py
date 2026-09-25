@@ -1,6 +1,7 @@
 """Tests for the tirith security scanning subprocess wrapper."""
 
 import json
+import os
 import subprocess
 import time
 from unittest.mock import MagicMock, patch
