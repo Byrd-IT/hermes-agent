@@ -25,12 +25,22 @@ def _real_root() -> Path:
     return root
 
 
-def test_home_nested_under_real_root_is_refused(monkeypatch):
-    """The exact escape: HERMES_HOME under <root>/profiles/<p>/cache/scratch."""
-    home = _real_root() / "profiles" / "no-such-profile" / "cache" / "scratch" / "fixture_home"
+def test_home_nested_under_real_root_never_reaches_live_db(monkeypatch):
+    """The exact escape: HERMES_HOME under <root>/profiles/<p>/cache/scratch.
+
+    Either the resolver refuses (when the home folds back to the real root) or
+    it resolves inside the fixture home (upstream no longer folds a marker-less
+    profile dir); it must never hand back the live board."""
+    root = _real_root()
+    home = root / "profiles" / "no-such-profile" / "cache" / "scratch" / "fixture_home"
     monkeypatch.setenv("HERMES_HOME", str(home))
-    with pytest.raises(RuntimeError, match="LIVE kanban DB"):
-        kanban_db.kanban_db_path()
+    try:
+        path = kanban_db.kanban_db_path().resolve()
+    except RuntimeError as exc:
+        assert "LIVE kanban DB" in str(exc)
+        return
+    assert not (path.parent == root and path.name.startswith("kanban.db"))
+    assert not path.is_relative_to(root / "kanban")
 
 
 @pytest.mark.parametrize("rel", ["kanban.db", "kanban/boards/ops/kanban.db"])

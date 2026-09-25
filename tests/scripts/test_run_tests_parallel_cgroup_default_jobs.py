@@ -2,9 +2,9 @@
 
 kanban workers run scripts/run_tests.sh -> run_tests_parallel.py wrapped in
 tools/process_registry.py's ``systemd-run --user --scope --property
-MemoryMax=<cap>`` (effectively 4GiB on a typical host). The historical
-default worker count is ``os.cpu_count() * 2`` — 112 on a 56-core host —
-which spawns 112 concurrent ``python -m pytest <file>`` interpreters and
+MemoryMax=<cap>`` (effectively 4GiB on a typical host). The default
+worker count is ``os.cpu_count()`` (upstream; formerly ``* 2``) — 56 on a
+56-core host — which spawns 56 concurrent ``python -m pytest <file>`` interpreters and
 blows straight through a 4GiB scope. The kernel cgroup OOM killer then
 kills the scope's top-level process (the kanban worker itself, not a test
 subprocess), silently ending the agent turn with no exception surfaced.
@@ -12,7 +12,7 @@ subprocess), silently ending the agent turn with no exception surfaced.
 _default_job_count() must clamp the default to fit a detected cgroup
 memory.max, while still honoring an explicit HERMES_TEST_WORKERS override
 verbatim (the caller stated intent) and never *raising* the default above
-cpu_count()*2 just because headroom exists.
+cpu_count() just because headroom exists.
 """
 
 from __future__ import annotations
@@ -33,19 +33,19 @@ def _load_runner():
     return mod
 
 
-def test_no_cgroup_info_falls_back_to_cpu_count_times_two(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_no_cgroup_info_falls_back_to_cpu_count(monkeypatch: pytest.MonkeyPatch) -> None:
     mod = _load_runner()
     monkeypatch.delenv("HERMES_TEST_WORKERS", raising=False)
     monkeypatch.setattr(mod, "_cgroup_memory_max_bytes", lambda: None)
     monkeypatch.setattr(mod.os, "cpu_count", lambda: 56)
-    assert mod._default_job_count() == 112
+    assert mod._default_job_count() == 56
 
 
-def test_tight_memory_cap_clamps_default_below_cpu_count_times_two(
+def test_tight_memory_cap_clamps_default_below_cpu_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Reproduces the OOM incident: 56 cores, 4GiB scope -> naive default
-    112 workers, clamped default must fit inside the cap."""
+    56 workers, clamped default must fit inside the cap."""
     mod = _load_runner()
     monkeypatch.delenv("HERMES_TEST_WORKERS", raising=False)
     monkeypatch.setattr(mod.os, "cpu_count", lambda: 56)
@@ -54,20 +54,20 @@ def test_tight_memory_cap_clamps_default_below_cpu_count_times_two(
 
     clamped = mod._default_job_count()
 
-    assert clamped < 112
+    assert clamped < 56
     assert clamped * mod._ASSUMED_WORKER_RSS_BYTES <= four_gib
 
 
 def test_generous_memory_cap_does_not_raise_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """A cgroup with ample headroom must not push the default ABOVE the
-    historical cpu_count()*2 ceiling."""
+    unclamped cpu_count() default."""
     mod = _load_runner()
     monkeypatch.delenv("HERMES_TEST_WORKERS", raising=False)
     monkeypatch.setattr(mod.os, "cpu_count", lambda: 4)
     huge = 512 * 1024 * 1024 * 1024
     monkeypatch.setattr(mod, "_cgroup_memory_max_bytes", lambda: huge)
 
-    assert mod._default_job_count() == 8
+    assert mod._default_job_count() == 4
 
 
 def test_explicit_env_override_wins_verbatim_even_under_a_tight_cap(

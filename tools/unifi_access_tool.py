@@ -15,7 +15,7 @@ import json
 import urllib.request
 import urllib.error
 import ssl
-import yaml
+import hermes_yaml as yaml
 import time
 import logging
 from typing import Dict, Any, List, Optional
