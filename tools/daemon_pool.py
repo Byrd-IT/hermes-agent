@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import threading
 import weakref
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures.thread import _worker
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import thread as _cf_thread
+from concurrent.futures.thread import BrokenThreadPool, _WorkItem, _worker
 from contextvars import copy_context
 
 __all__ = ["DaemonThreadPoolExecutor"]
@@ -33,7 +34,34 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
 
         def _run_with_context(*call_args, **call_kwargs):
             return ctx.run(fn, *call_args, **call_kwargs)
+        if _cf_thread._shutdown:
+            return self._submit_during_interpreter_shutdown(_run_with_context, args, kwargs)
         return super().submit(_run_with_context, *args, **kwargs)
+
+    def _submit_during_interpreter_shutdown(self, fn, args, kwargs):
+        """Stdlib ``submit`` minus the module-global interpreter-shutdown refusal.
+
+        ``threading._register_atexit`` sets ``concurrent.futures.thread._shutdown`` BEFORE
+        ``atexit`` handlers run, and stdlib ``submit`` then refuses work on EVERY pool — even a
+        fresh one. That guard exists to protect the non-daemon, ``_threads_queues``-registered
+        workers the stdlib atexit hook joins; ours are neither, so it does not apply. Without
+        this, a tool call made from an atexit path (the CLI's memory-provider shutdown turn)
+        fails with "cannot schedule new futures after interpreter shutdown". The per-instance
+        ``_shutdown``/``_broken`` guards are kept.
+        """
+        with self._shutdown_lock:
+            if self._broken:
+                raise BrokenThreadPool(self._broken)
+            if self._shutdown:
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            f = Future()
+            if hasattr(self, "_resolve_work_item_task"):  # Python 3.14+
+                w = _WorkItem(f, self._resolve_work_item_task(fn, args, kwargs))
+            else:
+                w = _WorkItem(f, fn, args, kwargs)
+            self._work_queue.put(w)
+            self._adjust_thread_count()
+            return f
 
     def _adjust_thread_count(self) -> None:
         # Mirrors CPython's implementation with two changes:

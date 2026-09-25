@@ -94,6 +94,65 @@ def test_submit_propagates_caller_contextvars():
         pool.shutdown(wait=True)
 
 
+def test_submit_runs_after_interpreter_shutdown_flag_is_set(monkeypatch):
+    """``threading._register_atexit`` sets ``concurrent.futures.thread._shutdown`` BEFORE atexit
+    handlers run, and stdlib ``submit`` then refuses every pool. The CLI's memory-provider shutdown
+    turn runs from atexit and its tool calls died with "cannot schedule new futures after
+    interpreter shutdown"; daemon workers are never joined by that hook, so the pool must run it."""
+    import concurrent.futures.thread as cf_thread
+    from contextvars import ContextVar
+
+    var = ContextVar("daemon_pool_shutdown_var", default="unset")
+    monkeypatch.setattr(cf_thread, "_shutdown", True)
+    pool = DaemonThreadPoolExecutor(max_workers=1)
+    try:
+        token = var.set("scoped")
+        try:
+            is_daemon, seen = pool.submit(
+                lambda: (threading.current_thread().daemon, var.get())
+            ).result(timeout=10)
+        finally:
+            var.reset(token)
+        assert (is_daemon, seen) == (True, "scoped")
+        # Arguments still reach the callable on the shutdown path.
+        assert pool.submit(lambda a, b=0: a + b, 2, b=3).result(timeout=10) == 5
+    finally:
+        pool.shutdown(wait=True)
+
+
+def test_instance_shutdown_still_refuses_during_interpreter_shutdown(monkeypatch):
+    import concurrent.futures.thread as cf_thread
+
+    import pytest
+
+    monkeypatch.setattr(cf_thread, "_shutdown", True)
+    pool = DaemonThreadPoolExecutor(max_workers=1)
+    pool.shutdown(wait=True)
+    with pytest.raises(RuntimeError, match="after shutdown"):
+        pool.submit(lambda: None)
+
+
+def test_submit_from_real_atexit_handler_runs():
+    """Real interpreter teardown, no patching: a submit from an atexit handler completes."""
+    script = (
+        "import sys; sys.path.insert(0, %r)\n"
+        "import atexit\n"
+        "from tools.daemon_pool import DaemonThreadPoolExecutor\n"
+        "def _at_exit():\n"
+        "    pool = DaemonThreadPoolExecutor(max_workers=1)\n"
+        "    try:\n"
+        "        print('atexit-result', pool.submit(lambda: 42).result(timeout=10), flush=True)\n"
+        "    except Exception as e:\n"
+        "        print('atexit-error', e, flush=True)\n"
+        "    finally:\n"
+        "        pool.shutdown(wait=True)\n"
+        "atexit.register(_at_exit)\n"
+    ) % (str(_repo_root()),)
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    assert "atexit-result 42" in proc.stdout, proc.stdout + proc.stderr
+
+
 def _capture_worker_args(monkeypatch, pool):
     """Swap the stdlib worker for one that records its args and resolves one item.
 

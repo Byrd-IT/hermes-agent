@@ -347,3 +347,20 @@ def test_sequential_timeout_does_not_cut_clarify_human_wait(
     assert "timed out" not in messages[0]["content"]
     assert messages[1]["content"] == "second result"
     assert not any(event.get("error_type") == "tool_timeout" for event in terminal_events)
+
+
+def test_sequential_tool_runs_during_interpreter_shutdown(tmp_path, monkeypatch):
+    """The CLI memory-shutdown turn runs from atexit, after concurrent.futures has flagged
+    interpreter shutdown; its tool call must still dispatch instead of failing with
+    "cannot schedule new futures after interpreter shutdown"."""
+    import concurrent.futures.thread as cf_thread
+
+    agent = _make_agent(tmp_path)
+    calls = [_tool_call("teardown")]
+    messages: list[dict] = []
+    monkeypatch.setattr(cf_thread, "_shutdown", True)
+    with patch("model_tools.handle_function_call", return_value="teardown result"):
+        execute_tool_calls_sequential(agent, SimpleNamespace(tool_calls=calls), messages, "task")
+
+    assert [m["tool_call_id"] for m in messages] == ["teardown"]
+    assert messages[0]["content"] == "teardown result"
