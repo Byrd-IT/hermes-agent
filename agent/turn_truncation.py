@@ -44,7 +44,7 @@ _CONTEXT_OVERFLOW_PARTIAL_FINAL = (
 
 def collapse_continuation_trail(
     agent: Any, messages: List[Dict[str, Any]], current_turn_user_idx: Any, *,
-    finish_reason: str, parts: Optional[List[Tuple[str, bool]]] = None,
+    finish_reason: str, parts: Optional[List[str]] = None,
 ) -> str:
     """Drop this turn's ``_length_continuation_fragment``/``_nudge`` rows and append one
     assistant row holding the joined, think-stripped partial; returns that text ("" none).
@@ -59,7 +59,7 @@ def collapse_continuation_trail(
     if parts is None and not (valid_idx and idx < len(messages)):
         return ""
     turn_start = idx + 1 if valid_idx else 0
-    fragment_parts: List[Tuple[str, bool]] = []
+    fragment_parts: List[str] = []
     retained: List[Any] = []
     found_trail = False
     for message in messages[turn_start:]:
@@ -69,7 +69,7 @@ def collapse_continuation_trail(
             found_trail = True
             content = message.get("content")
             if message.get("_length_continuation_fragment") and isinstance(content, str) and content:
-                fragment_parts.append((content, False))
+                fragment_parts.append(content)
             continue
         retained.append(message)
     if parts is None and not found_trail:
