@@ -1306,6 +1306,107 @@ def _iter_shell_command_word_spans(command: str):
             positionals = _COMMAND_WRAPPER_POSITIONAL_ARGS.get(name, 0)
 
 
+_DOCKER_LIFECYCLE_DESCRIPTIONS = frozenset({
+    "docker compose restart/stop/kill/down (container lifecycle)",
+    "docker restart/stop/kill (container lifecycle)",
+})
+# Commands whose arguments and stdin are data, never executed, so docker lifecycle words inside
+# them are prose (`echo`, `git commit -m`, `grep PATTERN`, `hermes kanban create --body`). Every
+# other command's segment is still scanned: xargs, find -exec, ssh, watch and interpreters DO run
+# their arguments, so an allowlist of prose commands (not a denylist of executors) keeps them flagged.
+_DOCKER_LIFECYCLE_PROSE_COMMANDS = frozenset({
+    "cat", "echo", "egrep", "fgrep", "git", "grep", "hermes", "printf", "rg",
+})
+# git can run shell through `-c alias.x='!cmd'`, core.sshCommand, etc., so it is prose only when the
+# subcommand directly follows `git` and only carries messages/patterns.
+_DOCKER_LIFECYCLE_GIT_PROSE_RE = re.compile(r'\S*git\s+(?:commit|grep|log|show|tag|notes)\b')
+
+
+def _command_word_name(word: str) -> str:
+    return os.path.basename(_deobfuscate_shell_word_for_detection(word)).lower()
+
+
+def _mask_prose_heredoc_bodies(command: str) -> str:
+    """Blank here-doc bodies fed to a prose command, preserving line boundaries.
+
+    The command-start scanner treats every body line as an executable position, so documentation
+    fed to ``cat``/``hermes`` reads as commands. Only bodies whose owning command is in
+    ``_DOCKER_LIFECYCLE_PROSE_COMMANDS`` are masked: ``ssh host <<EOF`` or ``python3 - <<EOF`` bodies
+    are code and stay visible. Unterminated here-docs mask to the end (the shell would still be
+    waiting for the delimiter).
+    """
+    masked = list(command)
+    cursor = 0
+    while cursor < len(command):
+        operator = next((
+            index
+            for kind, index, _, quote in _scan_shell(command, cursor)
+            if kind == "char" and quote is None and command.startswith("<<", index)
+            and (index == 0 or command[index - 1] != "<")
+            and not command.startswith("<<<", index)
+        ), None)
+        if operator is None:
+            break
+        strip_tabs = command.startswith("<<-", operator)
+        _, delimiter_end, delimiter_word = _read_shell_word(command, operator + 2 + strip_tabs)
+        header_end = command.find("\n", delimiter_end)
+        delimiter = _deobfuscate_shell_word_for_detection(delimiter_word)
+        if header_end < 0 or not delimiter:
+            break
+        body_start = header_end + 1
+        line_start = body_start
+        body_end = len(command)
+        while line_start < len(command):
+            line_end = command.find("\n", line_start)
+            if line_end < 0:
+                line_end = len(command)
+            line = command[line_start:line_end]
+            if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+                body_end = line_end + (line_end < len(command))
+                break
+            line_start = line_end + 1
+        owners = [_command_word_name(word)
+                  for _, _, word in _iter_shell_command_word_spans("".join(masked[:operator]))]
+        if owners and owners[-1] in _DOCKER_LIFECYCLE_PROSE_COMMANDS:
+            for index in range(body_start, body_end):
+                if masked[index] != "\n":
+                    masked[index] = " "
+        cursor = body_end
+    return "".join(masked)
+
+
+def _docker_lifecycle_matches_outside_prose(command: str, pattern_re) -> bool:
+    """Match a docker lifecycle pattern in any command segment not led by a prose command.
+
+    Nested ``$(...)``/backtick commands are their own command starts, so ``echo $(docker stop x)``
+    is still flagged even though its ``echo`` segment is skipped.
+    """
+    command = _mask_prose_heredoc_bodies(command)
+    for start, _, word in _iter_shell_command_word_spans(command):
+        name = _command_word_name(word)
+        segment = _shell_command_segment(command, start).lower()
+        if name in _DOCKER_LIFECYCLE_PROSE_COMMANDS and (
+            name != "git" or _DOCKER_LIFECYCLE_GIT_PROSE_RE.match(segment)
+        ):
+            continue
+        if pattern_re.search(segment):
+            return True
+    return False
+
+
+def _docker_lifecycle_requires_raw_scan(command: str, variant: str) -> bool:
+    """Keep policy payloads and shell-carrier code subject to lifecycle detection.
+
+    ``command_allowlist`` is itself an approval boundary: treating its quoted value as prose would
+    let an unattended worker store a lifecycle approval without a prompt. Shell-carrier arguments
+    are executable code, and extracted ``bash -c`` variants must inherit that fact from the source.
+    """
+    return any(
+        "command_allowlist" in candidate.lower() or _contains_shell_carrier(candidate)
+        for candidate in (command, variant)
+    )
+
+
 def _shell_command_segment(command: str, start: int) -> str:
     """Bound a candidate to its command, preserving quoted argument bytes."""
     end = len(command)
@@ -1742,7 +1843,12 @@ def detect_dangerous_command(command: str) -> tuple:
         command_lower = _lower_preserving_flags(variant)
         masked_lower: str | None = None
         for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
-            if description in _QUOTE_MASKED_DANGEROUS_DESCRIPTIONS:
+            if description in _DOCKER_LIFECYCLE_DESCRIPTIONS:
+                if _docker_lifecycle_requires_raw_scan(command, variant):
+                    matches = pattern_re.search(command_lower)
+                else:
+                    matches = _docker_lifecycle_matches_outside_prose(variant, pattern_re)
+            elif description in _QUOTE_MASKED_DANGEROUS_DESCRIPTIONS:
                 if masked_lower is None:
                     masked_lower = _lower_preserving_flags(
                         _mask_quoted_prose(variant)
