@@ -240,6 +240,11 @@
     "kind": "bare_which"
   },
   {
+    "path": "hermes_cli/kanban_db_dispatch.py",
+    "symbol": "_scope_descendant_summary",
+    "kind": "bare_which"
+  },
+  {
     "path": "hermes_cli/linux_desktop_entry.py",
     "symbol": "_refresh_hicolor_cache",
     "kind": "bare_which"
