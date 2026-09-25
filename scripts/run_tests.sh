@@ -11,9 +11,7 @@
 #   * Env vars blanked (conftest.py also does this, but this
 #     is belt-and-suspenders for anyone running pytest outside our
 #     conftest path — e.g. on a single file)
-#   * The activated checkout's test environment (activates when needed); on
-#     Byrd-IT hosts an existing pytest-capable .venv, venv, or the canonical
-#     /usr/local/lib/hermes-agent/venv is used before activating
+#   * The activated checkout's test environment (activates when needed)
 #
 # Usage:
 #   scripts/run_tests.sh                            # full suite
@@ -50,28 +48,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # the Nix devShell's editable venv and CI's minimal installer lanes provide
 # one on purpose. The import check matters: a wrapped `hermes` binary exports
 # HERMES_PYTHON pointing at a release venv without pytest.
-#
-# Byrd-IT (d92f212324): with neither an activation nor HERMES_PYTHON, reuse an
-# existing pytest-capable venv — the checkout's own .venv/venv, then the
-# canonical deployment venv — before activating. Activation runs setup, which
-# stages tools into the live ~/.hermes/tools store; worktrees on this host must
-# not provision into the operator's Hermes home just to run tests.
 _has_pytest() { [ -n "$1" ] && [ -x "$1" ] && "$1" -c 'import pytest' 2>/dev/null; }
 # shellcheck source=scripts/_activation.sh
 . "$SCRIPT_DIR/_activation.sh"
-BYRD_FALLBACK_PYTHON=""
-if [ -z "${__HERMES_ACTIVATED:-}" ] && ! _has_pytest "${HERMES_PYTHON:-}"; then
-  for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" /usr/local/lib/hermes-agent/venv; do
-    if _has_pytest "$candidate/bin/python"; then
-      BYRD_FALLBACK_PYTHON="$candidate/bin/python"
-      break
-    fi
-  done
-fi
-if [ -n "$BYRD_FALLBACK_PYTHON" ]; then
-  PYTHON="$BYRD_FALLBACK_PYTHON"
-  echo "▶ not activated — using existing venv: $PYTHON"
-elif [ -z "${__HERMES_ACTIVATED:-}" ] && _has_pytest "${HERMES_PYTHON:-}"; then
+if [ -z "${__HERMES_ACTIVATED:-}" ] && _has_pytest "${HERMES_PYTHON:-}"; then
   PYTHON="$HERMES_PYTHON"
   echo "▶ not activated — using HERMES_PYTHON: $PYTHON"
 else

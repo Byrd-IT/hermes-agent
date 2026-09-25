@@ -177,16 +177,21 @@ session-scoped. Assert the GUI session gets the tool **with the env var absent**
 ## Development Environment
 
 ```bash
-source /usr/local/lib/hermes-agent/venv/bin/activate   # this deployment (upstream: source ./activate)
+source ./activate   # provisions/syncs PM tools + dependencies, then activates
 ```
-On this deployment, the canonical repository virtual environment is
-`/usr/local/lib/hermes-agent/venv`. The main checkout has no `.venv`; a worktree
-may carry its own `.venv`. Upstream's `source ./activate` provisions PM tools into
-`~/.hermes/tools`, so do not run it here without an isolated `HERMES_HOME` and
-`HERMES_RUNTIME_DIR` (see `website/docs/reference/package-management.md#developer-workflow`).
-`scripts/run_tests.sh` honours an existing activation, then a pytest-capable
-`HERMES_PYTHON`, then (Byrd-IT) the first pytest-capable `$REPO_ROOT/.venv`,
-`$REPO_ROOT/venv`, or `/usr/local/lib/hermes-agent/venv`, and only then activates.
+Select an isolated development `HERMES_HOME` and `HERMES_RUNTIME_DIR` first;
+see `website/docs/reference/package-management.md#developer-workflow`.
+PowerShell: `. .\activate.ps1`. `deactivate` restores the prior environment.
+For tests, use the independent test environment in `CONTRIBUTING.md` (or Nix);
+PM activation's `PYTHONPATH` does not survive the test runner's environment scrub.
+`scripts/run_tests.sh` uses an existing activation, then a pytest-capable
+`HERMES_PYTHON`, else activates the checkout itself.
+
+Byrd-IT hosts: `/usr/local/lib/hermes-agent/venv` is the pre-PM Python 3.11 venv
+and cannot run this tree's 3.14-gated dependencies. In a worktree or agent shell,
+export a throwaway `HERMES_HOME` and `HERMES_RUNTIME_DIR` (and `HOME`) before
+`./activate` or `scripts/run_tests.sh`, or PM provisions into the live
+`~/.hermes/tools`/`~/.hermes/installs` and may republish `~/.local/bin` launchers.
 
 ## Project Structure
 
