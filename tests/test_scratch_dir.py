@@ -225,7 +225,7 @@ def test_secure_file_skips_chmod_on_canonical_container_signal(tmp_path, monkeyp
     assert stat.S_IMODE(os.stat(f).st_mode) == 0o640
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_named_user_acl_mask_survives_policy_without_spawning_a_process(tmp_path, monkeypatch):
     """A named-user ACL grant on HERMES_HOME (e.g. a web user) must survive the policy chmod, and
     the ACL check must not shell out: apply_secure_dir_policy runs on every config load, including
