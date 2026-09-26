@@ -38,7 +38,11 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 def _dispatcher(reconcile_orphans: bool = True) -> kwd._KanbanDispatcher:
-    settings = kwd._DispatcherSettings(60.0, None, None, 2, 14400, reconcile_orphans, None, None)
+    settings = kwd._DispatcherSettings(
+        interval=60.0, max_spawn=None, max_in_progress=None, failure_limit=2,
+        stale_timeout_seconds=14400, reclaim_defer_max_attempts=2,
+        reconcile_orphans=reconcile_orphans, default_assignee=None,
+        max_in_progress_per_profile=None)
     return kwd._KanbanDispatcher(kb, settings)
 
 

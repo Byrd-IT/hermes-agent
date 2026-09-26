@@ -234,9 +234,12 @@ class _KanbanDispatcher:
         kbd, kbc = _kbd(), _kbc()
         conn = None
         try:
-            # Pin-first, as tick_once_for_board: an env-pinned HERMES_KANBAN_DB must win.
+            # Pin-first, as upstream tick_once_for_board: an env-pinned HERMES_KANBAN_DB must win.
+            # Fork main predates pin_first_board_resolution (matches fork tick_once_for_board), so
+            # degrade to a no-op context instead of raising AttributeError into the broad handler.
             from hermes_cli import kanban_db as _kb
-            with _kb.pin_first_board_resolution():
+            _pin = getattr(_kb, "pin_first_board_resolution", contextlib.nullcontext)
+            with _pin():
                 conn = kbc.connect(board=slug)
                 with kbc._dispatch_tick_lock(self.kb.kanban_db_path(board=slug)) as held:
                     if not held:
