@@ -851,19 +851,82 @@ def _shell_segment_tokens(segment: str, start: int) -> list[str] | None:
         return None
 
 
+def _top_level_shell_segments(command: str, subst: str) -> tuple[list[str], bool]:
+    """Split *command* at unquoted separators -> (segments, closed) where *closed* says the final
+    quote state is balanced."""
+    segments, start, state = [], 0, None
+    for kind, i, j, quote in _scan_shell(command, subst=subst, comments=True):
+        state = (None if quote else command[i]) if kind == "quote" else quote
+        if kind == "comment" or (kind == "char" and quote is None and command[i] in ";&|\n"):
+            if start < i:
+                segments.append(command[start:i])
+            start = j
+    if start < len(command):
+        segments.append(command[start:])
+    return segments, state is None
+
+
 def _iter_top_level_shell_segments(command: str):
     """Yield top-level command segments in one left-to-right pass."""
-    start = 0
     # A "$(...)" inside double quotes starts a fresh quote context, so its own quotes must not
     # toggle the outer state: `echo "$(grep -c "a|b" f)"` would otherwise expose the pattern's
     # `|` as a top-level separator and split grep into an unterminated (fail-closed) fragment.
-    for kind, i, j, quote in _scan_shell(command, subst="q", comments=True):
-        if kind == "comment" or (kind == "char" and quote is None and command[i] in ";&|\n"):
-            if start < i:
-                yield command[start:i]
-            start = j
-    if start < len(command):
-        yield command[start:]
+    segments, closed = _top_level_shell_segments(command, "q")
+    if not closed:
+        # An outer quote left open after skipping a substitution (`echo "$(grep "a|b" f)`) is not
+        # valid shell, so the fresh-context reading has no authority. Fall back to the flat quote
+        # parity, which reports the grep fragment as malformed (fail-closed) exactly as before.
+        segments, _ = _top_level_shell_segments(command, "")
+    yield from segments
+
+
+def _substitution_body_spans(command: str) -> list[tuple[int, int]]:
+    """``(body_start, body_end)`` of every ``$(...)`` / backtick body, nested ones included, found
+    with the same quote-aware recursion as ``_iter_shell_command_starts`` (an unterminated one runs
+    to the end of its enclosing span)."""
+    spans: list[tuple[int, int]] = []
+
+    def scan(start: int, end: int) -> None:
+        for kind, i, j, _ in _scan_shell(command, start, end, subst="uq", stop_unterminated=True,
+                                         comments=True):
+            if kind == "subst":
+                inner = i + (1 if command[i] == "`" else 2)
+                body_end = end if j is None else j - 1
+                spans.append((inner, body_end))
+                scan(inner, body_end)
+
+    scan(0, len(command))
+    return spans
+
+
+def _simple_command_end(command: str, start: int, spans: list[tuple[int, int]]) -> int:
+    """End offset of the simple command starting at *start*: bounded by the innermost substitution
+    body that contains it, then by the first unquoted separator or closing ``)`` at its own nesting
+    level. Nested ``$(...)`` / backtick operands are skipped as units, so their quotes and
+    separators never leak into (or truncate) the enclosing command's words — without this,
+    ``echo "$(grep "a|b" f; bash -c 'reboot')"`` tokenized ``bash`` through the enclosing ``)"``,
+    lexed as malformed, and the shell payload was silently skipped."""
+    limit = len(command)
+    enclosing = max((span for span in spans if span[0] <= start < span[1]), default=None)
+    if enclosing is not None:
+        limit = enclosing[1]
+    depth = 0  # unquoted `(`: subshells, process substitutions, arrays
+    for kind, i, _, quote in _scan_shell(command, start, limit, subst="uq", brace=True, comments=True):
+        if kind == "comment":
+            return i
+        if kind != "char" or quote is not None:
+            continue
+        ch = command[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                return i
+            depth -= 1
+        elif ch == "`" or (depth == 0 and ch in ";&|\n"):
+            # A backtick left as a char has no closer: it ends the command it sits inside.
+            return i
+    return limit
 
 
 def _interpreter_exec_flag(family: str, args: list[str]) -> str | None:
@@ -964,13 +1027,15 @@ def _read_tool_exec_flag(tool: str, args: list[str]) -> tuple[str, str] | None:
 def _execution_flag_findings(command: str):
     """Yield scoped execution mechanisms and any executable payloads."""
     for segment in _iter_top_level_shell_segments(command):
+        spans = _substitution_body_spans(segment)
         for start, _, word in _iter_shell_command_word_spans(segment):
             executable = _deobfuscate_shell_word_for_detection(word)
-            tokens = _shell_segment_tokens(segment, start)
+            tokens = _shell_segment_tokens(segment[:_simple_command_end(segment, start, spans)], start)
             executable_name = os.path.basename(executable).lower()
             family = _interpreter_family(executable)
             if tokens is None:
-                if family is not None or executable_name in _READ_TOOL_EXEC_FLAGS:
+                if (family is not None or executable_name in _READ_TOOL_EXEC_FLAGS
+                        or executable_name in _SHELL_NAMES):
                     yield (_MALFORMED_EXEC_DESCRIPTION, None)
                 continue
             if not tokens:
