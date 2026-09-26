@@ -854,7 +854,10 @@ def _shell_segment_tokens(segment: str, start: int) -> list[str] | None:
 def _iter_top_level_shell_segments(command: str):
     """Yield top-level command segments in one left-to-right pass."""
     start = 0
-    for kind, i, j, quote in _scan_shell(command, comments=True):
+    # A "$(...)" inside double quotes starts a fresh quote context, so its own quotes must not
+    # toggle the outer state: `echo "$(grep -c "a|b" f)"` would otherwise expose the pattern's
+    # `|` as a top-level separator and split grep into an unterminated (fail-closed) fragment.
+    for kind, i, j, quote in _scan_shell(command, subst="q", comments=True):
         if kind == "comment" or (kind == "char" and quote is None and command[i] in ";&|\n"):
             if start < i:
                 yield command[start:i]
