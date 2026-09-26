@@ -310,6 +310,29 @@ def test_activate_under_a_profile_home_finds_the_root_store(tmp_path: Path):
     assert result.stdout == "env-ok"
 
 
+@pytest.mark.platforms("posix")
+def test_activate_reads_its_own_checkout_from_inside_another(tmp_path: Path):
+    """`python -m` puts the CWD ahead of PYTHONPATH. Sourcing a worktree's activate
+    while the shell sits in another checkout (scripts/run_tests.sh run from the
+    production tree) imported that checkout's pm, so the composed env described the
+    wrong install and carried no __HERMES_TEST_PYTHON for this one."""
+    root = _isolated_checkout(tmp_path)
+    store, _ = _fake_store(tmp_path)
+    other = tmp_path / "other checkout"
+    (other / "pm").mkdir(parents=True)
+    (other / "pm" / "__init__.py").write_text("", encoding="utf-8")
+    (other / "pm" / "environments.py").write_text(
+        f"import json\nprint(json.dumps({{{CANARY!r}: 'other-checkout'}}))\n", encoding="utf-8",
+    )
+    script = f'source "{_posix(root / "activate")}" && printf "%s" "${CANARY}"'
+    result = subprocess.run(
+        [_bash(), "-c", script], capture_output=True, text=True, cwd=_posix(other),
+        env=_bash_env(store),
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "env-ok"
+
+
 def test_activate_fails_cleanly_without_a_store(tmp_path: Path):
     env = _bash_env(tmp_path / "empty-store")
     isolated = _isolated_checkout(tmp_path) / "activate"

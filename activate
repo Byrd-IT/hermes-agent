@@ -96,7 +96,10 @@ if [ -z "$_hermes_py" ]; then
 fi
 
 # --- emit export lines from `pm env` ---
-_hermes_json="$(PYTHONHOME= PYTHONPATH="$_hermes_repo" "$_hermes_py" -m pm.environments)"
+# -P: `python -m` puts the CWD ahead of PYTHONPATH, so sourcing from inside
+# another checkout (run_tests.sh <this-checkout>/... from the prod tree) would
+# import THAT checkout's pm and describe its install, not this one.
+_hermes_json="$(PYTHONHOME= PYTHONPATH="$_hermes_repo" "$_hermes_py" -P -m pm.environments)"
 if [ -z "$_hermes_json" ] || [ "${_hermes_json#*{}" = "$_hermes_json" ]; then
     echo "activate: could not read pm env (run ./setup-hermes.sh first)" >&2
     unset _hermes_repo _hermes_os _hermes_arch _hermes_target _hermes_store _hermes_py _hermes_json
