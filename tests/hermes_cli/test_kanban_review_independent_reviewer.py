@@ -189,3 +189,96 @@ def test_default_reviewer_config_key_is_registered() -> None:
 
     assert "default_reviewer" in DEFAULT_CONFIG["kanban"]
     assert not DEFAULT_CONFIG["kanban"]["default_reviewer"]  # legacy by default
+
+
+# --- Real config.yaml + real profile dirs (no loader mocks): the reroute must
+# respect kanban.dispatch_profiles, and has_spawnable_review must agree with
+# the dispatch loop about what it would spawn.
+
+
+@pytest.fixture
+def real_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for name in ("app-coder", "code-reviewer"):
+        prof = home / "profiles" / name
+        prof.mkdir(parents=True)
+        (prof / "config.yaml").write_text("{}\n")
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "unknown")
+    kb.init_db()
+    return home
+
+
+def _write_config(home: Path, *, allowed=None, **extra) -> None:
+    kanban = {"review_dispatch": True, "default_reviewer": "code-reviewer", **extra}
+    if allowed is not None:
+        kanban["dispatch_profiles"] = allowed
+    (home / "config.yaml").write_text(json.dumps({"kanban": kanban}))
+
+
+def _assigned_events(conn, tid) -> list:
+    return conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'assigned'", (tid,),
+    ).fetchall()
+
+
+def test_real_config_reroutes_to_default_reviewer(real_home) -> None:
+    _write_config(real_home)
+    with kbc.connect() as conn:
+        tid = _self_review_card(conn)
+        assert kbd.has_spawnable_review(conn)
+        res = kbd.dispatch_once(conn, spawn_fn=lambda t, w: None)
+        assert kb.get_task(conn, tid).assignee == "code-reviewer"
+    assert [(t, who) for t, who, *_ in res.spawned] == [(tid, "code-reviewer")]
+
+
+@pytest.mark.parametrize("allowed", [["app-coder"], []], ids=["reviewer-denied", "empty-allowlist"])
+def test_unclaimable_reviewer_never_rewrites_shared_card(real_home, allowed) -> None:
+    """A home whose dispatch_profiles excludes the default reviewer must leave
+    the card for a home that may claim it: no reassignment, no assigned event,
+    and no fallback to the implementer reviewing itself."""
+    _write_config(real_home, allowed=allowed)
+    with kbc.connect() as conn:
+        tid = _self_review_card(conn)
+        for dry_run in (True, False):
+            res = kbd.dispatch_once(
+                conn, dry_run=dry_run, spawn_fn=lambda t, w: pytest.fail("spawned"),
+            )
+            assert not res.spawned and not res.reviewer_reassigned
+            assert tid in res.skipped_nonspawnable
+        task = kb.get_task(conn, tid)
+        assert task.status == "review" and task.assignee == "app-coder"
+        assert _assigned_events(conn, tid) == []
+        assert not kbd.has_spawnable_review(conn)
+
+
+def test_probe_sees_card_routable_to_allowed_reviewer(real_home) -> None:
+    """dispatch_profiles=[code-reviewer]: the implementer is not claimable
+    here but the rerouted reviewer is, so the probe and dispatch both say yes."""
+    _write_config(real_home, allowed=["code-reviewer"])
+    with kbc.connect() as conn:
+        tid = _self_review_card(conn)
+        assert kbd.has_spawnable_review(conn)
+        res = kbd.dispatch_once(conn, dry_run=True)
+    assert res.spawned == [(tid, "code-reviewer", "")]
+
+
+def test_probe_excludes_card_held_for_human(real_home) -> None:
+    _write_config(real_home)
+    with kbc.connect() as conn:
+        tid = _self_review_card(conn, implementer="code-reviewer")
+        assert not kbd.has_spawnable_review(conn)
+        res = kbd.dispatch_once(conn, dry_run=True)
+    assert res.skipped_self_review == [tid] and not res.spawned
+
+
+def test_probe_legacy_without_default_reviewer(real_home) -> None:
+    (real_home / "config.yaml").write_text(json.dumps({"kanban": {"review_dispatch": True}}))
+    with kbc.connect() as conn:
+        tid = _self_review_card(conn)
+        assert kbd.has_spawnable_review(conn)
+        res = kbd.dispatch_once(conn, dry_run=True)
+    assert res.spawned == [(tid, "app-coder", "")]

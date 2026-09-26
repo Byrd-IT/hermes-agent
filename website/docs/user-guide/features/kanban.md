@@ -319,7 +319,10 @@ kanban:
                                    # work. A card implemented BY the default
                                    # reviewer stays in review for a human. An
                                    # uninstalled name logs a warning and falls
-                                   # back to the legacy behaviour.
+                                   # back to the legacy behaviour. A reviewer
+                                   # this home's dispatch_profiles excludes
+                                   # leaves the card untouched for a home that
+                                   # may claim it.
   # dispatch_profiles: [sage]       # unset (key omitted): this home may claim
                                    # cards for any existing profile. Set to a
                                    # list (or comma-separated string) of profile

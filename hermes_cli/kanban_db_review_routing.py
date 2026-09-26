@@ -14,6 +14,12 @@ takes such self-review cards instead:
   (``DispatchResult.skipped_self_review``).
 * set to a profile that is not installed: legacy behaviour with a warning, so
   a typo never parks every review card.
+* set to an installed profile this home may not claim
+  (``kanban.dispatch_profiles``): the card is left untouched in ``review``
+  for a home that may claim the reviewer (``skipped_nonspawnable``).
+
+The dispatch loop and the gateway's ``has_spawnable_review`` probe both route
+through :func:`route_review_row`, so they agree on what is spawnable.
 """
 
 from __future__ import annotations
@@ -79,7 +85,8 @@ def route_review_row(
 
     Returns ``(assignee_to_spawn, action)`` where ``action`` is ``None``
     (spawn ``assignee`` as-is), ``"reassign"`` (hand the card to the default
-    reviewer first) or ``"self_review"`` (refuse; returned assignee is None).
+    reviewer first), ``"self_review"`` or ``"reviewer_unclaimable"`` (refuse;
+    returned assignee is None).
     """
     if reviewer is None:
         return assignee, None
@@ -96,7 +103,21 @@ def route_review_row(
             "%s is reviewed by its implementer %r", reviewer, task_id, implementer,
         )
         return assignee, None
+    if not _claimable(reviewer):
+        # Installed, but kanban.dispatch_profiles bars this home from claiming
+        # it: leave the shared card untouched for a home that may (never
+        # rewrite a card this home cannot then claim, and never fall back to
+        # the implementer reviewing itself).
+        return None, "reviewer_unclaimable"
     return reviewer, "reassign"
+
+
+def _claimable(name: str) -> bool:
+    """Same allowlist-gated predicate the spawn gate applies."""
+    from hermes_cli import kanban_db_dispatch as _kbd
+
+    claimable = _kbd._profile_exists_fn()
+    return claimable is None or bool(claimable(name))
 
 
 def apply_default_reviewer(

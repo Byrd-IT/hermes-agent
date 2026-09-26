@@ -1760,8 +1760,23 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
 
 
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
-    """:func:`has_spawnable_ready` for the review column."""
-    return _has_spawnable(conn, "review")
+    """:func:`has_spawnable_ready` for the review column, judged on the
+    profile the review loop would actually spawn (``kanban.default_reviewer``
+    routing): a card held for a human is not spawnable, and a self-review card
+    routable to a reviewer this home may claim is."""
+    rows = conn.execute(
+        "SELECT id, assignee FROM tasks "
+        "WHERE status = 'review' AND assignee IS NOT NULL AND claim_lock IS NULL"
+    ).fetchall()
+    if not rows:
+        return False
+    profile_exists = _profile_exists_fn()
+    reviewer = _kbr.default_reviewer()
+    for row in rows:
+        target, _action = _kbr.route_review_row(conn, row["id"], row["assignee"], reviewer=reviewer)
+        if target is not None and (profile_exists is None or profile_exists(target)):
+            return True
+    return False
 
 
 def review_dispatch_enabled() -> bool:
@@ -2410,6 +2425,11 @@ def _route_review_assignee(
     target, action = _kbr.route_review_row(conn, task_id, current, reviewer=reviewer)
     if action == "self_review":
         result.skipped_self_review.append(task_id)
+        return None
+    if action == "reviewer_unclaimable":
+        # Checked BEFORE the reassignment is persisted: a reviewer this home
+        # may not claim must never rewrite the shared card.
+        result.skipped_nonspawnable.append(task_id)
         return None
     if action == "reassign" and target is not None:
         if not dry_run and not _kbr.apply_default_reviewer(conn, task_id, current, target):
