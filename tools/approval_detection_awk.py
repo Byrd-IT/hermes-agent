@@ -13,10 +13,11 @@ AWK_EXEC_DESCRIPTION = "awk program runs a shell command (system()/pipe)"
 _AWK_OPTIONS_WITH_ARG = {"-F", "--field-separator", "-v", "--assign", "-f", "--file", "-e", "--source",
                          "-i", "--include", "-l", "--load", "-W"}
 _AWK_COMMAND_EXEC_RE = re.compile(r'\bsystem\s*\(|\|&|\|\s*getline\b|\bprintf?\b[^;}\n]*(?<!\|)\|(?![|&])')
-# After one of these keywords a `/` opens a regex (`print /re/`); after any other operand it divides.
-_REGEX_AFTER_KEYWORDS = frozenset({"print", "printf", "return", "in", "case", "getline", "delete"})
-_OPERAND_END = re.compile(r"[A-Za-z0-9_$.)\]]")
-_TRAILING_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*$")
+# After one of these keywords a `/` opens a regex (`print /re/`); after any other word it divides.
+# Words that can themselves be a value (`getline`, a variable) are left out on purpose: reading a
+# division as a regex opener would hide the code up to the next `/` from the execution check.
+_REGEX_AFTER_KEYWORDS = frozenset({"print", "printf", "return", "case"})
+_WORD = re.compile(r"[A-Za-z0-9_.]+")
 
 
 def awk_program_texts(args: list[str]) -> list[str]:
@@ -47,18 +48,9 @@ def awk_program_texts(args: list[str]) -> list[str]:
     return texts
 
 
-def _regex_may_start(code: list[str]) -> bool:
-    """Whether a ``/`` read now opens a regex literal, judged from the code emitted so far."""
-    tail = "".join(code[-32:]).rstrip(" \t")
-    if not tail or not _OPERAND_END.match(tail[-1]):
-        return True
-    word = _TRAILING_WORD.search(tail)
-    return bool(word) and word.group() in _REGEX_AFTER_KEYWORDS
-
-
-def _scan_delimited(program: str, i: int, closer: str, brackets: bool) -> int:
-    """Index just past the literal opened at *i* (``"..."`` or ``/.../``); a regex ``[...]`` class may
-    hold an unescaped ``/``. An unterminated literal runs to the end of its line, as awk rejects it."""
+def _scan_delimited(program: str, i: int, closer: str, brackets: bool) -> int | None:
+    """Index just past the literal opened at *i* (``"..."`` or ``/.../``), or None when it is not
+    closed on its line. A regex ``[...]`` class may hold an unescaped ``/``."""
     j, n, in_class = i + 1, len(program), False
     while j < n and program[j] != "\n":
         ch = program[j]
@@ -76,31 +68,49 @@ def _scan_delimited(program: str, i: int, closer: str, brackets: bool) -> int:
         elif ch == closer:
             return j + 1
         j += 1
-    return min(j, n)
+    return None
 
 
 def awk_code_only(program: str) -> str:
     """*program* with string literals reduced to ``""``, regex literals to ``//`` and comments
-    dropped, so only awk code remains."""
+    dropped, so only awk code remains.
+
+    ``operand`` records whether the last token ends a value (word, number, string, regex, ``)``,
+    ``]``, postfix ``++``/``--``): a ``/`` there is division, anywhere else it opens a regex. When
+    unsure the ``/`` is kept as division, which leaves the following code visible to the check.
+    """
     code: list[str] = []
-    i, n = 0, len(program)
+    i, n, operand = 0, len(program), False
     while i < n:
         ch = program[i]
         if ch == '"':
-            i = _scan_delimited(program, i, '"', brackets=False)
+            end = _scan_delimited(program, i, '"', brackets=False)
+            # Unterminated: keep scanning what follows as code rather than hide it.
+            i = i + 1 if end is None else end
             code.append('""')
-        elif ch == "/" and _regex_may_start(code):
-            i = _scan_delimited(program, i, "/", brackets=True)
+            operand = True
+        elif ch == "/" and not operand and (end := _scan_delimited(program, i, "/", brackets=True)):
+            i = end
             code.append("//")
+            operand = True
         elif ch == "#":
             end = program.find("\n", i)
             i = n if end < 0 else end
         elif ch == "\\" and i + 1 < n:
-            code.append(program[i:i + 2])
+            code.append(program[i:i + 2])  # escaped char or line continuation: state unchanged
             i += 2
+        elif program.startswith(("++", "--"), i):
+            code.append(program[i:i + 2])  # postfix keeps a value, prefix still awaits one
+            i += 2
+        elif (word := _WORD.match(program, i)):
+            code.append(word.group())
+            i = word.end()
+            operand = word.group() not in _REGEX_AFTER_KEYWORDS
         else:
             code.append(ch)
             i += 1
+            if ch not in " \t":
+                operand = ch in ")]"
     return "".join(code)
 
 

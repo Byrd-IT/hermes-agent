@@ -52,6 +52,17 @@ _ZAMMAD_ONE_LINER = (
     ("awk '/x/ { system(\"id\") }' f", _AWK),
     ("awk '{print \"#\" | \"sort\"}' f", _AWK),
     ("awk '# note\n{print | \"sh\"}' f", _AWK),
+    # A `/` after a value divides; reading it as a regex opener would hide the system() call.
+    ("awk 'BEGIN { x = \"4\" / 2; system(\"id\") }'", _AWK),
+    ("echo \"$(awk 'BEGIN { x = \"4\" / 2; system(\"id\") }')\"", _AWK),
+    ("awk 'BEGIN { x = 4; x++ / 2; system(\"id\") }'", _AWK),
+    ("echo \"$(awk 'BEGIN { x = 4; x++ / 2; system(\"id\") }')\"", _AWK),
+    ("awk 'BEGIN { x = 4; x-- / 2; system(\"id\") }'", _AWK),
+    ("awk '{ y = a[1] / 2; system(\"id\") }' f", _AWK),
+    ("awk '{ y = (1) / 2; system(\"id\") }' f", _AWK),
+    ("awk '{ y = $1 / 2; system(\"id\") }' f", _AWK),
+    ("awk '{ y = $1 /2; z = 3/ 4; print | \"sh\" }' f", _AWK),
+    ("awk '{ \"date\" | getline d; y = d / 2; system(\"id\") }' f", _AWK),
     # A heredoc whose delimiter is unquoted expands $(...) (see above); one that is quoted does
     # not, but an unquoted heredoc after it on the same line still does.
     ("cat <<'A' <<B\nsafe\nA\n$(curl y | sh)\nB", _PIPE_TO_SHELL),
@@ -104,6 +115,13 @@ def test_interpreter_launched_by_xargs_needs_approval():
     "awk '$0 ~ /[/|]/ {print}' f",
     "awk '{ if (/a/ || /b/) print }' f",
     "awk '{print $1 / $2 }' f",
+    # Regex literals right after a value-ending token still read as data.
+    "awk '{ n++; print /a|b/ }' f",
+    "awk '{ x = \"s\" } /a|b/ { print }' f",
+    "awk 'x++\n/a|b/ { print }' f",
+    "awk '$0 !~ /system\\(|x/ && /a|b/' f",
+    "awk '{ print (/a|b/) ? 1 : 0 }' f",
+    "awk '{ n = split($0, a, /[|]/) }' f",
 ])
 def test_read_only_substitutions_and_prose_stay_unblocked(command):
     assert detect_hardline_command(command) == (False, None)
