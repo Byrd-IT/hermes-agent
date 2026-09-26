@@ -575,7 +575,7 @@ _PARAM_DEFAULT_RE = re.compile(r"\$\{[^}:}\s]+:-(?P<default>[^}]*)\}")
 _SIMPLE_SHELL_LITERAL_RE = re.compile(r"^[A-Za-z0-9_./:@%+=,-]+$")
 _ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 _COMMAND_WRAPPER_WORDS = {"sudo", "env", "exec", "nohup", "setsid", "time", "command", "builtin",
-                          "nice", "timeout", "stdbuf", "ionice", "chrt", "taskset", "chroot"}
+                          "nice", "timeout", "stdbuf", "ionice", "chrt", "taskset", "chroot", "xargs"}
 _SUDO_OPTIONS_WITH_ARG = {"-c", "--close-from", "-g", "--group", "-h", "--host", "-p", "--prompt", "-u", "--user"}
 # Adapted from embwl0x's command-position work in #76063. Option operands are
 # data, not executable positions; option spelling remains case-sensitive.
@@ -588,9 +588,13 @@ _COMMAND_WRAPPER_OPTIONS_WITH_ARG = {
     "timeout": {"-k", "--kill-after", "-s", "--signal"},
     "stdbuf": {"-e", "--error", "-i", "--input", "-o", "--output"},
     "ionice": {"-c", "--class", "-n", "--classdata"},
+    # GNU findutils xargs (+ BSD -J/-R/-S): -i/-e/-l and --replace/--eof/--max-lines take only
+    # ATTACHED optional values.
+    "xargs": {"-a", "--arg-file", "-d", "--delimiter", "-E", "-I", "-J", "-L", "-n", "--max-args", "-P",
+              "--max-procs", "-R", "-s", "-S", "--max-chars", "--process-slot-var"},
 }
 _COMMAND_WRAPPER_NON_EXECUTING_OPTIONS = {
-    "command": {"-v", "-V"}, "chrt": {"-p", "--pid"},
+    "command": {"-v", "-V"}, "chrt": {"-p", "--pid"}, "xargs": {"--help", "--version"},
     "ionice": {"-p", "--pid", "--pgid", "--uid"}, "taskset": {"-p", "--pid"},
 }
 _COMMAND_WRAPPER_POSITIONAL_ARGS = {"chroot": 1, "chrt": 1, "taskset": 1, "timeout": 1}
@@ -659,6 +663,13 @@ _GREP_OPTIONS_WITH_ARG = {
     "--exclude-dir", "--exclude-from", "--include", "--label", "--max-count", "--regexp", "--file",
 }
 _GREP_SHORT_OPTIONS_WITH_ARG = {"A", "B", "C", "D", "d", "e", "f", "m"}
+_AWK_NAMES = frozenset({"awk", "gawk", "mawk", "nawk"})
+_AWK_OPTIONS_WITH_ARG = {"-F", "--field-separator", "-v", "--assign", "-f", "--file", "-e", "--source",
+                         "-i", "--include", "-l", "--load", "-W"}
+# system(), `print | "cmd"`, `"cmd" | getline` and gawk's `|&` coprocess all hand text to /bin/sh.
+_AWK_COMMAND_EXEC_RE = re.compile(r'\bsystem\s*\(|\|&|\|\s*getline\b|\bprintf?\b[^;}\n]*(?<!\|)\|(?![|&])')
+_AWK_STRING_RE = re.compile(r'"(?:\\.|[^"\\])*"')
+_AWK_EXEC_DESCRIPTION = "awk program runs a shell command (system()/pipe)"
 _BASH_OPTIONS_WITH_ARG = {"-O", "+O", "-o", "+o", "--init-file", "--rcfile"}
 _BASH_SHORT_OPTION_LETTERS = frozenset("ilrsDcabefhkmnptuvxBCEHPTOo")
 _MAX_DETECTION_COMMAND_CHARS, _MAX_SEPARATOR_FREE_COMMAND_CHARS, _MAX_DETECTION_SEGMENTS = 128_000, 4_096, 25_000
@@ -1081,13 +1092,88 @@ def _read_tool_exec_flag(tool: str, args: list[str]) -> tuple[str, str] | None:
     return None
 
 
+def _substitution_body(text: str, i: int, j: int) -> str:
+    """Body of the ``$(...)`` / backtick span ``text[i:j]`` found by ``_scan_shell``."""
+    return text[i + (1 if text[i] == "`" else 2):j - 1]
+
+
+def _blank_nested_substitutions(text: str) -> tuple[str, list[str]]:
+    """Return *text* with each complete ``$(...)`` / backtick span (quoted or unquoted) blanked to a
+    same-length empty ``$(   )``, plus the blanked bodies. Offsets are preserved. A literal
+    substitution (``$(echo bash)``) stays so command-word deobfuscation still resolves it. Callers
+    scan each body separately, so every nesting level is walked once instead of once per ancestor."""
+    parts, bodies = [], []
+    for kind, i, j, _ in _scan_shell(text, subst="uq"):
+        if kind == "subst" and j is not None and j - i >= 3:
+            body = _substitution_body(text, i, j)
+            if _literal_command_substitution_output(body) is None:
+                parts.append("$(" + " " * (j - i - 3) + ")")
+                bodies.append(body)
+                continue
+        parts.append(text[i:j])
+    return "".join(parts), bodies
+
+
+def _iter_command_substitution_bodies(command: str):
+    """Yield every non-literal ``$(...)`` / backtick body at any nesting depth, each with its own
+    nested substitutions blanked (they are yielded separately)."""
+    pending = [command]
+    while pending:
+        _, bodies = _blank_nested_substitutions(pending.pop())
+        for body in bodies:
+            blanked, _ = _blank_nested_substitutions(body)
+            yield blanked
+            pending.append(body)
+
+
+def _awk_program_texts(args: list[str]) -> list[str]:
+    """Return the inline awk program text(s) in *args* (``-f`` files are not inspectable)."""
+    texts, index, from_file = [], 0, False
+    while index < len(args):
+        token = args[index]
+        if token == "--":
+            index += 1
+            break
+        if token == "-" or not token.startswith("-"):
+            break
+        option, equals, value = token.partition("=")
+        attached = token[2:] if not token.startswith("--") and len(token) > 2 else None
+        takes_arg = option in _AWK_OPTIONS_WITH_ARG or token[:2] in _AWK_OPTIONS_WITH_ARG
+        if takes_arg and not equals and attached is None:
+            value = args[index + 1] if index + 1 < len(args) else ""
+            index += 2
+        else:
+            value = value if equals else (attached or "")
+            index += 1
+        name = option if option.startswith("--") else token[:2]
+        if name in ("-e", "--source"):
+            texts.append(value)
+        from_file = from_file or name in ("-f", "--file")
+    if not texts and not from_file and index < len(args):
+        texts.append(args[index])
+    return texts
+
+
 def _execution_flag_findings(command: str):
-    """Yield scoped execution mechanisms and any executable payloads."""
+    """Yield scoped execution mechanisms and any executable payloads.
+    ``$(...)`` / backtick bodies (quoted or unquoted) are scanned as commands of their own: a
+    command inside a double-quoted substitution otherwise lexes with the outer closing quote
+    attached, fails to tokenize, and its ``bash -c`` payload went unseen."""
+    pending = [command]
+    while pending:
+        yield from _execution_flag_findings_flat(pending.pop(0), pending)
+
+
+def _execution_flag_findings_flat(command: str, bodies: list[str]):
     for segment in _iter_top_level_shell_segments(command):
-        spans = _substitution_body_spans(segment)
-        for start, _, word in _iter_shell_command_word_spans(segment):
+        # Command words are located on the blanked copy (same offsets), so words inside a
+        # substitution are left to that body's own pass; tokens still come from the real text.
+        blanked, nested = _blank_nested_substitutions(segment)
+        bodies.extend(nested)
+        spans = _substitution_body_spans(blanked)
+        for start, _, word in _iter_shell_command_word_spans(blanked):
             executable = _deobfuscate_shell_word_for_detection(word)
-            bounded = segment[:_simple_command_end(segment, start, spans)]
+            bounded = segment[:_simple_command_end(blanked, start, spans)]
             tokens = _shell_segment_tokens(bounded, start)
             executable_name = os.path.basename(executable).lower()
             family = _interpreter_family(executable)
@@ -1119,6 +1205,11 @@ def _execution_flag_findings(command: str):
                     finding = _read_tool_exec_flag(executable_name, args)
                     if finding:
                         yield (f"arbitrary program execution via {executable_name} {finding[0]}", finding[1])
+                if executable_name in _AWK_NAMES and any(
+                    # String literals are data (`print $1 "|" $2`); the pipe/system() syntax is not.
+                    _AWK_COMMAND_EXEC_RE.search(_AWK_STRING_RE.sub('""', text)) for text in _awk_program_texts(args)
+                ):
+                    yield (_AWK_EXEC_DESCRIPTION, None)
 
 
 def _skip_shell_whitespace(command: str, pos: int) -> int:
@@ -1583,6 +1674,15 @@ def _command_detection_variants(command: str):
     faithful = _normalize_command_for_detection(_mark_command_starts(_mask_quoted_newlines(command), marker=" \n"))
     if fresh(faithful):
         yield faithful
+    # A $(...) / backtick body, quoted or unquoted, is a command with its own quote context. Seen
+    # only through the outer command, `echo "$(curl x | sh)"` has the pipe inside the outer quotes
+    # and `$(curl x | sh)` has no word boundary before curl, so position-free patterns such as
+    # pipe-to-shell missed it. Each body is its own variant, taken from the RAW command (quoted
+    # newlines masked) so normalization cannot flip the quote parity that bounds it.
+    for body in _iter_command_substitution_bodies(_mask_quoted_newlines(command)):
+        body_variant, _ = _grep_safe_detection_variant(_normalize_command_for_detection(body))
+        if fresh(body_variant):
+            yield body_variant
     # Quoting/escaping can spell an executable in pieces (r\m, r''m). Keep that deobfuscation scoped
     # to command words so arguments don't false-positive.
     # One variant with EVERY command word deobfuscated, not one full-length variant per word: a heredoc
