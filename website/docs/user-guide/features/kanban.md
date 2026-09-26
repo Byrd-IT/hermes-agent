@@ -311,6 +311,15 @@ kanban:
   review_dispatch: true            # default: spawn the assigned profile with
                                    # the bundled sdlc-review skill. Set false
                                    # for human-only review boards.
+  default_reviewer: ""             # default: the card's assignee reviews it.
+                                   # Set to a profile (e.g. code-reviewer) so a
+                                   # card that reaches review still assigned to
+                                   # its implementer is reassigned to that
+                                   # profile first: no profile approves its own
+                                   # work. A card implemented BY the default
+                                   # reviewer stays in review for a human. An
+                                   # uninstalled name logs a warning and falls
+                                   # back to the legacy behaviour.
   # dispatch_profiles: [sage]       # unset (key omitted): this home may claim
                                    # cards for any existing profile. Set to a
                                    # list (or comma-separated string) of profile

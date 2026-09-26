@@ -145,6 +145,13 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    reviewer_reassigned: list[tuple[str, str, str]] = field(default_factory=list)
+    """``(task_id, implementer, reviewer)``: review cards still assigned to
+    their implementer, handed to ``kanban.default_reviewer`` before the claim
+    so no profile approves its own work."""
+    skipped_self_review: list[str] = field(default_factory=list)
+    """Review cards whose implementer IS ``kanban.default_reviewer``: no other
+    profile can review them independently, so they wait for a human."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -2247,9 +2254,15 @@ def _any_spawnable_review(
         return False
     profile_exists = _profile_exists_fn()
     running = per_profile_running or {}
+    reviewer = _kbr.default_reviewer()
     for row in review_rows:
         assignee = row["assignee"]
         if not assignee:
+            continue
+        # The profile the review loop would actually spawn (never a
+        # self-reviewer when kanban.default_reviewer is set).
+        assignee, _action = _kbr.route_review_row(conn, row["id"], assignee, reviewer=reviewer)
+        if assignee is None:
             continue
         if profile_exists is not None and not profile_exists(assignee):
             continue
@@ -2371,15 +2384,38 @@ def _dispatch_once_locked(
     # (→ ready/todo). Review spawns share max_spawn with ready tasks. The loop
     # checks the FULL shared ``spawn_budget`` — the reservation above caps the
     # ready lane, it grants no extra capacity here.
+    reviewer = _kbr.default_reviewer() if review_rows else None
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
+        review_assignee = _route_review_assignee(conn, row, reviewer, result, dry_run=dry_run)
+        if review_assignee is None:
+            continue
+        if _dispatch_lane_task(conn, row, review_assignee, result, lane="review", **lane_kwargs):
             spawned += 1
     return result
+
+
+def _route_review_assignee(
+    conn: sqlite3.Connection, row: sqlite3.Row, reviewer: Optional[str],
+    result: DispatchResult, *, dry_run: bool,
+) -> Optional[str]:
+    """Profile that reviews ``row``, never its own implementer when
+    ``kanban.default_reviewer`` is configured (see ``kanban_db_review_routing``).
+    ``None`` = skip this row this tick (recorded on ``result``)."""
+    task_id, current = row["id"], row["assignee"]
+    target, action = _kbr.route_review_row(conn, task_id, current, reviewer=reviewer)
+    if action == "self_review":
+        result.skipped_self_review.append(task_id)
+        return None
+    if action == "reassign" and target is not None:
+        if not dry_run and not _kbr.apply_default_reviewer(conn, task_id, current, target):
+            return None
+        result.reviewer_reassigned.append((task_id, current, target))
+    return target
 
 
 def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
@@ -2965,4 +3001,5 @@ def run_daemon(
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb  # noqa: E402
 from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
+from hermes_cli import kanban_db_review_routing as _kbr  # noqa: E402
 from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402
