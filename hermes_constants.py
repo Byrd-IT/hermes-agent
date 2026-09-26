@@ -850,6 +850,33 @@ def _chown_to_hermes_uid(path) -> None:
         pass
 
 
+def _named_user_acl_mask(path) -> int | None:
+    """ACL mask bits (``0o7``) of directory *path* when its access ACL has named-user entries.
+
+    Reads the ``system.posix_acl_access`` xattr in-process rather than shelling out to
+    ``getfacl``: this runs on every config load and scratch-dir creation, including inside
+    code under test that fakes ``subprocess``. ``None`` means no ACL, no named users, or the
+    platform/filesystem cannot say — the caller then applies its plain chmod.
+    """
+    try:
+        if path is None or not os.path.isdir(str(path)):
+            return None
+        raw = os.getxattr(str(path), "system.posix_acl_access")
+    except (OSError, AttributeError):  # ENODATA/ENOTSUP, or no getxattr off Linux
+        return None
+    # Linux xattr layout: u32 version (2), then (u16 tag, u16 perm, u32 id) little-endian.
+    if len(raw) < 4 or (len(raw) - 4) % 8 or int.from_bytes(raw[:4], "little") != 2:
+        return None
+    named_user, mask = False, None
+    for off in range(4, len(raw), 8):
+        tag = int.from_bytes(raw[off:off + 2], "little")
+        if tag == 0x02:  # ACL_USER
+            named_user = True
+        elif tag == 0x10:  # ACL_MASK
+            mask = int.from_bytes(raw[off + 2:off + 4], "little") & 0o7
+    return mask if named_user and mask is not None else None
+
+
 def apply_secure_dir_policy(path, *, home: str | Path | None = None) -> None:
     """Apply the canonical Hermes home-directory permission policy to *path*.
 
@@ -879,6 +906,17 @@ def apply_secure_dir_policy(path, *, home: str | Path | None = None) -> None:
         mode = int(explicit_mode or "700", 8)
     except ValueError:
         mode = 0o700
+    # A chmod on a directory with a POSIX ACL resets the ACL mask to the chmod's group
+    # bits, silently voiding any named-user grants (e.g. a web user traversing HERMES_HOME).
+    # When an ACL is present with named-user entries, skip the chmod if it would only narrow
+    # the mask; keep it when it would widen permissions beyond the operator's configured mode.
+    # (Byrd-IT patch; KB QvKRt6ABoiu35iVggyXX; re-applied by secure_dir_acl_guard.sh)
+    acl_mask = _named_user_acl_mask(path)
+    if acl_mask is not None:
+        would_narrow = bool(acl_mask & ~(mode >> 3) & 0o7)
+        if would_narrow:
+            _chown_to_hermes_uid(path)
+            return  # preserve the operator's ACL grants; skip this chmod
     try:
         os.chmod(path, mode)
     except (OSError, NotImplementedError):
