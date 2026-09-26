@@ -851,13 +851,66 @@ def _shell_segment_tokens(segment: str, start: int) -> list[str] | None:
         return None
 
 
+def _is_redirection_operator_char(text: str, i: int, previous) -> bool:
+    """Whether the unquoted ``&`` / ``|`` at *i* belongs to a redirection operator (``>&``, ``<&``,
+    ``&>``, ``&>>``, ``>|``) rather than separating commands. *previous* is the prior ``_scan_shell``
+    step; only an unquoted plain ``<`` / ``>`` char there can own the ``&`` / ``|``. Treating the
+    ``&`` in ``bash 2>&1 -c 'reboot'`` as a separator cut the command before ``-c``."""
+    before = text[previous[1]] if previous and previous[0] == "char" and previous[3] is None else ""
+    if text[i] == "|":
+        return before == ">"
+    if text[i] != "&":
+        return False
+    return before in ("<", ">") or (text.startswith(">", i + 1) and before not in ("&", "|"))
+
+
+_REDIRECTION_OPERATOR_RE = re.compile(r"&>>?|<<<|<<-?|<>|>>|>&|<&|>\||[<>]")
+_REDIRECTION_FD_PREFIX_RE = re.compile(r"(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})$")
+
+
+def _blank_shell_redirections(text: str, start: int) -> str:
+    """Replace every unquoted redirection (optional fd / ``{var}`` prefix, operator, target word) in
+    ``text[start:]`` with spaces, keeping offsets. Redirections may appear anywhere in a simple
+    command, and ``bash 2>/dev/null -c 'reboot'`` otherwise leaves ``2 > /dev/null`` in argv where
+    option parsing stops at the first non-option before ``-c``. Substitutions are skipped as units
+    and process substitutions ``<(...)`` / ``>(...)`` are words, not redirections."""
+    edits, skip_to, previous = [], start, None
+    for step in _scan_shell(text, start, subst="uq"):
+        kind, i, _, quote = step
+        if i < skip_to:
+            continue
+        match = None
+        if kind == "char" and quote is None and not text.startswith(("<(", ">("), i):
+            match = _REDIRECTION_OPERATOR_RE.match(text, i)
+            if match and match.group().startswith("&") and previous and previous[0] == "char" \
+                    and previous[3] is None and text[previous[1]] in "&|":
+                match = None  # `&&>x` / `|&>x`: the `&` is a separator, the `>` is matched next
+        if match is None:
+            previous = step
+            continue
+        op_start = i
+        if not match.group().startswith("&"):
+            # Bounded lookback for an fd (`2>`) or `{var}>` prefix that forms its own word.
+            prefix = _REDIRECTION_FD_PREFIX_RE.search(text, max(start, i - 64), i)
+            if prefix and (prefix.start() == start or text[prefix.start() - 1].isspace()):
+                op_start = prefix.start()
+        _, target_end, _ = _read_shell_word(text, match.end())
+        edits.append((op_start, target_end, " " * (target_end - op_start)))
+        skip_to, previous = target_end, None
+    return _splice(text, edits) if edits else text
+
+
 def _top_level_shell_segments(command: str, subst: str) -> tuple[list[str], bool]:
     """Split *command* at unquoted separators -> (segments, closed) where *closed* says the final
     quote state is balanced."""
-    segments, start, state = [], 0, None
-    for kind, i, j, quote in _scan_shell(command, subst=subst, comments=True):
+    segments, start, state, previous = [], 0, None, None
+    for step in _scan_shell(command, subst=subst, comments=True):
+        kind, i, j, quote = step
         state = (None if quote else command[i]) if kind == "quote" else quote
-        if kind == "comment" or (kind == "char" and quote is None and command[i] in ";&|\n"):
+        separator = (kind == "char" and quote is None and command[i] in ";&|\n"
+                     and not _is_redirection_operator_char(command, i, previous))
+        previous = step
+        if kind == "comment" or separator:
             if start < i:
                 segments.append(command[start:i])
             start = j
@@ -911,7 +964,10 @@ def _simple_command_end(command: str, start: int, spans: list[tuple[int, int]]) 
     if enclosing is not None:
         limit = enclosing[1]
     depth = 0  # unquoted `(`: subshells, process substitutions, arrays
-    for kind, i, _, quote in _scan_shell(command, start, limit, subst="uq", brace=True, comments=True):
+    previous = None
+    for step in _scan_shell(command, start, limit, subst="uq", brace=True, comments=True):
+        kind, i, _, quote = step
+        prior, previous = previous, step
         if kind == "comment":
             return i
         if kind != "char" or quote is not None:
@@ -923,7 +979,8 @@ def _simple_command_end(command: str, start: int, spans: list[tuple[int, int]]) 
             if depth == 0:
                 return i
             depth -= 1
-        elif ch == "`" or (depth == 0 and ch in ";&|\n"):
+        elif ch == "`" or (depth == 0 and ch in ";&|\n"
+                           and not _is_redirection_operator_char(command, i, prior)):
             # A backtick left as a char has no closer: it ends the command it sits inside.
             return i
     return limit
@@ -1030,20 +1087,28 @@ def _execution_flag_findings(command: str):
         spans = _substitution_body_spans(segment)
         for start, _, word in _iter_shell_command_word_spans(segment):
             executable = _deobfuscate_shell_word_for_detection(word)
-            tokens = _shell_segment_tokens(segment[:_simple_command_end(segment, start, spans)], start)
+            bounded = segment[:_simple_command_end(segment, start, spans)]
+            tokens = _shell_segment_tokens(bounded, start)
             executable_name = os.path.basename(executable).lower()
             family = _interpreter_family(executable)
+            relevant = (family is not None or executable_name in _READ_TOOL_EXEC_FLAGS
+                        or executable_name in _SHELL_NAMES)
+            if relevant and tokens:
+                # Option parsing runs on argv as the program sees it: redirections are removed by the
+                # shell wherever they sit. Heredoc detection still reads the raw tokens below.
+                argv = _shell_segment_tokens(_blank_shell_redirections(bounded, start), start)
+                if argv is None:
+                    tokens = None
             if tokens is None:
-                if (family is not None or executable_name in _READ_TOOL_EXEC_FLAGS
-                        or executable_name in _SHELL_NAMES):
+                if relevant:
                     yield (_MALFORMED_EXEC_DESCRIPTION, None)
                 continue
-            if not tokens:
+            if not tokens or not relevant:
                 continue
-            args = tokens[1:]
+            args = argv[1:]
             if family and _interpreter_exec_flag(family, args):
                 yield ("script execution via -e/-c flag", None)
-            elif family and any(token.startswith("<<") for token in args):
+            elif family and any(token.startswith("<<") for token in tokens[1:]):
                 yield ("script execution via heredoc", None)
             else:
                 if executable_name in _SHELL_NAMES:
@@ -1206,9 +1271,11 @@ def _iter_shell_command_starts(command: str):
     starts = [0]
 
     def scan(start: int, end: int) -> None:
-        skip = -1
-        for kind, i, j, quote in _scan_shell(command, start, end, subst="uq", stop_unterminated=True,
-                                            comments=True):
+        skip, previous = -1, None
+        for step in _scan_shell(command, start, end, subst="uq", stop_unterminated=True,
+                                comments=True):
+            kind, i, j, quote = step
+            prior, previous = previous, step
             if kind == "subst":
                 # Record a nested $(...)/backtick command start and scan its body.
                 inner = i + (1 if command[i] == "`" else 2)
@@ -1221,7 +1288,7 @@ def _iter_shell_command_starts(command: str):
                 if command[i] in "(;\n" or (command[i] == "{" and (i == 0 or command[i - 1].isspace()
                                                                    or command[i - 1] in "(;&|)")):
                     starts.append(i + 1)
-                elif command[i] in "&|":
+                elif command[i] in "&|" and not _is_redirection_operator_char(command, i, prior):
                     repeated = i + 1 < end and command[i + 1] == command[i]
                     skip = i + 1 if repeated else skip
                     starts.append(i + 1 + repeated)

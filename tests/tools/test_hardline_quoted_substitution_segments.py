@@ -89,3 +89,41 @@ def test_benign_shell_payload_in_quoted_substitution_is_not_hardline(command):
 ])
 def test_unterminated_outer_quote_after_substitution_fails_closed(command):
     assert detect_hardline_command(command) == (True, "command parser limit or malformed executable payload")
+
+
+# Redirections before `-c`: `&` in `2>&1` / `&>` is part of the operator, not a separator, and the
+# redirection (operator + target) is not in the program's argv, so it cannot end option parsing.
+_REDIRECTIONS = ["2>&1", "2>/dev/null", "&>/dev/null", ">&2", "2>>log", ">| out", "<<<x", "{fd}>out", "2> /dev/null"]
+
+
+@pytest.mark.parametrize("redirection", _REDIRECTIONS)
+@pytest.mark.parametrize("form", [
+    "bash {r} -c 'reboot'",
+    'echo "$(grep -c "a|b" f; bash {r} -c \'reboot\')"',
+    'echo "`grep -c "a|b" f; bash {r} -c \'reboot\'`"',
+    'echo "$(echo "x$(grep "a|b" f; sh {r} -c \'reboot\')y")"',
+])
+def test_redirection_before_shell_c_reaches_hardline_floor(redirection, form):
+    command = form.format(r=redirection)
+    assert detect_hardline_command(command) == (True, "system shutdown/reboot")
+
+
+@pytest.mark.parametrize("command", [
+    'echo "$(grep -c "a|b" f; bash 2>&1 -c \'rm -rf /\')"',
+    "zsh 2>/dev/null -lc 'rm -rf /'",
+])
+def test_redirected_shell_root_delete_reaches_hardline_floor(command):
+    assert detect_hardline_command(command) == (True, "recursive delete of root filesystem")
+
+
+@pytest.mark.parametrize("command", [
+    # A positional script ends option parsing: `-c` after it is a script argument, not a flag.
+    "bash 2>&1 script.sh -c reboot",
+    "bash script.sh 2>/dev/null -c reboot",
+    # Redirections inside a quoted substitution stay benign for read-only grep.
+    'echo "$(grep -c "a|b" f 2>&1)"',
+    'echo "`grep -c "a|b" f 2>/dev/null`"',
+    'ls 2>&1 | grep -c "a|b"',
+])
+def test_redirection_controls_are_not_hardline(command):
+    assert detect_hardline_command(command) == (False, None)
