@@ -1093,8 +1093,9 @@ def _substitution_body(text: str, i: int, j: int) -> str:
     return text[i + (1 if text[i] == "`" else 2):j - 1]
 
 
-def _quoted_heredoc_body_spans(text: str) -> list[tuple[int, int]]:
-    """``(start, end)`` of each heredoc body whose delimiter word is quoted or escaped
+def _quoted_heredoc_body_spans(text: str, *, quoted_only: bool = True) -> list[tuple[int, int]]:
+    """``(start, end)`` of each heredoc body whose delimiter word is quoted or escaped; with
+    *quoted_only* False, of every heredoc body.
     (``<<'EOF'``, ``<<"EOF"``, ``<<\\EOF``, ``<<E'O'F``). The shell performs no expansion there, so a
     ``$(...)`` in such a body is data. Bodies are read line by line, not through the quote scanner:
     an apostrophe in heredoc text is not a quote."""
@@ -1124,7 +1125,7 @@ def _quoted_heredoc_body_spans(text: str) -> list[tuple[int, int]]:
                     break
             else:
                 end = n
-            if any(ch in word for ch in "'\"\\"):
+            if not quoted_only or any(ch in word for ch in "'\"\\"):
                 spans.append((start, end))
     return spans
 

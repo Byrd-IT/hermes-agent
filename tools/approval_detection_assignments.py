@@ -221,17 +221,29 @@ def resolve_shell_assignments(command: str) -> str | None:
 
 
 def opaque_command_leaders(command: str) -> list[tuple[str, int, int, str]]:
-    """Every command word still opaque after same-command bindings are substituted, as
-    ``(resolved_command, start, end, word)``. An opaque word is a variable reference with no earlier
-    binding (``$CMD args``) or a command substitution (``$(cat f) args``). It takes its program from
-    the environment or another command's output at run time, so no detector can say what it runs.
-    Only bindings made BEFORE the use count here (no fallback): the environment decides the rest."""
-    from tools.approval_detection import _iter_shell_command_word_spans
-    forms = [command]
-    if _has_candidate(command):
-        forms = list(_expand_references(command, _resolver(command, fallback=False)))
+    """Every command word that stays opaque after same-command bindings, as
+    ``(command, start, end, word)``. An opaque word is a variable reference with no binding earlier
+    in the command (``$CMD args``), a variable whose bound value itself starts with one, or a
+    command substitution (``$(cat f) args``). It takes its program from the environment or another
+    command's output at run time, so no detector can say what it runs.
+
+    Only bindings made BEFORE the use count (no fallback): the environment decides the rest. The
+    ORIGINAL command is scanned, not a resolved form, because splicing a deobfuscated value back in
+    unquotes it and invents command positions (``B=$(printf '%s' '<?php $c=1'); echo $B``).
+    Heredoc bodies are stdin data, so words inside them are skipped."""
+    from tools.approval_detection import _iter_shell_command_word_spans, _quoted_heredoc_body_spans
+    heredocs = _quoted_heredoc_body_spans(command, quoted_only=False) if "<<" in command else []
+    values_of = _resolver(command, fallback=False) if _has_candidate(command) else (lambda _name, _offset: None)
     found: list[tuple[str, int, int, str]] = []
-    for resolved in forms:
-        found.extend((resolved, start, end, word) for start, end, word in _iter_shell_command_word_spans(resolved)
-                     if _OPAQUE_LEADER_RE.fullmatch(word))
+    for start, end, word in _iter_shell_command_word_spans(command):
+        if not _OPAQUE_LEADER_RE.fullmatch(word) or any(lo <= start < hi for lo, hi in heredocs):
+            continue
+        reference = _REFERENCE_RE.search(word)
+        if reference and word.strip('"').startswith("$") and not word.strip('"').startswith(("$(", "$`")):
+            values = values_of(reference.group("braced") or reference.group("bare"), start)
+            if values is not None and not any(
+                    _OPAQUE_LEADER_RE.fullmatch(value.split(None, 1)[0] if value.strip() else value)
+                    for value in values):
+                continue
+        found.append((command, start, end, word))
     return found

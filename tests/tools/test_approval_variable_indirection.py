@@ -219,6 +219,12 @@ def test_opaque_leaders_skip_resolved_and_literal_words():
     ('echo "$X"', False),
     ("ls $HOME", False),
     ("echo '$X'", False),
+    # Data that only LOOKS like a command word once a value is spliced back in, or heredoc text.
+    ("B=$(printf '%s' '<?php $c=1; if(!f($c)){exit;}' | base64); ssh h \"echo $B | php\"", False),
+    ("cat > /tmp/x.php <<'PHP'\n<?php\n$config = 1;\nPHP\nphp /tmp/x.php", False),
+    ("FILES=\"a b\"\nfor f in $FILES; do grep -c x \"$f\"; done", False),
+    # A variable whose same-command value is itself an environment variable stays opaque.
+    ("P=$__TEST_PYTHON; $P -m pytest", True),
 ])
 def test_opaque_leader_classifier(command, refused):
     reason = unattended_approve_refusal(command, dangerous_description=None, tirith_result=None)
