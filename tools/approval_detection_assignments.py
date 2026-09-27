@@ -322,6 +322,35 @@ def _simple_command_range(text: str, starts: list[int], i: int, j: int) -> tuple
     return 0, len(text)
 
 
+# Programs whose arguments are only printed. A combination of their argument values cannot run
+# anything, so its simple command needs no cross product (each value is still seen at least once).
+_PRINT_ONLY_PROGRAMS = frozenset({"echo", "printf"})
+_REDIRECT_CHAR_RE = re.compile(r"[<>]")
+
+
+def _inert_segment(text: str, lo: int, hi: int) -> bool:
+    """The simple command ``text[lo:hi]`` is assignments only (their values are checked where they
+    are USED, with their own completeness), or a print-only program whose output goes nowhere
+    executable: not piped (``echo "$A $B" | sh`` runs it) and no redirection (``> $D$N``)."""
+    from tools.approval_detection import _deobfuscate_shell_word_for_detection, _read_shell_word, _scan_shell
+    pos = lo
+    while True:
+        start, end, word = _read_shell_word(text, pos)
+        if start == end or start >= hi:
+            return True     # assignments only
+        if not _ASSIGNMENT_WORD_RE.fullmatch(word):
+            break
+        pos = end
+    if _deobfuscate_shell_word_for_detection(word) not in _PRINT_ONLY_PROGRAMS:
+        return False
+    if text.startswith("|", hi) and not text.startswith("||", hi):
+        return False
+    if text.startswith("printf", start) and re.search(r"(?:^|\s)-v\b", text[start:hi]):
+        return False
+    return not any(kind == "char" and quote is None and _REDIRECT_CHAR_RE.match(text[i])
+                   for kind, i, _, quote in _scan_shell(text, lo, hi))
+
+
 def _expand_command(text: str, values_of) -> tuple[list[str], bool]:
     """Detection variants of a whole command and whether they cover every combination.
 
@@ -347,6 +376,8 @@ def _expand_command(text: str, values_of) -> tuple[list[str], bool]:
     extra: list[str] = []
     complete = True
     for (lo, hi), keys in segments.items():
+        if _inert_segment(text, lo, hi):
+            continue
         seg_picks, seg_complete = pieces.product(keys, _MAX_SEGMENT_COMBOS)
         complete = complete and seg_complete
         extra.extend(pieces.render(pick, lo, hi) for pick in seg_picks)
@@ -519,12 +550,15 @@ def eval_payloads(command: str) -> tuple[list[str], bool]:
     if "eval" not in command:
         return [], True
     resolution = _resolution(command) if _has_candidate(command) else None
+    # A heredoc body fed to a non-shell (`cat > f <<EOF`) is data; blanking keeps offsets intact.
+    from tools.approval_detection_shell_scope import _blank_spans, _heredoc_bodies
+    text = _blank_spans(command, [(h.start, h.end) for h in _heredoc_bodies(command) if not h.executed])
     payloads: list[str] = []
     all_complete = True
-    for _, end, word in _iter_shell_command_word_spans(command):
+    for _, end, word in _iter_shell_command_word_spans(text):
         if _deobfuscate_shell_word_for_detection(word) != "eval":
             continue
-        arguments = _shell_command_segment(command, end)
+        arguments = _shell_command_segment(text, end)
         values_of = (lambda name, _offset, at=end: resolution.values_at(name, at)) if resolution else (
             lambda name, _offset: None)
         expanded, complete = _expand_all(arguments, values_of, _MAX_VARIANTS)
@@ -551,7 +585,9 @@ def _inspect(command: str, depth: int, found: list, reasons: list[str]) -> None:
         if any(h.start <= start < h.end for h in heredocs):
             continue
         if not _OPAQUE_LEADER_RE.fullmatch(word):
-            if _partial_leader_is_opaque(word, start, resolution):
+            # `env "PATH=$PATH" prog`: a quoted NAME=value operand of env is an assignment, not a program.
+            if (not _ASSIGNMENT_WORD_RE.fullmatch(word.replace('"', ""))
+                    and _partial_leader_is_opaque(word, start, resolution)):
                 found.append((command, start, end, word))
             continue
         bare = word.strip('"')

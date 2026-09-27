@@ -618,3 +618,44 @@ def test_partial_variable_program_name_refused_in_approve_mode(single_query, com
 def test_literal_or_resolved_program_name_still_approves(single_query, command):
     with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
         assert check_all_command_guards(command, "local")["approved"] is True
+
+
+# A large product inside print-only output (not piped, not redirected) cannot run anything, so it
+# is not "incomplete"; the same product piped to a shell or redirected still is.
+_NINE = " ".join(f"v{k}" for k in range(9))
+_NINE_B = " ".join(f"w{k}" for k in range(9))
+
+
+@pytest.mark.parametrize("body", ['echo "$A $B"', "printf '%s %s\\n' \"$A\" \"$B\"", 'C="$A$B"'])
+def test_print_only_cross_product_is_not_incomplete(body):
+    command = f"for A in {_NINE}; do for B in {_NINE_B}; do {body}; done; done"
+    assert uninspectable_reasons(command) == []
+
+
+@pytest.mark.parametrize("body", ['echo "$A $B" | bash', 'echo "$A" > "$B"', "printf -v X '%s' \"$A$B\""])
+def test_executable_or_redirected_cross_product_stays_incomplete(body):
+    command = f"for A in {_NINE}; do for B in {_NINE_B}; do {body}; done; done"
+    assert uninspectable_reasons(command)
+
+
+def test_assignment_product_is_checked_where_it_is_used(single_query):
+    command = f'for A in {_NINE}; do for B in {_NINE_B}; do C="$A $B"; $C; done; done'
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        assert check_all_command_guards(command, "local")["approved"] is False
+
+
+def test_eval_text_inside_a_data_heredoc_is_not_executed():
+    command = "cat >> notes.py <<'EOF'\nassert f('X=\"rm -rf /home\"; eval \"$X\"')\nEOF"
+    assert detect_hardline_command(command) == (False, None)
+    assert uninspectable_reasons(command) == []
+
+
+def test_eval_inside_a_shell_heredoc_is_still_seen():
+    command = "bash <<'EOF'\nX=\"rm -rf /home\"; eval \"$X\"\nEOF"
+    assert detect_hardline_command(command)[0] is True
+
+
+@pytest.mark.parametrize("command", ['sudo -n env "PATH=$PATH" /usr/bin/py-spy dump --pid 1',
+                                     'env "LD_PATH=$HOME/lib" ls'])
+def test_quoted_env_assignment_operand_is_not_a_program(command):
+    assert opaque_command_leaders(command) == []
