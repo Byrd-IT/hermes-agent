@@ -782,3 +782,21 @@ def test_command_clobbers_late_writers(words):
 def test_command_clobbers_dynamic_leader_is_deferred():
     from tools.approval_detection_clobbers import DYNAMIC, command_clobbers
     assert command_clobbers(["$R", "X"]) == (DYNAMIC, 0)
+
+
+def test_many_dynamic_command_words_resolve_in_linear_passes():
+    # Each `$P ...` word's values depend on what every earlier dynamic word writes. Resolving that
+    # by recursion was exponential in the number of such lines (a replayed 20-line script hung);
+    # the fixpoint is a handful of linear passes.
+    import time
+    command = "P=/usr/bin/python3\n" + "\n".join(f"$P tool{k}.py arg" for k in range(40))
+    started = time.monotonic()
+    assert opaque_command_leaders(command) == []
+    assert uninspectable_reasons(command) == []
+    assert time.monotonic() - started < 10
+
+
+def test_reader_reached_through_a_loop_variable_is_still_seen():
+    # `$R R` overwrites R itself, so on the second iteration the command word is unknown.
+    command = "R=read; for i in 1 2; do $R R; done; $R X"
+    assert [w for *_, w in opaque_command_leaders(command)][:1] == ["$R"]

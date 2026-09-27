@@ -98,6 +98,8 @@ _MAX_SEGMENT_COMBOS = 64
 _MAX_SEGMENT_VARIANTS = 512
 _MAX_LOOP_WORDS = 64
 _MAX_PAYLOAD_DEPTH = 3
+# Passes of the dynamic-command-word fixpoint (``_Resolution._solve_dynamic_reach``).
+_MAX_REACH_PASSES = 4
 
 
 @dataclass(frozen=True)
@@ -458,7 +460,29 @@ class _Resolution:
         self._memo: dict[int, tuple[str, ...]] = {}
         self._busy: set[int] = set()
         self._reach: dict[int, "frozenset[str] | str | None"] = {}
-        self._busy_reach: set[int] = set()
+        self._solve_dynamic_reach()
+
+    def _solve_dynamic_reach(self) -> None:
+        """What each command whose command word is an expansion (``$R X``) may write. Its word's
+        values depend on what the OTHER such commands write, so this is a fixpoint: start from
+        "writes nothing" and recompute every reach from the previous pass's answers until none
+        changes. Reaches only grow, and every pass is linear in the bindings, so a command with
+        many ``$PY ...`` lines cannot recurse exponentially. If it has not settled after
+        _MAX_REACH_PASSES passes, every such command writes every name (fail closed)."""
+        dynamic = [k for k, b in enumerate(self.bindings) if b.dynamic is not None]
+        if not dynamic:
+            return
+        self._reach = {k: frozenset() for k in dynamic}
+        for _ in range(_MAX_REACH_PASSES):
+            self._memo.clear()
+            solved = {k: self._compute_reach(k) for k in dynamic}
+            if solved == self._reach:
+                break
+            self._reach = solved
+        else:
+            self._reach = {k: None for k in dynamic}
+            self.truncated = True
+        self._memo.clear()
 
     def _cap(self, values) -> tuple[str, ...]:
         unique = tuple(dict.fromkeys(values))
@@ -492,59 +516,43 @@ class _Resolution:
             old = self.values_at(b.name, b.start)
             values = [UNKNOWN if UNKNOWN in (o, n) else o + n for o in old for n in values]
         self._busy.discard(k)
-        capped = self._cap(values)
-        if not self._busy_reach:
-            self._memo[k] = capped      # computed under a reach assumption: recompute later
-        return capped
+        self._memo[k] = self._cap(values)
+        return self._memo[k]
 
     def clobbers(self, k: int, name: str) -> bool:
         """Can binding *k* (name None: a clobber of unknown or dynamic reach) write *name*?"""
         b = self.bindings[k]
         if b.name is not None or b.dynamic is None:
             return b.name in (name, None)
-        if k in self._busy_reach:
-            # Resolving this command's own word: the values it had BEFORE this run. What this
-            # run then writes is added once the reach is known (a loop feeds it back to the word).
-            return False
-        reach = self._dynamic_reach(k)
+        reach = self._reach[k]
         return reach is None or isinstance(reach, str) or name in reach
 
     def is_late(self, k: int) -> bool:
         b = self.bindings[k]
-        return b.late or (b.dynamic is not None and self._dynamic_reach(k) == "late")
+        return b.late or (b.dynamic is not None and self._reach[k] == "late")
 
-    def _dynamic_reach(self, k: int) -> "frozenset[str] | str | None":
-        """What the command at binding *k*, whose command word is an expansion, may write once its
-        word holds each of its possible values: a name set, None (every name) or "late"."""
+    def _compute_reach(self, k: int) -> "frozenset[str] | str | None":
+        """What the command at binding *k* may write when its expanded command word takes each of
+        its possible values (read from the current reach answers): a name set, None (every name)
+        or "late"."""
         from tools.approval_detection import _deobfuscate_shell_word_for_detection
         from tools.approval_detection_clobbers import ALL, LATE, command_clobbers, is_dynamic
-        if k in self._reach:
-            return self._reach[k]
-        if k in self._busy_reach:
-            return ALL
-        self._busy_reach.add(k)
         dynamic = self.bindings[k].dynamic or ("",)
         start = self.bindings[k].start
         forms, complete = _expand_all(dynamic[0], lambda name, _offset: self.values_at(name, start),
                                       _MAX_VALUES_PER_NAME)
+        if not complete:
+            return ALL
         names: set[str] = set()
-        reach: "frozenset[str] | str | None" = None if not complete else frozenset()
-        for form in forms if complete else ():
+        for form in forms:
             if is_dynamic(form):
-                reach = ALL     # still an expansion: the program is not in the text
-                break
+                return ALL      # still an expansion: the program is not in the text
             hit = command_clobbers(_deobfuscate_shell_word_for_detection(form).split() + list(dynamic[1:]),
                                    include_assignments=True)
             if hit == LATE or hit is ALL or isinstance(hit, tuple):
-                reach = LATE if hit == LATE else ALL
-                break
+                return LATE if hit == LATE else ALL
             names |= hit
-        else:
-            reach = frozenset(names) if complete else ALL
-        self._busy_reach.discard(k)
-        if not self._busy_reach:
-            self._reach[k] = reach      # a nested answer rests on an assumption; do not keep it
-        return reach
+        return frozenset(names)
 
     def values_at(self, name: str, offset: int, *, fallback: bool = False) -> tuple[str, ...]:
         """Possible values of *name* at *offset*; UNKNOWN is among them unless a binding fixes it.
