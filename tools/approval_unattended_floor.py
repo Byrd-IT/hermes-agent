@@ -7,12 +7,13 @@ worker's test script then sent ``X="rm -rf /home"; $X`` through the real termina
 command ran. The hardline floor now resolves that spelling, but approve mode still passes some
 commands, and this module refuses them:
 
-* The program is unreadable. A command word that is still a bare ``$VAR`` / ``${VAR}`` after
-  same-command bindings are substituted takes its program, and possibly its arguments too
-  (``$X`` word-splits), from the environment at run time. No detector can say what it runs, so it
-  is refused whatever its arguments are. A variable assigned earlier in the same command
-  (``PY=python3; $PY -c ...``) or bound by a literal ``for p in a b`` loop is resolved and judged
-  by what it resolves to. A command substitution in command position (``$(which rm) -rf x``) is
+* The program is unreadable. A command word that is a bare ``$VAR`` / ``${VAR}`` whose value the
+  command does not fix takes its program, and possibly its arguments too (``$X`` word-splits), from
+  the environment at run time. No detector can say what it runs, so it is refused whatever its
+  arguments are. "Fixes" means an assignment that always runs in the same shell before the use
+  (``PY=python3; $PY -c ...``) or a literal ``for p in a b`` loop. A prefix-only ``X=v cmd``, a
+  conditional/subshell/pipeline assignment, ``read X`` and ``eval`` do not fix it. Shell payloads
+  (``bash -c '...'``, a heredoc fed to a shell) are checked the same way. A command substitution in command position (``$(which rm) -rf x``) is
   refused when its arguments look destructive: a short recursive flag group, ``--recursive``, a
   raw-device ``of=/dev/...``, or an operand that would be hardline under ``rm``.
 * Two independent scanners say "destroys data". Tirith returns ``block`` AND the dangerous-pattern
@@ -52,8 +53,9 @@ def _opaque_leader_refusal(command: str) -> str | None:
     from tools.approval_detection import _shell_command_segment, detect_hardline_command
     for resolved, _, end, word in opaque_command_leaders(command):
         if _VARIABLE_LEADER_RE.fullmatch(word):
-            return (f"command word {word} is a shell variable this command never assigns, so the "
-                    "program it runs comes from the environment and cannot be inspected")
+            return (f"command word {word} is a shell variable whose value this command never fixes "
+                    "(unassigned, or assigned only conditionally, temporarily, in a subshell or by "
+                    "read/eval), so the program it runs cannot be inspected")
         arguments = _shell_command_segment(resolved, end)
         if arguments and (_DESTRUCTIVE_ARGS_RE.search(arguments) or detect_hardline_command(f"rm {arguments}")[0]):
             return (f"command word {word} is an unresolved command substitution and its arguments "

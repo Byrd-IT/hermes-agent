@@ -107,8 +107,10 @@ def test_resolution_reports_unchanged_commands_as_none():
     assert resolve_shell_assignments("ls -la") is None
     assert resolve_shell_assignments("echo $HOME") is None
     assert resolve_shell_assignments('X=1; echo $X') == 'X=1; echo 1'
-    assert resolve_shell_assignments('export A=1 B="two words"; C=3 cmd $A $B $C') == (
-        'export A=1 B="two words"; C=3 cmd 1 two words 3')
+    # `C=3 cmd $C`: $C expands before the prefix assignment applies, so it keeps its environment
+    # value; the prefix value is only a possible one.
+    assert resolve_shell_assignment_variants('export A=1 B="two words"; C=3 cmd $A $B $C') == [
+        'export A=1 B="two words"; C=3 cmd 1 two words $C', 'export A=1 B="two words"; C=3 cmd 1 two words 3']
 
 
 # ---- combined guard under single_query_mode: approve (the acceptance criterion) --------------
@@ -133,7 +135,7 @@ def test_unresolved_leader_with_destructive_args_refused_in_approve_mode(single_
     with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
         result = check_all_command_guards("$X -rf ~/.local", "local")
     assert result["approved"] is False
-    assert "never assigns" in result["description"]
+    assert "never fixes" in result["description"]
     assert "single_query_mode" in result["message"]
 
 
@@ -300,7 +302,7 @@ def test_unresolved_variable_command_refused_in_approve_mode(single_query, comma
     with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
         result = check_all_command_guards(command, "local")
     assert result["approved"] is False
-    assert "never assigns" in result["description"]
+    assert "never fixes" in result["description"]
     assert "single_query_mode" in result["message"]
 
 
@@ -328,3 +330,123 @@ def test_delete_in_root_path_without_tirith_block_still_approves(single_query):
 
 def test_dangerous_detector_sees_the_resolved_command():
     assert detect_dangerous_command("X=rm; $X -rf ~/.local")[0] is True
+
+
+# ---- review round 2 regressions: combined guard, approve mode, guard-only ------------------
+
+# P1 #1: a binding that may not run, or not in this shell, must not replace an earlier destructive
+# value. Each of these must stay HARDLINE, not only blocked by the Tirith layer.
+UNPROVEN_OVERWRITE_COMMANDS = [
+    'X="rm -rf /home"; false && X=echo; $X',
+    'X="rm -rf /home"; true || X=echo; $X',
+    'X="rm -rf /home"; (X=echo); $X',
+    'X="rm -rf /home"; X=echo | cat; $X',
+    'X="rm -rf /home"; X=echo & $X',
+    'X="rm -rf /home"; if test -e f; then X=echo; fi; $X',
+    'X="rm -rf /home"; f() { X=echo; }; $X',
+    'X="rm -rf /home"; X=echo true; $X',
+    'X="rm -rf /home"; echo "$(X=echo)"; $X',
+]
+
+
+@pytest.mark.parametrize("command", UNPROVEN_OVERWRITE_COMMANDS)
+def test_unproven_reassignment_keeps_destructive_value_hardline(command):
+    assert detect_hardline_command(command) == (True, "recursive delete of system directory")
+
+
+@pytest.mark.parametrize("command", UNPROVEN_OVERWRITE_COMMANDS)
+def test_unproven_reassignment_hardline_under_combined_guard(single_query, command):
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        result = check_all_command_guards(command, "local")
+    assert result["approved"] is False
+    assert "hardline" in result["message"].lower()
+
+
+# A temporary, clobbered or conditional binding does not prove what a later $X runs.
+@pytest.mark.parametrize("command", [
+    "X=echo true; $X",                 # prefix assignment: only true's environment
+    "X=echo; read X; $X",              # read replaces X with unknown input
+    "X=echo; unset X; $X",
+    "X=echo; mapfile X < f; $X",
+    "X=echo; printf -v X '%s' \"$Y\"; $X",
+    "X=echo; eval \"$Y\"; $X",           # eval can set any name
+    "X=echo; . ./env.sh; $X",
+    "false && X=echo; $X",
+    "(X=echo); $X",
+    "for X; do $X; done",               # positional parameters
+])
+def test_unproven_binding_leader_refused_in_approve_mode(single_query, command):
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        result = check_all_command_guards(command, "local")
+    assert result["approved"] is False
+    assert "never fixes" in result["description"]
+
+
+@pytest.mark.parametrize("command", [
+    "X=echo; $X hello",
+    "X=echo && $X hello",
+    "X=echo; if true; then $X hi; fi",
+    "X=echo; { $X hi; }",
+    "X=echo; ($X hi)",
+    "X=echo; $X a | $X b",
+    "X=echo; for i in 1 2; do $X $i; done",
+    "export X=echo; $X hi",
+    "X=echo; case a in a) $X hi;; esac",
+])
+def test_dominating_bindings_still_auto_approve(single_query, command):
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        assert check_all_command_guards(command, "local")["approved"] is True
+
+
+# P1 #2: executable shell payloads are checked for unresolved leaders too.
+@pytest.mark.parametrize("command", [
+    "bash -c '$X'",
+    "sh -c '${X}'",
+    "bash -lc 'cd /tmp && $X'",
+    "bash <<'EOF'\n$X\nEOF",
+    "bash <<EOF\n$X\nEOF",
+    "cat <<'EOF' | bash\n$X\nEOF",
+    "ssh host <<'EOF'\n$X\nEOF",
+    "bash -c 'bash -c \"$X\"'",
+])
+def test_unresolved_leader_inside_shell_payload_refused(single_query, command):
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_INCOMPLETE):
+        result = check_all_command_guards(command, "local")
+    assert result["approved"] is False
+    assert "never fixes" in result["description"]
+
+
+@pytest.mark.parametrize("command", [
+    "bash -c 'X=echo; $X hi'",
+    "bash -c 'echo $X'",
+    "bash <<'EOF'\nX=ls\n$X -la\nEOF",
+    "cat > /tmp/x.php <<'PHP'\n<?php\n$config = 1;\nPHP\nphp /tmp/x.php",
+    "python3 - <<'PY'\n$X\nPY",           # a non-shell consumer: the body is not shell
+    "cat <<EOF > notes.txt\n$X\nEOF",
+])
+def test_shell_payload_benign_and_non_shell_heredocs_still_approve(single_query, command):
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        assert check_all_command_guards(command, "local")["approved"] is True
+
+
+# P2: bounds never drop a value silently.
+def test_loop_values_past_the_variant_cap_are_all_examined():
+    words = " ".join(chr(ord("a") + k) for k in range(8))
+    command = f'for c in {words} "rm -rf /home"; do $c; done'
+    assert detect_hardline_command(command) == (True, "recursive delete of system directory")
+    many = " ".join(f"w{k}" for k in range(40))
+    assert detect_hardline_command(f'for c in {many} "rm -rf /home"; do $c; done') == (
+        True, "recursive delete of system directory")
+
+
+def test_loop_past_the_word_limit_is_unknown_not_resolved(single_query):
+    many = " ".join(f"w{k}" for k in range(70))
+    command = f"for c in {many}; do $c; done"
+    assert [w for *_, w in opaque_command_leaders(command)] == ["$c"]
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        assert check_all_command_guards(command, "local")["approved"] is False
+
+
+def test_loop_within_the_limit_stays_resolved(single_query):
+    command = "for c in " + " ".join(f"tool{k}" for k in range(20)) + "; do $c --version; done"
+    assert opaque_command_leaders(command) == []
