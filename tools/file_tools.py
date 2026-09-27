@@ -1044,6 +1044,67 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         return tool_error(str(e))
 
 
+def _search_backend_path(path: str, resolved_search_path: str, file_ops) -> str:
+    """The root handed to the search backend: the workspace-resolved path.
+
+    ShellFileOperations resolves a relative root against the SHARED ``env.cwd``,
+    which any ``terminal(workdir=...)`` command moves (the cwd marker parse
+    stamps it), so a raw relative root silently searched the last workdir
+    instead of the workspace every other file tool uses. Same host-only rule
+    as read_file: sandbox backends keep the raw path (their namespace is not
+    the host's). A relative multi-path string ("a b", "a,b") whose joined form
+    does not exist stays raw so the backend's multi-path recovery can split it.
+    """
+    if not path or resolved_search_path == path or not _file_ops_uses_host_paths(file_ops):
+        return path
+    if Path(_expand_tilde(path)).is_absolute():
+        return path  # already anchored; keep the model's spelling
+    if ("," in path or any(ch.isspace() for ch in path)) and not os.path.exists(resolved_search_path):
+        return path
+    return resolved_search_path
+
+
+def _relativize_search_result(result, backend_root: str, raw_root: str) -> None:
+    """Rewrite hits under *backend_root* back to the caller's *raw_root* spelling
+    in place, so pinning the root does not change the output format (hits stay
+    relative, e.g. ``repo/AGENTS.md``, exactly as before when env.cwd matched)."""
+    root = backend_root.rstrip("/\\") or backend_root
+    raw = raw_root.rstrip("/\\") or raw_root
+
+    def fix(p):
+        if not isinstance(p, str):
+            return p
+        if p == root:
+            return raw
+        for sep in ("/", os.sep):
+            prefix = root if root.endswith(sep) else root + sep
+            if p.startswith(prefix):
+                return raw.rstrip(sep) + sep + p[len(prefix):]
+        return p
+
+    for m in getattr(result, "matches", None) or ():
+        m.path = fix(m.path)
+    if getattr(result, "files", None):
+        result.files = [fix(f) for f in result.files]
+    if getattr(result, "counts", None):
+        result.counts = {fix(k): v for k, v in result.counts.items()}
+    # Whole-path occurrences only ("/ws" must not rewrite "/ws2/x"); a trailing
+    # "." counts as a boundary only when it ends the sentence.
+    boundary = r"(?=$|[/\\\s'\",:;)\]]|\.(?:\s|$))"
+    for attr in ("error", "warning"):
+        text = getattr(result, attr, None)
+        if isinstance(text, str) and root in text:
+            setattr(result, attr, re.sub(re.escape(root) + boundary, lambda _m: raw, text))
+    # A missing root's "Similar paths" list names siblings in its parent
+    # directory; spell that parent the way the old cwd-relative search did.
+    err = getattr(result, "error", None)
+    parent = os.path.dirname(root).rstrip("/\\")
+    if isinstance(err, str) and err.startswith("Path not found:") and parent:
+        raw_parent = (os.path.dirname(raw) or ".").rstrip("/\\") or "/"
+        setattr(result, "error", re.sub(
+            re.escape(parent + "/"), lambda _m: raw_parent.rstrip("/") + "/", err))
+
+
 def search_tool(pattern: str, target: str = "content", path: str = ".",
                 file_glob: str = None, limit: int = 50, offset: int = 0,
                 output_mode: str = "content", context: int = 0,
@@ -1093,9 +1154,13 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         if cached_search_nf is not None:
             return cached_search_nf
 
-        result = _get_file_ops(task_id).search(
-            pattern=pattern, path=path, target=target, file_glob=file_glob,
+        file_ops = _get_file_ops(task_id)
+        backend_path = _search_backend_path(path, resolved_search_path, file_ops)
+        result = file_ops.search(
+            pattern=pattern, path=backend_path, target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context, order=order)
+        if backend_path != path:
+            _relativize_search_result(result, backend_path, path)
         omitted = _filter_read_blocked_search_results(result, task_id)
         for m in getattr(result, "matches", None) or ():
             if getattr(m, "content", None):
