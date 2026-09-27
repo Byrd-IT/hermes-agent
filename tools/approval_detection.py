@@ -12,6 +12,7 @@ import shlex
 import tempfile
 import unicodedata
 
+from tools.approval_detection_assignments import resolve_shell_assignments
 from tools.approval_detection_awk import AWK_EXEC_DESCRIPTION, AWK_NAMES, awk_program_runs_shell
 
 logger = logging.getLogger("tools.approval")
@@ -1624,7 +1625,44 @@ def _deny_command_variants(command: str):
                 pending.append(payload)
 
 
-def _command_detection_variants(command: str):
+def _command_detection_variants(command: str, *, resolve_assignments: bool = True):
+    """Every detection view of *command*. With *resolve_assignments*, variables assigned in the
+    same command are then substituted into each view and the result expanded once more, so
+    ``X="rm -rf /home"; $X`` is seen as ``rm -rf /home`` (see approval_detection_assignments)."""
+    seen: set[str] = set()
+    for variant in _command_detection_variants_unresolved(command):
+        if variant is None:
+            continue
+        seen.add(variant)
+        yield variant
+    if not resolve_assignments:
+        return
+    # Variants that differ from an earlier source only by whitespace (the command-start-marked
+    # forms insert newlines) resolve to the same command, so each is resolved and expanded once.
+    # Quoting is NOT folded: `"rm" -rf /` and `rm -rf /` expand to different variant sets.
+    done: set[str] = set()
+    for source in [command, *seen]:
+        key = _RESOLVE_DEDUP_RE.sub("", source)
+        if key in done:
+            continue
+        done.add(key)
+        resolved = resolve_shell_assignments(source)
+        if resolved is None:
+            continue
+        resolved_key = _RESOLVE_DEDUP_RE.sub("", resolved)
+        if resolved_key in done:
+            continue
+        done.add(resolved_key)
+        for variant in _command_detection_variants_unresolved(resolved):
+            if variant is not None and variant not in seen:
+                seen.add(variant)
+                yield variant
+
+
+_RESOLVE_DEDUP_RE = re.compile(r"\s")
+
+
+def _command_detection_variants_unresolved(command: str):
     # Mask quoted newlines BEFORE normalization: normalization strips escapes (\" -> ") and ""
     # pairs, corrupting quote tracking (`echo "a\""` becomes an unterminated quote) so masking
     # afterwards could swallow a REAL unquoted newline separator. The raw command carries faithful quote state.
