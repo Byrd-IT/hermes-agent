@@ -659,3 +659,126 @@ def test_eval_inside_a_shell_heredoc_is_still_seen():
                                      'env "LD_PATH=$HOME/lib" ls'])
 def test_quoted_env_assignment_operand_is_not_a_program(command):
     assert opaque_command_leaders(command) == []
+
+
+# ---- review round 4 regressions: every spelling of a name write invalidates the proof -------
+# All guard-only (check_all_command_guards / classifiers); nothing reaches an executor.
+
+READER_CLOBBER_COMMANDS = [
+    # the four review spellings
+    "X=echo; IFS= read -r X; $X",           # prefix assignment before the reader
+    "REPLY=echo; read; $REPLY",             # implicit REPLY target
+    "X=echo; R=read; $R X; $X",             # reader reached through a same-command variable
+    "X=echo; printf -vX %s \"$Y\"; $X",     # attached -v target
+    # the rest of the class
+    "X=echo; read -raX; $X",
+    "X=echo; LC_ALL=C builtin read X; $X",
+    "X=echo; time read X; $X",
+    "X=echo; ! read X; $X",
+    "X=echo; wait -p X; $X",
+    "X=echo; mapfile; $MAPFILE",
+    "X=echo; getopts ab X; $X",
+    "X=echo; let X=1; $X",
+    "X=echo; N=X; read \"$N\"; $X",         # target name not in the text
+    "X=echo; N=X; printf -v \"$N\" %s y; $X",
+    "X=echo; N=X; declare \"$N=v\"; $X",
+    "X=echo; declare -n R=X; $X",           # nameref: X can change through R
+    "declare -n R=X; X=ls; $R",
+    "X=echo; trap 'X=v' DEBUG; $X",
+    "trap 'X=v' DEBUG; X=echo; $X",         # a trap handler outlives later assignments
+    "eval \"$Y\"; X=echo; $X",
+    "X=echo; E=eval; $E \"$Y\"; $X",
+    "X=echo; B=builtin; $B read X; $X",
+    "X=echo; L=let; $L X=1; $X",
+    "X=echo; S=source; $S ./f; $X",
+    "X=echo; D=declare; $D X=v; $X",
+    "X=echo; select X in a; do break; done; $X",
+    "_=echo; true rm; $_ -rf /tmp/x",       # $_ is rewritten by every command
+]
+
+
+@pytest.mark.parametrize("scan", [_ALLOW_TIRITH, _INCOMPLETE], ids=["tirith-allow", "tirith-block"])
+@pytest.mark.parametrize("command", READER_CLOBBER_COMMANDS)
+def test_name_writes_invalidate_bindings_in_approve_mode(single_query, command, scan):
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=scan):
+        result = check_all_command_guards(command, "local")
+    assert result["approved"] is False
+    assert "never fixes" in result["description"]
+
+
+@pytest.mark.parametrize("command", [
+    'X=echo; X[0]="rm -rf /home"; $X',       # element 0 is what $X expands to
+    'X=echo; : ${X:="rm -rf /home"}; $X',    # default-assign expansion
+    'X=echo; D=declare; $D X="rm -rf /home"; $X',
+])
+def test_hidden_destructive_writes_reach_detection(single_query, command):
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        assert check_all_command_guards(command, "local")["approved"] is False
+
+
+@pytest.mark.parametrize("command", [
+    'X=echo; X[0]="rm -rf /home"; $X',
+    'X=echo; : ${X:="rm -rf /home"}; $X',
+])
+def test_element_and_default_assignment_values_are_hardline(command):
+    assert detect_hardline_command(command) == (True, "recursive delete of system directory")
+
+
+@pytest.mark.parametrize("command", [
+    "X=echo; $X hello",
+    "X=echo; read -r Y; $X \"$Y\"",           # read of ANOTHER name
+    "X=echo; IFS= read -r Y; $X \"$Y\"",
+    "X=echo; printf -v Y %s z; $X \"$Y\"",
+    "X=echo; command -v read; $X hi",         # lookup only
+    "X=echo; /usr/bin/read X; $X hi",         # a path is never the builtin
+    "X=echo; $HOME/bin/read X; $X hi",
+    "X=echo; \"$VIRTUAL_ENV/bin/python\" -V; $X hi",
+    "X=echo; export X; $X hi",
+    "X=echo; declare -r X; $X hi",
+    "X=echo; wait -n; $X hi",
+    "source ./venv/bin/activate; PY=python3; $PY -V",
+    "while IFS= read -r line; do echo \"$line\"; done < f",
+])
+def test_writes_to_other_names_still_auto_approve(single_query, command):
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        assert check_all_command_guards(command, "local")["approved"] is True
+
+
+@pytest.mark.parametrize("words, expected", [
+    (["IFS=", "read", "-r", "X"], {"X"}),
+    (["read"], {"REPLY"}),
+    (["read", "-r", "-p", "prompt"], {"REPLY"}),
+    (["read", "-raX"], {"X"}),
+    (["read", "-a", "ARR", "X"], {"ARR", "X"}),
+    (["printf", "-vX", "%s", "y"], {"X"}),
+    (["printf", "-v", "X", "%s"], {"X"}),
+    (["printf", "%s", "-v"], set()),
+    (["mapfile", "-t"], {"MAPFILE"}),
+    (["mapfile", "-t", "LINES"], {"LINES"}),
+    (["getopts", "ab", "OPT"], {"OPT", "OPTARG", "OPTIND"}),
+    (["wait", "-p", "PID"], {"PID"}),
+    (["let", "X+=1", "Y++"], {"X", "Y"}),
+    (["command", "-v", "read"], set()),
+    (["/usr/bin/read", "X"], set()),
+])
+def test_command_clobbers_names(words, expected):
+    from tools.approval_detection_clobbers import command_clobbers
+    assert command_clobbers(words) == frozenset(expected)
+
+
+@pytest.mark.parametrize("words", [["read", '"$N"'], ["printf", "-v", '"$N"', "%s"], ["source", "f"],
+                                   ["declare", '"$N=v"']])
+def test_command_clobbers_unknown_target_is_every_name(words):
+    from tools.approval_detection_clobbers import ALL, command_clobbers
+    assert command_clobbers(words) is ALL
+
+
+@pytest.mark.parametrize("words", [["trap", "X=v", "DEBUG"], ["eval", '"$Y"'], ["declare", "-n", "R=X"]])
+def test_command_clobbers_late_writers(words):
+    from tools.approval_detection_clobbers import LATE, command_clobbers
+    assert command_clobbers(words) == LATE
+
+
+def test_command_clobbers_dynamic_leader_is_deferred():
+    from tools.approval_detection_clobbers import DYNAMIC, command_clobbers
+    assert command_clobbers(["$R", "X"]) == (DYNAMIC, 0)

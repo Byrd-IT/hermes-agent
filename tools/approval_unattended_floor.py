@@ -12,8 +12,11 @@ commands, and this module refuses them:
   the environment at run time. No detector can say what it runs, so it is refused whatever its
   arguments are. "Fixes" means an assignment that always runs in the same shell before the use
   (``PY=python3; $PY -c ...``) or a literal ``for p in a b`` loop. A prefix-only ``X=v cmd``, a
-  conditional/subshell/pipeline assignment, ``X=$(cat f)`` (command output), ``read X`` (also as
-  ``builtin read``/``command read``) and ``eval`` do not fix it. Shell payloads (``bash -c '...'``,
+  conditional/subshell/pipeline assignment, ``X=$(cat f)`` (command output), and any builtin that
+  writes the name with a value not in the text do not fix it: ``read``/``mapfile``/``printf -v``/
+  ``wait -p``/``getopts``/``let`` however spelled (``IFS= read X``, ``builtin read``, ``printf -vX``,
+  a bare ``read`` setting REPLY, ``R=read; $R X``), ``eval``/``source``, a ``trap`` handler or a
+  ``declare -n`` nameref. Shell payloads (``bash -c '...'``,
   a heredoc fed to a shell, an ``eval``'s arguments) are checked the same way.
 * The inspection was incomplete. Any bound the resolver hits (too many value combinations, loop
   words, or shell payloads nested past the depth limit) is refused rather than treated as clean.
@@ -67,7 +70,8 @@ def _opaque_leader_refusal(command: str) -> str | None:
                                                    and not _SUBSTITUTION_RE.search(word)):
             return (f"command word {word} is a shell variable whose value this command never fixes "
                     "(unassigned, or assigned only conditionally, temporarily, in a subshell, from "
-                    "command output or by read/eval), so the program it runs cannot be inspected")
+                    "command output, or overwritten by read/printf -v/eval/trap and the like), so "
+                    "the program it runs cannot be inspected")
         arguments = _shell_command_segment(resolved, end)
         if arguments and (_DESTRUCTIVE_ARGS_RE.search(arguments) or detect_hardline_command(f"rm {arguments}")[0]):
             return (f"command word {word} is an unresolved command substitution and its arguments "

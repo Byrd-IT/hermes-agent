@@ -25,10 +25,13 @@ A binding is PROOF of a value only when it dominates the use (``approval_detecti
 it always runs, in the same shell, before the use, and is not a prefix-only temporary
 (``X=echo true``). Any other binding (conditional, subshell, pipeline, function or loop body, a
 heredoc line) only ADDS a possible value. A name no dominating binding fixes also keeps the
-environment's value, the explicit ``UNKNOWN``. ``read``/``unset``/``mapfile``/``getopts``/``printf -v``
-(also behind ``builtin``/``command``) make their names UNKNOWN; ``eval``/``source``/``.`` make every
-name UNKNOWN. A value computed by a command substitution (``X=$(cat f)``) is UNKNOWN too: the
-command's output is not in the text.
+environment's value, the explicit ``UNKNOWN``. A builtin that writes a name the text does not show
+(``read``, ``printf -v``, ``mapfile``, ``eval``, a nameref, however spelled; see
+``approval_detection_clobbers``) makes that name UNKNOWN. A reader reached through a variable
+(``R=read; $R X``) is classified by what the variable holds, and an unreadable one clobbers every
+name. Writes that can happen LATER than where they are written (a function body, a ``trap``
+handler, a nameref alias) are never overridden by an intervening assignment. A value computed by a
+command substitution (``X=$(cat f)``) is UNKNOWN too: the command's output is not in the text.
 
 For detection variants this over-approximates: a wrong guess only adds a variant, and a variant can
 only add blocks. For the opaque-leader classifier, UNKNOWN among a command word's values means the
@@ -47,15 +50,24 @@ from tools.approval_detection_shell_scope import ShellScope
 UNKNOWN = "\x00<unknown>"
 # NAME=value / NAME+=value as a whole shell word (the name part is never quoted in real shell).
 _ASSIGNMENT_WORD_RE = re.compile(r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?P<append>\+?)=(?P<value>.*)", re.DOTALL)
+# NAME[subscript]=value / NAME[subscript]+=value: one array element.
+_ELEMENT_ASSIGNMENT_RE = re.compile(r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\[[^\]]*\]\+?=(?P<value>.*)", re.DOTALL)
+# Names the shell itself rewrites as commands run (`$_` is the previous command's last argument).
+# A same-command assignment never proves their value.
+_SHELL_MANAGED_NAMES = frozenset({
+    "_", "BASH_REMATCH", "PIPESTATUS", "RANDOM", "SRANDOM", "LINENO", "SECONDS", "EPOCHSECONDS",
+    "EPOCHREALTIME", "BASHPID", "BASH_COMMAND", "FUNCNAME", "PWD", "OLDPWD", "COPROC", "BASH_ARGV",
+    "BASH_ARGC", "BASH_LINENO", "BASH_SOURCE", "DIRSTACK", "GROUPS", "HISTCMD", "OPTARG", "OPTIND",
+})
 _NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # Declaration builtins whose operands are assignments (`export X="rm -rf /"`).
 _DECLARATION_BUILTINS = frozenset({"export", "declare", "typeset", "local", "readonly"})
-# Builtins that give their NAME operands a value the command text does not show.
-_NAME_READERS = frozenset({"read", "unset", "mapfile", "readarray", "getopts"})
-# Builtins that can set any name at all.
-_ANY_NAME_SETTERS = frozenset({"eval", "source", "."})
-# Words that run the builtin named next in the current shell (`builtin read X`, `command read X`).
+# Words that run the builtin named next in the current shell (`builtin declare X=v`).
 _BUILTIN_WRAPPERS = frozenset({"builtin", "command"})
+# Builtins whose writes can land at any LATER point: a trap handler, a nameref alias.
+_LATE_WRITERS = frozenset({"trap", "declare", "typeset", "local"})
+# `${NAME=word}` / `${NAME:=word}`: assigns *word* when NAME is unset (or empty).
+_DEFAULT_ASSIGN_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):?=([^}]*)\}")
 # Loop keywords whose NAME takes each listed word in turn.
 _LOOP_BINDERS = frozenset({"for", "select"})
 # $NAME, ${NAME}, ${NAME[...]}, ${NAME:-word} / ${NAME-word} / ${NAME:+word} / ${NAME:=word}.
@@ -101,6 +113,11 @@ class _Binding:
     persistent: bool = True
     truncated: bool = False
     command_output: bool = False
+    # A command whose word is an expansion (`$R X`): its raw words from that word on. What it
+    # clobbers is decided once the word's values are known (``_Resolution.clobbered``).
+    dynamic: tuple[str, ...] | None = None
+    # Can take effect at any later point, so no later assignment overrides it.
+    late: bool = False
 
 
 def _array_value(command: str, open_paren: int) -> tuple[str, int] | None:
@@ -150,18 +167,48 @@ def _for_loop_binding(command: str, for_start: int, pos: int) -> _Binding | None
     return _Binding(for_start, pos, name, tuple(dict.fromkeys(words)) or (UNKNOWN,), truncated=truncated)
 
 
-def _reader_bindings(command: str, builtin: str, start: int, pos: int) -> list[_Binding]:
-    """NAME operands of read/unset/mapfile/readarray/getopts and ``printf -v NAME``: UNKNOWN."""
-    from tools.approval_detection import _deobfuscate_shell_word_for_detection, _read_shell_word
-    found, previous = [], None
+def _simple_command_words(command: str, pos: int) -> list[str]:
+    """The raw words of the simple command starting at *pos* (an unquoted newline ends it)."""
+    from tools.approval_detection import _read_shell_word
+    words: list[str] = []
     while pos < len(command):
-        word_start, word_end, word = _read_shell_word(command, pos)
-        if word_start == word_end or "\n" in command[pos:word_start]:
+        start, end, word = _read_shell_word(command, pos)
+        if start == end or (words and "\n" in command[pos:start]):
             break
-        plain = _deobfuscate_shell_word_for_detection(word)
-        if _NAME_RE.fullmatch(plain) and (builtin != "printf" or previous == "-v"):
-            found.append(_Binding(start, word_end, plain, (UNKNOWN,)))
-        previous, pos = plain, word_end
+        words.append(word)
+        pos = end
+    return words
+
+
+def _clobber_bindings(command: str, start: int, words: list[str]) -> list[_Binding]:
+    """Name writes whose value the text does not show (``approval_detection_clobbers``). They take
+    effect after the whole simple command (its arguments expand first). They never REPLACE a
+    proven value, only add UNKNOWN to it, so a destructive value seen earlier still reaches the
+    detectors."""
+    from tools.approval_detection import _shell_command_segment
+    from tools.approval_detection_clobbers import LATE, command_clobbers
+    hit = command_clobbers(words)
+    if hit == frozenset():
+        return []
+    end = start + len(_shell_command_segment(command, start))
+    if isinstance(hit, tuple):
+        return [_Binding(start, end, None, (UNKNOWN,), persistent=False, dynamic=tuple(words[hit[1]:]))]
+    if hit is None or hit == LATE:
+        return [_Binding(start, end, None, (UNKNOWN,), persistent=False, late=hit == LATE)]
+    return [_Binding(start, end, name, (UNKNOWN,), persistent=False) for name in sorted(hit)]
+
+
+def _default_assignment_bindings(command: str) -> list[_Binding]:
+    """``${X:=word}`` / ``${X=word}`` may assign *word* to X (only when X is unset or empty)."""
+    from tools.approval_detection import _deobfuscate_shell_word_for_detection, _scan_shell
+    found = []
+    for kind, i, _, quote in _scan_shell(command):
+        if kind == "char" and quote != "'" and command.startswith("${", i):
+            match = _DEFAULT_ASSIGN_RE.match(command, i)
+            if match:
+                found.append(_Binding(i, match.end(), match.group(1),
+                                      (_deobfuscate_shell_word_for_detection(match.group(2)),),
+                                      persistent=False))
     return found
 
 
@@ -171,10 +218,12 @@ def _collect_bindings(command: str) -> list[_Binding]:
     substitutions folded), so ``X="rm -rf /home"`` binds X to ``rm -rf /home``."""
     from tools.approval_detection import (
         _deobfuscate_shell_word_for_detection, _iter_shell_command_starts, _read_shell_word,
-        _shell_command_segment,
     )
-    bindings: list[_Binding] = []
+    bindings: list[_Binding] = _default_assignment_bindings(command) if "${" in command else []
     for pos in _iter_shell_command_starts(command):
+        words = _simple_command_words(command, pos)
+        if words and words[0] not in _LOOP_BINDERS:
+            bindings.extend(_clobber_bindings(command, pos, words))
         first, declaration, wrapped = True, False, False
         pending: list[_Binding] = []
         while pos < len(command):
@@ -184,24 +233,22 @@ def _collect_bindings(command: str) -> list[_Binding]:
             if first and not wrapped and word in _LOOP_BINDERS:
                 loop = _for_loop_binding(command, start, end)
                 if loop is not None:
+                    if word == "select":
+                        # select sets NAME from input (empty on a bad choice) and leaves it as it
+                        # was on EOF: the words are possible values, never a proof.
+                        loop = _Binding(loop.start, loop.end, loop.name, loop.raw_values + ("",),
+                                        persistent=False, truncated=loop.truncated)
+                        bindings.append(_Binding(start, loop.end, "REPLY", (UNKNOWN,), persistent=False))
                     bindings.append(loop)
                 break
             plain = _deobfuscate_shell_word_for_detection(word) if first else word
             if first and plain in _BUILTIN_WRAPPERS:
-                # `builtin read X` / `command -p read X` run the builtin in this shell.
+                # `builtin declare X=v` runs the builtin in this shell.
                 wrapped, pos = True, end
                 continue
             if first and wrapped and plain.startswith("-"):
                 pos = end
                 continue
-            if first and plain in _ANY_NAME_SETTERS:
-                # Its arguments expand BEFORE it runs, so the clobber takes effect after them.
-                bindings.append(_Binding(start, start + len(_shell_command_segment(command, start)),
-                                         None, (UNKNOWN,)))
-                break
-            if first and (plain in _NAME_READERS or plain == "printf"):
-                bindings.extend(_reader_bindings(command, plain, start, end))
-                break
             if first and plain in _DECLARATION_BUILTINS:
                 declaration, first, pos = True, False, end
                 continue
@@ -212,6 +259,16 @@ def _collect_bindings(command: str) -> list[_Binding]:
                 pos = end
                 continue
             match = _ASSIGNMENT_WORD_RE.fullmatch(word)
+            element = None if match else _ELEMENT_ASSIGNMENT_RE.fullmatch(word)
+            if element:
+                # `X[0]=v`: element 0 is what $X expands to; another index leaves it. Either way
+                # v is a possible value, never a proof.
+                pending.append(_Binding(start, end, element.group("name"),
+                                        (_deobfuscate_shell_word_for_detection(element.group("value")),),
+                                        persistent=False,
+                                        command_output=bool(_COMMAND_OUTPUT_RE.search(element.group("value")))))
+                pos = end
+                continue
             if not match:
                 # `X=v cmd ...`: the assignments only reach cmd's environment, not the shell.
                 if not declaration:
@@ -400,6 +457,8 @@ class _Resolution:
         self.truncated = False
         self._memo: dict[int, tuple[str, ...]] = {}
         self._busy: set[int] = set()
+        self._reach: dict[int, "frozenset[str] | str | None"] = {}
+        self._busy_reach: set[int] = set()
 
     def _cap(self, values) -> tuple[str, ...]:
         unique = tuple(dict.fromkeys(values))
@@ -433,27 +492,84 @@ class _Resolution:
             old = self.values_at(b.name, b.start)
             values = [UNKNOWN if UNKNOWN in (o, n) else o + n for o in old for n in values]
         self._busy.discard(k)
-        self._memo[k] = self._cap(values)
-        return self._memo[k]
+        capped = self._cap(values)
+        if not self._busy_reach:
+            self._memo[k] = capped      # computed under a reach assumption: recompute later
+        return capped
+
+    def clobbers(self, k: int, name: str) -> bool:
+        """Can binding *k* (name None: a clobber of unknown or dynamic reach) write *name*?"""
+        b = self.bindings[k]
+        if b.name is not None or b.dynamic is None:
+            return b.name in (name, None)
+        if k in self._busy_reach:
+            # Resolving this command's own word: the values it had BEFORE this run. What this
+            # run then writes is added once the reach is known (a loop feeds it back to the word).
+            return False
+        reach = self._dynamic_reach(k)
+        return reach is None or isinstance(reach, str) or name in reach
+
+    def is_late(self, k: int) -> bool:
+        b = self.bindings[k]
+        return b.late or (b.dynamic is not None and self._dynamic_reach(k) == "late")
+
+    def _dynamic_reach(self, k: int) -> "frozenset[str] | str | None":
+        """What the command at binding *k*, whose command word is an expansion, may write once its
+        word holds each of its possible values: a name set, None (every name) or "late"."""
+        from tools.approval_detection import _deobfuscate_shell_word_for_detection
+        from tools.approval_detection_clobbers import ALL, LATE, command_clobbers, is_dynamic
+        if k in self._reach:
+            return self._reach[k]
+        if k in self._busy_reach:
+            return ALL
+        self._busy_reach.add(k)
+        dynamic = self.bindings[k].dynamic or ("",)
+        start = self.bindings[k].start
+        forms, complete = _expand_all(dynamic[0], lambda name, _offset: self.values_at(name, start),
+                                      _MAX_VALUES_PER_NAME)
+        names: set[str] = set()
+        reach: "frozenset[str] | str | None" = None if not complete else frozenset()
+        for form in forms if complete else ():
+            if is_dynamic(form):
+                reach = ALL     # still an expansion: the program is not in the text
+                break
+            hit = command_clobbers(_deobfuscate_shell_word_for_detection(form).split() + list(dynamic[1:]),
+                                   include_assignments=True)
+            if hit == LATE or hit is ALL or isinstance(hit, tuple):
+                reach = LATE if hit == LATE else ALL
+                break
+            names |= hit
+        else:
+            reach = frozenset(names) if complete else ALL
+        self._busy_reach.discard(k)
+        if not self._busy_reach:
+            self._reach[k] = reach      # a nested answer rests on an assumption; do not keep it
+        return reach
 
     def values_at(self, name: str, offset: int, *, fallback: bool = False) -> tuple[str, ...]:
         """Possible values of *name* at *offset*; UNKNOWN is among them unless a binding fixes it.
         With *fallback*, a name no earlier binding touches also takes every value it is ever given."""
         values: list[str] = [UNKNOWN]
         bound_before = False
+        late = name in _SHELL_MANAGED_NAMES
         for k, b in enumerate(self.bindings):
-            if b.name not in (name, None):
+            if not self.clobbers(k, name):
                 continue
             if b.end > offset:
                 # A later binding still reaches this use through a loop or a function call.
                 if self.scope.in_loop_with(b.start, offset):
                     values.extend(self.binding_values(k))
+                    late = late or self.is_late(k)
                 continue
             bound_before = True
+            late = late or self.is_late(k)
             if b.persistent and self.scope.dominates(b.start, offset):
                 values = list(self.binding_values(k))
             else:
                 values.extend(self.binding_values(k))
+        if late and UNKNOWN not in values:
+            # A trap handler, nameref or sourced function can rewrite the name at any point.
+            values.append(UNKNOWN)
         if fallback and not bound_before:
             for k, b in enumerate(self.bindings):
                 if b.name == name:
