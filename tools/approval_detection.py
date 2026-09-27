@@ -12,7 +12,7 @@ import shlex
 import tempfile
 import unicodedata
 
-from tools.approval_detection_assignments import resolve_shell_assignment_variants
+from tools.approval_detection_assignments import eval_payloads, resolve_shell_assignment_variants
 from tools.approval_detection_awk import AWK_EXEC_DESCRIPTION, AWK_NAMES, awk_program_runs_shell
 
 logger = logging.getLogger("tools.approval")
@@ -1626,7 +1626,7 @@ def _deny_command_variants(command: str):
                 pending.append(payload)
 
 
-def _command_detection_variants(command: str, *, resolve_assignments: bool = True):
+def _command_detection_variants(command: str, *, resolve_assignments: bool = True, _eval_depth: int = 0):
     """Every detection view of *command*. With *resolve_assignments*, variables assigned in the
     same command are then substituted into each view (per use; one form per possible value) and
     each result expanded once more, so
@@ -1639,6 +1639,15 @@ def _command_detection_variants(command: str, *, resolve_assignments: bool = Tru
         yield variant
     if not resolve_assignments:
         return
+    # `eval` re-parses its (expanded) arguments as a script: that script is a command of its own,
+    # like a `bash -c` payload. Payloads are expanded with the same-command values, so
+    # `X="rm -rf /home"; eval "$X"` is seen as `rm -rf /home`.
+    evaluated, _ = eval_payloads(command) if _eval_depth < _MAX_EVAL_DEPTH else ([], True)
+    for payload in evaluated:
+        for variant in _command_detection_variants(payload, _eval_depth=_eval_depth + 1):
+            if variant not in seen:
+                seen.add(variant)
+                yield variant
     # Variants that differ from an earlier source only by whitespace (the command-start-marked
     # forms insert newlines) resolve to the same command, so each is resolved and expanded once.
     # Quoting is NOT folded: `"rm" -rf /` and `rm -rf /` expand to different variant sets.
@@ -1660,6 +1669,9 @@ def _command_detection_variants(command: str, *, resolve_assignments: bool = Tru
 
 
 _RESOLVE_DEDUP_RE = re.compile(r"\s")
+# Nested `eval` payloads expanded for detection. Deeper nesting is refused in unattended approve
+# mode by approval_detection_assignments.uninspectable_reasons (same depth bound).
+_MAX_EVAL_DEPTH = 3
 
 
 def _command_detection_variants_unresolved(command: str):

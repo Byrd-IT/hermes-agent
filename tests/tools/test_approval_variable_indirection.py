@@ -30,6 +30,7 @@ from tools.approval import check_all_command_guards
 from tools.approval_detection import detect_dangerous_command, detect_hardline_command
 from tools.approval_detection_assignments import (
     opaque_command_leaders, resolve_shell_assignment_variants, resolve_shell_assignments,
+    uninspectable_reasons,
 )
 from tools.approval_unattended_floor import tirith_blast_rules, tirith_block_rules, unattended_approve_refusal
 
@@ -450,3 +451,170 @@ def test_loop_past_the_word_limit_is_unknown_not_resolved(single_query):
 def test_loop_within_the_limit_stays_resolved(single_query):
     command = "for c in " + " ".join(f"tool{k}" for k in range(20)) + "; do $c --version; done"
     assert opaque_command_leaders(command) == []
+
+
+# ---- review round 3 regressions: combined guard, approve mode, guard-only ------------------
+
+# P1 #1: a value computed by a command substitution is not in the text, so it proves nothing.
+@pytest.mark.parametrize("command", [
+    "X=$(cat command.txt); $X",
+    "X=`cat command.txt`; $X",
+    'X="$(cat command.txt)"; $X --flag',
+    "X=$(cat a) Y=ls; $X",
+    "X=echo; X=$(cat f); $X",
+    'X="$(cat f) -rf"; $X /tmp/x',
+])
+def test_command_output_assignment_leader_refused_in_approve_mode(single_query, command):
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        result = check_all_command_guards(command, "local")
+    assert result["approved"] is False
+    assert "never fixes" in result["description"]
+
+
+def test_command_output_value_still_feeds_detection():
+    # The literal part of a substitution value is still examined (tiny literal substitutions fold).
+    assert detect_hardline_command('X="$(printf rm) -rf /home"; $X') == (
+        True, "recursive delete of system directory")
+
+
+# P1 #2: builtin/command-wrapped readers clobber their names too.
+@pytest.mark.parametrize("command", [
+    "X=echo; builtin read X; $X",
+    "X=echo; command read X; $X",
+    "X=echo; command -p read -r X; $X",
+    "X=echo; builtin unset X; $X",
+    "X=echo; builtin eval \"$Y\"; $X",
+    "X=echo; command . ./env.sh; $X",
+    "X=echo; builtin printf -v X '%s' \"$Y\"; $X",
+])
+def test_wrapped_clobbering_builtins_invalidate_in_approve_mode(single_query, command):
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        result = check_all_command_guards(command, "local")
+    assert result["approved"] is False
+    assert "never fixes" in result["description"]
+
+
+# P1 #3: independent choices combine as a cross product, not zipped.
+CROSS_PRODUCT_COMMANDS = [
+    "for X in rm echo; do for Y in ./build /home; do $X -rf $Y; done; done",
+    "for Y in ./build /home; do for X in echo rm; do $X -rf $Y; done; done",
+    "for X in echo rm; do for F in -v -rf; do for Y in ./a /home; do $X $F $Y; done; done; done",
+]
+
+
+@pytest.mark.parametrize("command", CROSS_PRODUCT_COMMANDS)
+def test_cross_product_of_loop_values_is_hardline(command):
+    assert detect_hardline_command(command) == (True, "recursive delete of system directory")
+
+
+@pytest.mark.parametrize("command", CROSS_PRODUCT_COMMANDS)
+def test_cross_product_blocked_by_combined_guard_in_approve_mode(single_query, command):
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_INCOMPLETE):
+        result = check_all_command_guards(command, "local")
+    assert result["approved"] is False
+    assert "hardline" in result["message"].lower()
+
+
+def test_cross_product_past_the_whole_command_cap_is_checked_per_simple_command():
+    # 3 x 4 = 12 combinations > the 8 whole-command variants: the simple command still gets all 12.
+    xs = "echo ls rm"
+    ys = "./a ./b ./c /home"
+    command = f"for X in {xs}; do for Y in {ys}; do $X -rf $Y; done; done"
+    assert detect_hardline_command(command) == (True, "recursive delete of system directory")
+    assert uninspectable_reasons(command) == []
+
+
+def test_cross_product_past_every_bound_is_incomplete_and_refused(single_query):
+    # 9 x 9 = 81 combinations in one simple command is past the per-command bound: incomplete.
+    xs = " ".join(f"t{k}" for k in range(9))
+    ys = " ".join(f"./d{k}" for k in range(9))
+    command = f"for X in {xs}; do for Y in {ys}; do $X $Y; done; done"
+    assert uninspectable_reasons(command)
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        result = check_all_command_guards(command, "local")
+    assert result["approved"] is False
+    assert "could not be fully inspected" in result["description"]
+
+
+def test_small_cross_product_resolves_every_combination():
+    variants = resolve_shell_assignment_variants("for X in a b; do for Y in 1 2; do $X$Y; done; done")
+    assert {v.rsplit("do ", 1)[1].split(";")[0] for v in variants} == {"a1", "a2", "b1", "b2"}
+
+
+# P2: the payload-depth bound fails closed.
+def _nested_bash(depth, inner="$X"):
+    import shlex
+    for _ in range(depth):
+        inner = "bash -c " + shlex.quote(inner)
+    return inner
+
+
+def test_payload_nesting_past_the_depth_bound_is_refused(single_query):
+    command = _nested_bash(4)
+    assert uninspectable_reasons(command)
+    for tirith in (_ALLOW_TIRITH, _INCOMPLETE):
+        with single_query("approve"), patch("tools.approval._tirith_scan", return_value=tirith):
+            result = check_all_command_guards(command, "local")
+        assert result["approved"] is False
+        assert "could not be fully inspected" in result["description"]
+
+
+def test_payload_nesting_past_the_depth_bound_refused_even_if_benign(single_query):
+    command = _nested_bash(5, "echo hi")
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        assert check_all_command_guards(command, "local")["approved"] is False
+
+
+@pytest.mark.parametrize("depth", [1, 2, 3])
+def test_payload_nesting_within_the_bound_is_inspected(single_query, depth):
+    assert uninspectable_reasons(_nested_bash(depth, "echo hi")) == []
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        assert check_all_command_guards(_nested_bash(depth, "echo hi"), "local")["approved"] is True
+        assert check_all_command_guards(_nested_bash(depth), "local")["approved"] is False
+
+
+# eval / source run text the command does not show: an eval'd unresolved leader is refused.
+@pytest.mark.parametrize("command", ['eval "$Y"', "X=$(cat f); eval \"$X\"", "eval '$X'"])
+def test_eval_of_unfixed_text_refused_in_approve_mode(single_query, command):
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        assert check_all_command_guards(command, "local")["approved"] is False
+
+
+def test_eval_of_same_command_value_is_hardline():
+    assert detect_hardline_command('X="rm -rf /home"; eval "$X"') == (True, "recursive delete of system directory")
+
+
+@pytest.mark.parametrize("command", [
+    "X=echo; $X hello",
+    "X=/usr/bin/echo; $X hi",
+    "X=echo; command -v $X",
+    "eval 'echo hi'",
+    "X=echo; builtin cd /tmp; $X hi",
+    "X=$HOME/bin/tool; $X --version",        # like writing $HOME/bin/tool directly
+])
+def test_round3_benign_controls_still_approve(single_query, command):
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        assert check_all_command_guards(command, "local")["approved"] is True
+
+
+# A program NAME that embeds an unfixed expansion is as unreadable as a bare `$X`.
+@pytest.mark.parametrize("command", [
+    "/bin/$X -rf ~/.local", "./$X", "${X%/*} -rf ~", "bin/py$V -m x", "sudo /bin/$X /home",
+    "X=$(cat f); /bin/$X",
+])
+def test_partial_variable_program_name_refused_in_approve_mode(single_query, command):
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        result = check_all_command_guards(command, "local")
+    assert result["approved"] is False
+    assert "never fixes" in result["description"]
+
+
+@pytest.mark.parametrize("command", [
+    "$HOME/bin/tool --version",               # literal program name under an expanded directory
+    '"$VIRTUAL_ENV/bin/python" -m pytest',
+    "X=ls; /bin/$X -la",                      # resolved in the same command
+    '"$(dirname "$0")/run.sh"',
+])
+def test_literal_or_resolved_program_name_still_approves(single_query, command):
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        assert check_all_command_guards(command, "local")["approved"] is True

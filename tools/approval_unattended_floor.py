@@ -12,8 +12,12 @@ commands, and this module refuses them:
   the environment at run time. No detector can say what it runs, so it is refused whatever its
   arguments are. "Fixes" means an assignment that always runs in the same shell before the use
   (``PY=python3; $PY -c ...``) or a literal ``for p in a b`` loop. A prefix-only ``X=v cmd``, a
-  conditional/subshell/pipeline assignment, ``read X`` and ``eval`` do not fix it. Shell payloads
-  (``bash -c '...'``, a heredoc fed to a shell) are checked the same way. A command substitution in command position (``$(which rm) -rf x``) is
+  conditional/subshell/pipeline assignment, ``X=$(cat f)`` (command output), ``read X`` (also as
+  ``builtin read``/``command read``) and ``eval`` do not fix it. Shell payloads (``bash -c '...'``,
+  a heredoc fed to a shell, an ``eval``'s arguments) are checked the same way.
+* The inspection was incomplete. Any bound the resolver hits (too many value combinations, loop
+  words, or shell payloads nested past the depth limit) is refused rather than treated as clean.
+* A command substitution in command position (``$(which rm) -rf x``) is
   refused when its arguments look destructive: a short recursive flag group, ``--recursive``, a
   raw-device ``of=/dev/...``, or an operand that would be hardline under ``rm``.
 * Two independent scanners say "destroys data". Tirith returns ``block`` AND the dangerous-pattern
@@ -28,7 +32,7 @@ interactive user can still approve the same command. Only the unattended auto-ap
 
 import re
 
-from tools.approval_detection_assignments import opaque_command_leaders
+from tools.approval_detection_assignments import opaque_command_leaders, uninspectable_reasons
 
 # Dangerous-pattern descriptions that destroy data (not merely "risky"): the classes where an
 # unattended auto-approve has no recovery path short of a backup restore.
@@ -44,6 +48,9 @@ _TIRITH_BLAST_RULE_PREFIX = "blast_"
 # A bare variable reference, optionally double-quoted: `$X`, `${X}`, `"${c[@]}"`.
 _VARIABLE_LEADER_RE = re.compile(r'"?\$(?:\{[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]}]*\])?(?::?[-=?+][^}]*)?\}'
                                  r'|[A-Za-z_][A-Za-z0-9_]*)"?')
+# A variable reference anywhere in a word (`/bin/$X`), and a command substitution (`$(...)`, backtick).
+_VARIABLE_REFERENCE_RE = re.compile(r"\$(?:\{|[A-Za-z_])")
+_SUBSTITUTION_RE = re.compile(r"\$\(|`")
 # Destructive-looking argv for an unknown program: a short-option group holding r/R (`-rf`, `-R`,
 # `-fr`), --recursive, or a dd-style raw-device output. `--version` / `-c` / `-m` do not match.
 _DESTRUCTIVE_ARGS_RE = re.compile(r'(?:^|\s)(?:-[A-Za-z]*[rR][A-Za-z]*|--recursive)(?=\s|$)|\bof=/dev/')
@@ -51,11 +58,16 @@ _DESTRUCTIVE_ARGS_RE = re.compile(r'(?:^|\s)(?:-[A-Za-z]*[rR][A-Za-z]*|--recursi
 
 def _opaque_leader_refusal(command: str) -> str | None:
     from tools.approval_detection import _shell_command_segment, detect_hardline_command
+    incomplete = uninspectable_reasons(command)
+    if incomplete:
+        return (f"the command could not be fully inspected ({incomplete[0]}), so what it runs "
+                "cannot be verified")
     for resolved, _, end, word in opaque_command_leaders(command):
-        if _VARIABLE_LEADER_RE.fullmatch(word):
+        if _VARIABLE_LEADER_RE.fullmatch(word) or (_VARIABLE_REFERENCE_RE.search(word)
+                                                   and not _SUBSTITUTION_RE.search(word)):
             return (f"command word {word} is a shell variable whose value this command never fixes "
-                    "(unassigned, or assigned only conditionally, temporarily, in a subshell or by "
-                    "read/eval), so the program it runs cannot be inspected")
+                    "(unassigned, or assigned only conditionally, temporarily, in a subshell, from "
+                    "command output or by read/eval), so the program it runs cannot be inspected")
         arguments = _shell_command_segment(resolved, end)
         if arguments and (_DESTRUCTIVE_ARGS_RE.search(arguments) or detect_hardline_command(f"rm {arguments}")[0]):
             return (f"command word {word} is an unresolved command substitution and its arguments "
