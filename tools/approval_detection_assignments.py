@@ -536,7 +536,7 @@ class _Resolution:
         its possible values (read from the current reach answers): a name set, None (every name)
         or "late"."""
         from tools.approval_detection import _deobfuscate_shell_word_for_detection
-        from tools.approval_detection_clobbers import ALL, LATE, command_clobbers, is_dynamic
+        from tools.approval_detection_clobbers import ALL, LATE, command_clobbers
         dynamic = self.bindings[k].dynamic or ("",)
         start = self.bindings[k].start
         forms, complete = _expand_all(dynamic[0], lambda name, _offset: self.values_at(name, start),
@@ -545,8 +545,8 @@ class _Resolution:
             return ALL
         names: set[str] = set()
         for form in forms:
-            if is_dynamic(form):
-                return ALL      # still an expansion: the program is not in the text
+            # Only the resolved COMMAND word decides whether the program is known; `$` in its
+            # arguments (`R="python3 $S/x.py"`) is judged by the builtin's own handler.
             hit = command_clobbers(_deobfuscate_shell_word_for_detection(form).split() + list(dynamic[1:]),
                                    include_assignments=True)
             if hit == LATE or hit is ALL or isinstance(hit, tuple):

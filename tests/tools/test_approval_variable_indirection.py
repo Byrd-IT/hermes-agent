@@ -800,3 +800,21 @@ def test_reader_reached_through_a_loop_variable_is_still_seen():
     # `$R R` overwrites R itself, so on the second iteration the command word is unknown.
     command = "R=read; for i in 1 2; do $R R; done; $R X"
     assert [w for *_, w in opaque_command_leaders(command)][:1] == ["$R"]
+
+
+@pytest.mark.parametrize("command", [
+    'S=/opt/s; R="python3 $S/resolve.py"; $R a; $R b',     # expansion in the ARGUMENTS only
+    'home=/tmp/h; base=(env HOME="$home" python3 -m tool); "${base[@]}" one; "${base[@]}" two',
+])
+def test_dynamic_word_with_expanded_arguments_is_not_a_clobber(single_query, command):
+    # Replay false positive: a `$` in a resolved command word's arguments made it "unreadable",
+    # so it was taken to overwrite every name and the NEXT use of the same word was refused.
+    assert opaque_command_leaders(command) == []
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        assert check_all_command_guards(command, "local")["approved"] is True
+
+
+def test_dynamic_word_whose_program_is_itself_unknown_still_clobbers(single_query):
+    command = 'X=echo; R="$B read"; $R X; $X'
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        assert check_all_command_guards(command, "local")["approved"] is False
