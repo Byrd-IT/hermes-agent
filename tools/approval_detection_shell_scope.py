@@ -46,6 +46,12 @@ class HeredocBody:
     start: int
     end: int
     executed: bool   # the consumer is a shell, so the body is commands, not data
+    # The consumer's command word is an expansion (`$S <<EOF`): which program reads the body is not
+    # in the text, so it counts as executed here. The resolver may prove it a non-shell
+    # (``approval_detection_assignments._executed_heredocs``).
+    owner: str = ""
+    owner_start: int = -1
+    owner_dynamic: bool = False
 
 
 class ShellScope:
@@ -312,16 +318,19 @@ def _heredoc_bodies(command: str) -> list[HeredocBody]:
                  if kind == "char" and quote is None and blanked.startswith("<<", i)
                  and not blanked.startswith("<<<", i) and (i == 0 or blanked[i - 1] != "<")]
     words = sorted(_iter_shell_command_word_spans(blanked))
+    from tools.approval_detection_clobbers import is_dynamic
     consumers = []
     for op in operators:
-        owner = None
+        owner, owner_start = None, -1
         for start, _, word in words:
             if start < op and start + len(_shell_command_segment(blanked, start)) >= op:
-                owner = word
+                owner, owner_start = word, start
+        dynamic = bool(owner) and is_dynamic(owner)
         name = os.path.basename(_deobfuscate_shell_word_for_detection(owner)).lower() if owner else ""
         newline = blanked.find("\n", op)
         rest = blanked[op:len(blanked) if newline < 0 else newline]
-        consumers.append(name in _HEREDOC_SHELL_CONSUMERS or bool(_PIPE_TO_SHELL_RE.search(rest)))
+        executed = dynamic or name in _HEREDOC_SHELL_CONSUMERS or bool(_PIPE_TO_SHELL_RE.search(rest))
+        consumers.append((executed, owner or "", owner_start, dynamic))
     if len(consumers) != len(spans):
-        consumers = [True] * len(spans)
-    return [HeredocBody(lo, hi, executed) for (lo, hi), executed in zip(spans, consumers)]
+        consumers = [(True, "", -1, False)] * len(spans)
+    return [HeredocBody(lo, hi, *consumer) for (lo, hi), consumer in zip(spans, consumers)]

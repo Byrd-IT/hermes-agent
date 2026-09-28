@@ -43,6 +43,7 @@ command cannot be read.
 import functools
 import itertools
 import math
+import os
 import re
 from dataclasses import dataclass
 
@@ -667,11 +668,21 @@ def resolve_shell_assignments(command: str) -> str | None:
 
 # ---- what the command's text does not fix ------------------------------------------------------
 
-def _leader_is_opaque(value: str) -> bool:
+# Pathname-expansion syntax: `*`, `?`, a `[...]` bracket, or an extglob group (`@(..)`, `!(..)`, `+(..)`).
+_GLOB_RE = re.compile(r"[*?]|\[[^\]]*\]|[@!+]\(")
+
+
+def _leader_is_opaque(value: str, *, globbed: bool = False) -> bool:
     """Does *value*, spliced into command position, leave the program unreadable (its first word
-    is still a whole-word expansion or substitution, like an opaque command word written directly)?"""
+    is still a whole-word expansion or substitution, like an opaque command word written directly)?
+
+    *globbed*: the reference was unquoted, so its expansion is also filename-expanded. A first word
+    with glob syntax (``X="r?"; $X -rf /home``) is then whatever file in the working directory
+    matches, not the program its text spells; bash runs ``rm`` if that is the only match."""
     from tools.approval_detection import _read_shell_word
     if value == UNKNOWN or not value.strip():
+        return True
+    if globbed and _GLOB_RE.search(value.split(None, 1)[0]):
         return True
     start, end, first = _read_shell_word(value, 0)
     return start == end or bool(_OPAQUE_LEADER_RE.fullmatch(first)) or _basename_is_expansion(first)
@@ -694,14 +705,50 @@ def _basename_is_expansion(word: str) -> bool:
 
 def _partial_leader_is_opaque(word: str, start: int, resolution) -> bool:
     """A command word that EMBEDS an expansion (``/bin/$X``): opaque if, with the same-command
-    values substituted, some possible form still has an expansion in its program name."""
+    values substituted, some possible form still has an expansion in its program name, or (the
+    word being unquoted there) a glob in it (``$D/bin/r?`` runs whatever file matches)."""
+    globbed = not word.startswith('"')
+    if (globbed and "$" in word
+            and _GLOB_RE.search(re.sub(r"'[^']*'", "q", word).rsplit("/", 1)[-1])):
+        return True
     if not _basename_is_expansion(word):
         return False
     if resolution is None:
         return True
     pieces = _reference_pieces(word, lambda name, _offset: resolution.values_at(name, start))
     picks, complete = pieces.product(pieces.choices, _MAX_VALUES_PER_NAME)
-    return not complete or any(_basename_is_expansion(pieces.render(pick)) for pick in picks)
+    return not complete or any(
+        _basename_is_expansion(form) or (globbed and _GLOB_RE.search(form.rsplit("/", 1)[-1]))
+        for form in (pieces.render(pick) for pick in picks))
+
+
+def _heredoc_owner_is_data(heredoc, resolution) -> bool:
+    """A heredoc whose consumer is an expansion (``$S <<EOF``) is data only when every value the
+    same-command bindings give that word names a program that is not a shell (``PY=python3; $PY -
+    <<EOF``). An unknown value, a shell (``S=bash``), or a wrapper that runs another word
+    (``S="sudo bash"``) keeps it executed."""
+    from tools.approval_detection import _COMMAND_WRAPPER_WORDS, _deobfuscate_shell_word_for_detection
+    from tools.approval_detection_clobbers import is_dynamic
+    from tools.approval_detection_shell_scope import _HEREDOC_SHELL_CONSUMERS
+    if resolution is None:
+        return False
+    pieces = _reference_pieces(heredoc.owner, lambda name, _offset: resolution.values_at(name, heredoc.owner_start))
+    picks, complete = pieces.product(pieces.choices, _MAX_VALUES_PER_NAME)
+    if not complete:
+        return False
+    for pick in picks:
+        form = pieces.render(pick)
+        words = _deobfuscate_shell_word_for_detection(form).split()
+        if (is_dynamic(form) or not words or _GLOB_RE.search(words[0])
+                or any(os.path.basename(word).lower() in _HEREDOC_SHELL_CONSUMERS | _COMMAND_WRAPPER_WORDS
+                       for word in words)):
+            return False
+    return True
+
+
+def _executed_heredocs(heredocs, resolution) -> list:
+    return [h for h in heredocs
+            if h.executed and not (h.owner_dynamic and _heredoc_owner_is_data(h, resolution))]
 
 
 def eval_payloads(command: str) -> tuple[list[str], bool]:
@@ -717,7 +764,9 @@ def eval_payloads(command: str) -> tuple[list[str], bool]:
     resolution = _resolution(command) if _has_candidate(command) else None
     # A heredoc body fed to a non-shell (`cat > f <<EOF`) is data; blanking keeps offsets intact.
     from tools.approval_detection_shell_scope import _blank_spans, _heredoc_bodies
-    text = _blank_spans(command, [(h.start, h.end) for h in _heredoc_bodies(command) if not h.executed])
+    heredocs = _heredoc_bodies(command)
+    executed = set(_executed_heredocs(heredocs, resolution))
+    text = _blank_spans(command, [(h.start, h.end) for h in heredocs if h not in executed])
     payloads: list[str] = []
     all_complete = True
     for _, end, word in _iter_shell_command_word_spans(text):
@@ -760,13 +809,14 @@ def _inspect(command: str, depth: int, found: list, reasons: list[str]) -> None:
         if reference and reference.end() == len(bare):
             values = (_reference_values(reference, resolution.values_at(_reference_name(reference), start))
                       if resolution else (UNKNOWN,))
-            if not any(_leader_is_opaque(value) for value in values):
+            globbed = not word.startswith('"')
+            if not any(_leader_is_opaque(value, globbed=globbed) for value in values):
                 continue
         found.append((command, start, end, word))
     if not _resolve(command)[1]:
         reasons.append("its variables have more possible values than the resolver examines, so not "
                        "every command it can run was checked")
-    payloads = [command[h.start:h.end] for h in heredocs if h.executed]
+    payloads = [command[h.start:h.end] for h in _executed_heredocs(heredocs, resolution)]
     payloads += [payload for _, payload in _execution_flag_findings(command) if payload]
     evaluated, complete = eval_payloads(command)
     if not complete:

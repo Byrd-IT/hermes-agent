@@ -911,3 +911,80 @@ def test_every_bash_builtin_is_classified():
     from tools.approval_detection_clobbers import _BASH_BUILTINS, _HANDLERS, _NON_WRITING_BUILTINS
     assert set(_HANDLERS) <= _BASH_BUILTINS
     assert not (_NON_WRITING_BUILTINS & set(_HANDLERS))
+
+
+
+# ---- review round 6 regressions: compound aliases, resolved heredoc consumers, glob leaders ----
+# All guard-only (check_all_command_guards / classifiers); nothing reaches an executor.
+
+ROUND6_REFUSE_COMMANDS = [
+    # alias replacement text is shell syntax, not one word list
+    "shopt -s expand_aliases\nalias r=':; read X'\nX=echo\nr\n$X",
+    "shopt -s expand_aliases\nalias r=':|read X'\nX=echo\nr\n$X",
+    "shopt -s expand_aliases\nalias r='true && read X'\nX=echo\nr\n$X",
+    "shopt -s expand_aliases\nalias r='X=rm'\nX=echo\nr\n$X -rf /tmp/a",
+    "shopt -s expand_aliases\nalias r='{ read X; }'\nX=echo\nr\n$X",
+    # a heredoc consumer spelled as a variable is judged by what the variable holds
+    "S=bash; $S <<'EOF'\n$X\nEOF",
+    "S=/bin/bash; \"$S\" <<'EOF'\n$X\nEOF",
+    "S=\"sudo bash\"; $S <<'EOF'\n$X\nEOF",
+    "S=\"env sh\"; $S <<'EOF'\n$X\nEOF",
+    "$S <<'EOF'\n$X\nEOF",
+    "S=$(which bash); $S <<'EOF'\n$X\nEOF",
+    # an unquoted glob-bearing value in command position runs whatever file matches
+    'X="r?"; $X -rf /home',
+    "X='r*'; $X -rf /home",
+    'X="[r]m"; $X -rf /home',
+    'X="/bin/r?"; $X -rf /home',
+    'X="+(rm)"; shopt -s extglob; $X -rf /home',
+    "D=/usr; $D/bin/r? -rf /home",
+]
+
+
+@pytest.mark.parametrize("scan", [_ALLOW_TIRITH, _INCOMPLETE], ids=["tirith-allow", "tirith-block"])
+@pytest.mark.parametrize("command", ROUND6_REFUSE_COMMANDS)
+def test_alias_heredoc_consumer_and_glob_leaders_refused(single_query, command, scan):
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=scan):
+        assert check_all_command_guards(command, "local")["approved"] is False
+
+
+@pytest.mark.parametrize("command, executed", [
+    ("S=bash; $S <<'EOF'\n$X\nEOF", True),
+    ("S=zsh; $S -s <<'EOF'\n$X\nEOF", True),
+    ("$UNSET <<'EOF'\n$X\nEOF", True),
+    ("PY=python3; $PY - <<'EOF'\n$X\nEOF", False),
+    ("C=cat; $C > f <<'EOF'\n$X\nEOF", False),
+])
+def test_variable_heredoc_consumer_payload_inspected_unless_proven_data(command, executed):
+    # The payload's `$X` leader shows up as opaque only when its body is treated as shell code.
+    payload_leaders = [f for f in opaque_command_leaders(command) if f[0] != command]
+    assert bool(payload_leaders) is executed
+
+
+@pytest.mark.parametrize("command", [
+    "X=echo; $X hello",
+    "alias ll='ls -l'; X=echo; $X hi",
+    "alias ll='ls -l; pwd'; X=echo; $X hi",
+    "PY=python3; $PY - <<'EOF'\nimport os; x=$X\nEOF",
+    "C=cat; $C > f <<'EOF'\n$X\nEOF",
+    'X="r?"; "$X" -rf ./build',          # quoted: no filename expansion, the literal program "r?"
+    'X="ls -l *.py"; $X',                # the glob is an argument, not the program
+    "X=ls; $X *.py",
+    "ls /usr/bin/py*",
+])
+def test_round6_benign_controls_still_approve(single_query, command):
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        assert check_all_command_guards(command, "local")["approved"] is True
+
+
+@pytest.mark.parametrize("words, expected", [
+    (["alias", "r=:; read X"], "late"),
+    (["alias", "r=X=v"], "late"),
+    (["alias", "r=( read X )"], "late"),
+    (["alias", "ll=ls -l; pwd"], set()),
+    (["alias", "g=git status | cat"], set()),
+])
+def test_command_clobbers_compound_alias_values(words, expected):
+    from tools.approval_detection_clobbers import command_clobbers
+    result = command_clobbers(words)
+    assert result == (frozenset(expected) if isinstance(expected, set) else expected)

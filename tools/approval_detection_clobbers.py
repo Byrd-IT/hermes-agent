@@ -206,16 +206,35 @@ _BASH_BUILTINS = _NON_WRITING_BUILTINS | frozenset({
 
 def _alias(args):
     """``alias echo=read`` makes every later ``echo X`` a reader: any name, at any later point. An
-    alias whose own text writes no name (``alias ll='ls -l'``) cannot."""
+    alias whose own text writes no name (``alias ll='ls -l'``) cannot.
+
+    The replacement text is shell syntax, not one word list: ``alias r=':; read X'`` runs ``read X``
+    after ``:``. Every simple command in it is classified; an assignment (``alias r='X=v'``) or any
+    compound syntax this does not walk (``( )``, ``{ }``, a substitution) counts as a writer."""
     for raw in args:
         if is_dynamic(raw):
             return LATE
         word = _plain(raw)
-        if "=" in word:
-            value = word.split("=", 1)[1]
-            if is_dynamic(value) or command_clobbers(value.split()) != frozenset():
-                return LATE
+        if "=" in word and _alias_value_writes(word.split("=", 1)[1]):
+            return LATE
     return frozenset()
+
+
+_ALIAS_COMPOUND_RE = re.compile(r"[(){}`]")
+
+
+def _alias_value_writes(value: str) -> bool:
+    from tools.approval_detection import _iter_shell_command_starts
+    from tools.approval_detection_assignments import _simple_command_words
+    if is_dynamic(value) or _ALIAS_COMPOUND_RE.search(value):
+        return True
+    for pos in _iter_shell_command_starts(value):
+        words = _simple_command_words(value, pos)
+        if words and _ASSIGNMENT_PREFIX_RE.match(words[0]):
+            return True
+        if command_clobbers(words) != frozenset():
+            return True
+    return False
 
 
 _HANDLERS = {
