@@ -1,5 +1,8 @@
 """Session-persistent Python kernels for execute_code: one child per (owner, mode,
-interpreter, cwd, tool-set), one code cell per call, state survives across calls.
+interpreter, tool-set), one code cell per call, state survives across calls. The cwd is
+NOT part of the key: it follows the terminal's `cd` state per cell (the request carries a
+``cwd`` the runner chdirs to), so a `cd` between calls moves the kernel instead of
+silently replacing it with a fresh, empty one.
 
 Constraints, in order: (1) SAME security envelope as per-call (``_build_child_env``
 scrubbing, ``_rpc_server_loop`` token + per-cell tool budget, ANSI strip + secret
@@ -55,8 +58,11 @@ def _clip(text):
 def run_cell(request, execution_count):
     """Exec one cell; returns (response payload, FULL stdout text)."""
     out, err = io.StringIO(), io.StringIO()
-    status, trace = "ok", ""
+    status, trace, cwd_applied = "ok", "", False
     try:
+        if request.get("cwd"):
+            os.chdir(request["cwd"])
+            cwd_applied = True
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             exec(compile(request["code"], "<cell>", "exec"), GLOBALS)
     except SystemExit as exc:
@@ -69,7 +75,7 @@ def run_cell(request, execution_count):
         "id": request.get("id", ""), "status": status,
         "stdout": stdout_text, "stderr": stderr_text,
         "stdout_clipped": stdout_clipped, "stderr_clipped": stderr_clipped,
-        "traceback": trace, "execution_count": execution_count,
+        "traceback": trace, "execution_count": execution_count, "cwd_applied": cwd_applied,
     }, out.getvalue()
 '''
 
@@ -325,6 +331,8 @@ class SessionKernel:
         self.raw, self.stderr = _BoundedBuffer(), _BoundedBuffer()
         self.execution_count, self.last_used = 0, time.monotonic()
         self.cell_authority: Optional[CellAuthority] = None
+        # Resolved cwd the kernel process last ran a cell in ("" = its spawn default).
+        self.cwd = ""
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -643,6 +651,7 @@ def _spawn(kernel: SessionKernel, *, child_python: str, child_cwd: str,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
             close_fds=True, pass_fds=pass_fds, startupinfo=startupinfo,
         )
+        kernel.cwd = child_cwd
     finally:
         if parent_handle and close_handle is not None:
             close_handle(parent_handle)
@@ -846,9 +855,12 @@ def execute_in_session_kernel(
     code: str, *, task_id: str, mode: str, child_python: str, child_cwd: str,
     sandbox_tools: frozenset, timeout: int, max_tool_calls: int, reset: bool, is_interrupted,
 ) -> str:
-    """Run one cell in the (owner, mode, python, cwd, tools) session kernel. The owner is the
-    session key (``_resolve_owner``), not the per-turn task id, so state survives across turns."""
-    key = (_resolve_owner(task_id) or "", mode, child_python, child_cwd, tuple(sorted(sandbox_tools)))
+    """Run one cell in the (owner, mode, python, tools) session kernel. The owner is the
+    session key (``_resolve_owner``), not the per-turn task id, so state survives across turns.
+    ``child_cwd`` is deliberately not in the key: project mode resolves it from the terminal's
+    live `cd` state, so keying on it gave every `cd` (including one made by a cell's own
+    terminal() call) a fresh kernel with no state. The cell chdirs instead (``_cell_request``)."""
+    key = (_resolve_owner(task_id) or "", mode, child_python, tuple(sorted(sandbox_tools)))
     exec_start = time.monotonic()
     from agent.delegation_context import is_delegated_child_context
     kernel, state_reset = _acquire_kernel(key, reset, pinned=is_delegated_child_context())
@@ -865,6 +877,17 @@ def execute_in_session_kernel(
             orphaned = kernel.attached == 0 and _KERNELS.get(key) is not kernel
         if orphaned:
             kernel.teardown()
+
+
+def _cell_request(kernel: SessionKernel, code: str, child_cwd: str) -> Dict[str, str]:
+    """One cell's wire request. Carries ``cwd`` only when the resolved cwd moved since the kernel
+    last ran a cell there, so a cell's own ``os.chdir`` persists until the terminal cwd changes
+    (the same rule a fresh kernel spawned in the new cwd would follow). A chdir that failed (the
+    dir vanished after resolution) fails that cell only and is re-sent next time."""
+    request = {"id": uuid.uuid4().hex, "code": code}
+    if child_cwd and child_cwd != kernel.cwd:
+        request["cwd"] = child_cwd
+    return request
 
 
 def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, child_python: str,
@@ -884,9 +907,12 @@ def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, chi
             kernel.tool_call_counter[0] = 0
             kernel.raw.drain(), kernel.stderr.drain()  # raw output leaked between cells belongs to no cell
             kernel.cell_authority = authority
-            kernel.proc.stdin.write((json.dumps({"id": uuid.uuid4().hex, "code": code}) + "\n").encode("utf-8"))
+            request = _cell_request(kernel, code, child_cwd)
+            kernel.proc.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
             kernel.proc.stdin.flush()
             status, payload = _await_cell(kernel, timeout, is_interrupted)
+            if payload.get("cwd_applied"):
+                kernel.cwd = child_cwd
             result = _cell_result(
                 kernel, key, status, payload,
                 timeout=timeout, sandbox_tools=sandbox_tools, reused=reused,

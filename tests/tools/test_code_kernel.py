@@ -2,7 +2,7 @@
 """Tests for execute_code's session kernel.
 
 Session kernels are always on (the ``code_execution.kernel_mode`` key is
-retired): each (task, mode, interpreter, cwd, tool-set) owner keeps one
+retired): each (task, mode, interpreter, tool-set) owner keeps one
 Python child alive so state survives across calls. These tests pin the
 contract:
 
@@ -426,6 +426,75 @@ class TestKernelOwnershipAndLifecycle(unittest.TestCase):
         for proc in runners:
             proc.wait(timeout=10)
             self.assertIsNotNone(proc.returncode)
+
+
+class TestKernelFollowsTerminalCwd(unittest.TestCase):
+    """Project mode resolves the child cwd from the terminal's live `cd` record. With the cwd
+    in the kernel key, every `cd` between calls (even one made by a cell's own terminal() RPC)
+    silently swapped in a fresh kernel: ``reused: false``, ``state_reset: false``, NameError on
+    the previous cell's variables. The kernel must keep its state and move with the cwd."""
+
+    def setUp(self):
+        from tools import terminal_tool
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir_a = os.path.realpath(os.path.join(self._tmp.name, "a"))
+        self.dir_b = os.path.realpath(os.path.join(self._tmp.name, "b"))
+        os.mkdir(self.dir_a)
+        os.mkdir(self.dir_b)
+        self._patches = [patch.object(terminal_tool, "_session_cwd", {}),
+                         patch.object(terminal_tool, "_task_env_overrides", {})]
+        for p in self._patches:
+            p.start()
+        self.record = terminal_tool.record_session_cwd
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        self._tmp.cleanup()
+
+    def test_state_survives_a_terminal_cd_between_cells(self):
+        with _kernel_config(mode="project"):
+            self.record("kernel-test", self.dir_a)
+            first = _run("import os\nx = 41\nprint(os.getcwd())")
+            self.record("kernel-test", self.dir_b)
+            second = _run("import os\nprint(x + 1)\nprint(os.getcwd())")
+        self.assertEqual(first["status"], "success", first)
+        self.assertIn(self.dir_a, first["output"])
+        self.assertEqual(second["status"], "success", second)
+        self.assertIn("42", second["output"])
+        self.assertIn(self.dir_b, second["output"])
+        self.assertEqual(second["kernel"]["reused"], True)
+        self.assertEqual(second["kernel"]["execution_count"], 2)
+        self.assertEqual(len(_KERNELS), 1)
+
+    def test_a_cells_own_chdir_persists_until_the_terminal_cwd_moves(self):
+        with _kernel_config(mode="project"):
+            self.record("kernel-test", self.dir_a)
+            _run(f"import os\nos.chdir({self.dir_b!r})")
+            kept = _run("import os\nprint(os.getcwd())")
+            self.record("kernel-test", self._tmp.name)
+            moved = _run("import os\nprint(os.getcwd())")
+        self.assertIn(self.dir_b, kept["output"], kept)
+        self.assertIn(os.path.realpath(self._tmp.name), moved["output"], moved)
+        self.assertEqual(moved["kernel"]["reused"], True)
+
+    def test_a_vanished_cwd_is_reported_and_retried_without_losing_state(self):
+        gone = os.path.join(self._tmp.name, "gone")
+        os.mkdir(gone)
+        with _kernel_config(mode="project"):
+            self.record("kernel-test", self.dir_a)
+            _run("x = 41")
+            kernel = next(iter(_KERNELS.values()))
+            # The resolver checked isdir, then the dir vanished before the cell ran.
+            with patch("tools.code_execution_tool._resolve_child_cwd", return_value=gone):
+                os.rmdir(gone)
+                failed = _run("print(x)")
+            self.assertEqual(failed["status"], "error", failed)
+            self.assertIn("FileNotFoundError", failed["error"])
+            self.assertEqual(kernel.cwd, self.dir_a)
+            after = _run("import os\nprint(x + 1)\nprint(os.getcwd())")
+        self.assertIn("42", after["output"], after)
+        self.assertIn(self.dir_a, after["output"])
 
 
 class TestPerCellRpcAuthority(unittest.TestCase):
