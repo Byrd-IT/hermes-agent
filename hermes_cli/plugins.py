@@ -1960,7 +1960,13 @@ def fire_pre_command_hook(
         logger.debug("pre_command hook dispatch failed (non-fatal): %s", exc)
 
 
-_thread_tool_whitelist = threading.local()
+# A ContextVar, not threading.local: tool calls dispatch on pool workers started via
+# tools.thread_context.propagate_context_to_thread, which carries contextvars only. A thread-local
+# whitelist read None there, so a background-review fork could run any pooled tool (#15204).
+# A bare threading.Thread still starts with an empty context, so the whitelist does not leak into
+# unrelated threads.
+_thread_tool_whitelist: contextvars.ContextVar[Optional[Tuple[Set[str], str]]] = contextvars.ContextVar(
+    "hermes_thread_tool_whitelist", default=None)
 
 
 @dataclass(frozen=True)
@@ -1975,12 +1981,12 @@ def set_thread_tool_whitelist(
     allowed: Optional[Set[str]],
     deny_msg_fmt: str = "Tool '{tool_name}' denied: not in this thread's tool whitelist",
 ) -> None:
-    _thread_tool_whitelist.allowed = allowed
-    _thread_tool_whitelist.fmt = deny_msg_fmt
+    """Restrict tool calls in the current context, and in every tool worker it spawns, to ``allowed``."""
+    _thread_tool_whitelist.set(None if allowed is None else (allowed, deny_msg_fmt))
 
 
 def clear_thread_tool_whitelist() -> None:
-    _thread_tool_whitelist.allowed = None
+    _thread_tool_whitelist.set(None)
 
 
 def _get_pre_tool_call_directive_details(
@@ -1994,9 +2000,9 @@ def _get_pre_tool_call_directive_details(
     ``block`` > ``approve`` > none, not registration order: any plugin's valid veto wins over an
     earlier plugin's request for human confirmation (#87420); among approves the first valid one
     wins. Irrelevant returns are ignored."""
-    allowed = getattr(_thread_tool_whitelist, "allowed", None)
-    if allowed is not None and tool_name not in allowed:
-        fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
+    whitelist = _thread_tool_whitelist.get()
+    if whitelist is not None and tool_name not in whitelist[0]:
+        fmt = whitelist[1]
         return _PreToolCallDirective(action="block", message=fmt.format(tool_name=tool_name))
     from hermes_cli.lifecycle import invoke_hook as invoke_lifecycle_hook
     hook_results = invoke_lifecycle_hook(
