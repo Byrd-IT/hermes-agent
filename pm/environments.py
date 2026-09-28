@@ -343,8 +343,35 @@ def activate_dependencies(project_root: Path) -> None:
     os.environ["PYTHONPATH"] = os.pathsep.join([str(project_root.resolve()), str(selected)])
     os.environ.pop("VIRTUAL_ENV", None)
     executable_dir = venv_bin_dir(environment)
-    if executable_dir.is_dir():
-        os.environ["PATH"] = os.pathsep.join([str(executable_dir), os.environ.get("PATH", "")])
+    front = [executable_dir] if executable_dir.is_dir() else []
+    launcher_dir = published_launcher_dir(project_root)
+    if launcher_dir is not None:
+        front.insert(0, launcher_dir)
+    if front:
+        os.environ["PATH"] = _prepend_path_entries(os.environ.get("PATH", ""), front)
+
+
+def published_launcher_dir(project_root: Path) -> Path | None:
+    """``<root>/.hermes/bin`` when it holds this install's published ``hermes`` launcher.
+
+    The committed venv's ``bin/hermes`` is uv's console script; its editable finder maps
+    every package to the generation's build snapshot (``<generation>/workspace``), which
+    is refreshed only when a new generation is built. After a plain source update the
+    snapshot is stale, so a child shell that resolves bare ``hermes`` through the venv
+    bin runs pre-update code (and reports false PM drift from the snapshot's old lock).
+    The published launcher imports the checkout itself, so it must win on PATH.
+    """
+    name = "hermes.exe" if os.name == "nt" else "hermes"
+    launcher_dir = Path(project_root).resolve() / ".hermes" / "bin"
+    return launcher_dir if (launcher_dir / name).is_file() else None
+
+
+def _prepend_path_entries(existing: str, entries: list[Path]) -> str:
+    """Put *entries* first on a PATH string, dropping their earlier occurrences so
+    nested activations (gateway -> worker -> CLI) never demote them or grow PATH."""
+    front = [str(entry) for entry in entries]
+    rest = [item for item in existing.split(os.pathsep) if item not in front] if existing else []
+    return os.pathsep.join([*front, *rest])
 
 
 def activation_environment(project_root: Path) -> dict[str, str]:
