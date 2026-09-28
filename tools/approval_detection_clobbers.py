@@ -12,7 +12,13 @@ command is spelled:
 * implicit targets count: a bare ``read`` sets REPLY, a bare ``mapfile`` sets MAPFILE, and
   ``getopts`` also sets OPTARG/OPTIND;
 * attached option targets count: ``printf -vX``, ``read -raX``, ``wait -pX``;
-* a target the text cannot name (``read "$N"``, ``declare "$N=v"``) means every name.
+* a target the text cannot name (``read "$N"``, ``declare "$N=v"``) means every name;
+* redirections are removed wherever they sit (``< in read X``, ``read X 2>/dev/null``) before the
+  command word is found (``approval_detection_assignments._simple_command_spans``);
+* shell code a builtin runs later counts as LATE: a ``mapfile -C`` callback, a ``trap`` handler, an
+  alias whose text writes a name;
+* a bash builtin with no handler here and not in _NON_WRITING_BUILTINS (``enable``, ``fc``,
+  ``bind``, ``coproc``) means every name, so an unmodeled builtin fails closed.
 
 A command word that is itself an expansion (``$R X`` with R=read) cannot be classified here. It is
 returned as DYNAMIC, and the resolver decides once it knows what the word may hold. Anything it
@@ -110,9 +116,13 @@ def _read(args):
 
 
 def _mapfile(args):
-    targets, operands, unreadable = _options(args, "dnOsuCc")
+    callbacks, operands, unreadable = _options(args, "dnOsuCc", "C")
     if unreadable:
         return ALL
+    if callbacks:
+        # `-C code` runs shell code for every chunk read: it can write any name, install a trap
+        # or a nameref (so it reaches past later assignments, like eval).
+        return LATE
     return _targets(operands[:1] or ["MAPFILE"])
 
 
@@ -176,7 +186,41 @@ def _trap(args):
     return LATE if unreadable or operands else frozenset()
 
 
+# Bash builtins that never write a shell variable the text does not show (``cd`` only rewrites
+# the shell-managed PWD/OLDPWD, which are never proven anyway). Every OTHER builtin must have a
+# handler in _HANDLERS; a builtin on neither list counts as writing every name. External programs
+# cannot write this shell's variables at all.
+_NON_WRITING_BUILTINS = frozenset({
+    ":", "[", "test", "true", "false", "echo", "cd", "pwd", "pushd", "popd", "dirs", "exit",
+    "return", "break", "continue", "shift", "kill", "jobs", "bg", "fg", "disown", "hash", "type",
+    "help", "history", "logout", "times", "ulimit", "umask", "unalias", "set", "shopt",
+    "complete", "compopt", "caller", "suspend", "exec",
+})
+# Every bash 5.x builtin (``compgen -b``) plus the ``coproc`` keyword, which names an array.
+_BASH_BUILTINS = _NON_WRITING_BUILTINS | frozenset({
+    ".", "alias", "bind", "builtin", "command", "compgen", "declare", "enable", "eval", "export", "fc",
+    "getopts", "let", "local", "mapfile", "printf", "read", "readarray", "readonly", "source",
+    "trap", "typeset", "unset", "wait", "coproc",
+})
+
+
+def _alias(args):
+    """``alias echo=read`` makes every later ``echo X`` a reader: any name, at any later point. An
+    alias whose own text writes no name (``alias ll='ls -l'``) cannot."""
+    for raw in args:
+        if is_dynamic(raw):
+            return LATE
+        word = _plain(raw)
+        if "=" in word:
+            value = word.split("=", 1)[1]
+            if is_dynamic(value) or command_clobbers(value.split()) != frozenset():
+                return LATE
+    return frozenset()
+
+
 _HANDLERS = {
+    "alias": _alias,
+    "compgen": _output_var("V"),    # bash 5.3: `compgen -V NAME` stores the matches in NAME
     "read": _read,
     "mapfile": _mapfile,
     "readarray": _mapfile,
@@ -222,7 +266,9 @@ def command_clobbers(words: list[str], *, include_assignments: bool = False):
     leader = _plain(words[pos])
     handler = _HANDLERS.get(leader)
     if handler is None:
-        return frozenset()
+        # enable (loads new builtins), fc (re-runs history), bind -x, coproc NAME, and any
+        # builtin added later: not modeled, so every name.
+        return ALL if leader in _BASH_BUILTINS and leader not in _NON_WRITING_BUILTINS else frozenset()
     if leader in _DECLARATIONS:
         return handler(words[pos + 1:], include_assignments)
     return handler(words[pos + 1:])

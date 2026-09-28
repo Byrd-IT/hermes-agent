@@ -818,3 +818,96 @@ def test_dynamic_word_whose_program_is_itself_unknown_still_clobbers(single_quer
     command = 'X=echo; R="$B read"; $R X; $X'
     with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
         assert check_all_command_guards(command, "local")["approved"] is False
+
+
+# ---- review round 5 regressions: redirections, mapfile callbacks, deferred function writes ----
+# All guard-only (check_all_command_guards / classifiers); nothing reaches an executor.
+
+ROUND5_REFUSE_COMMANDS = [
+    # the three review spellings
+    "X=echo; < input.txt read X; $X",                            # leading redirection
+    "X=echo; mapfile -C 'read X; :' -c 1 A < input.txt; $X",     # callback runs shell code
+    "X=echo; f() { read X; }; X=echo; f; $X",                    # write runs at the call
+    # redirections anywhere in the reader
+    "X=echo; read X < f; $X",
+    "X=echo; 2>/dev/null read -r X; $X",
+    "X=echo; <<<\"$s\" read X; $X",
+    "X=echo; < a IFS= < b read < c X; $X",
+    "X=echo; 0<f builtin read X; $X",
+    "X=echo; exec {X}<f; $X",                                    # {NAME}< stores an fd number
+    # callbacks and deferred writers
+    "X=echo; mapfile -C'read X' A; $X",
+    "mapfile -C 'X=v' A; X=echo; $X",
+    "X=echo; function f { read X; }; X=echo; f; $X",
+    "X=echo; f() ( read X ); X=echo; f; $X",
+    # builtins with no handler count as writing every name
+    "X=echo; enable -f ./x.so foo; $X",
+    "X=echo; fc -s; $X",
+    "X=echo; bind -x \"\\C-a: read X\"; $X",
+    "X=echo; coproc X { cat; }; $X",
+    "X=echo; B=bind; $B -x z; $X",
+    # an alias whose text writes a name rewrites later commands
+    "X=echo; alias echo=read; X=echo; $X",
+    "X=echo; alias ll='read X'; $X",
+    "X=echo; alias e=eval; $X",
+]
+
+
+@pytest.mark.parametrize("scan", [_ALLOW_TIRITH, _INCOMPLETE], ids=["tirith-allow", "tirith-block"])
+@pytest.mark.parametrize("command", ROUND5_REFUSE_COMMANDS)
+def test_redirected_callback_and_deferred_writes_refused(single_query, command, scan):
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=scan):
+        assert check_all_command_guards(command, "local")["approved"] is False
+
+
+@pytest.mark.parametrize("command", [
+    'f() { X="rm -rf /home"; }; X=echo; f; $X',     # the function's value survives the later X=echo
+    '2>/dev/null X="rm -rf /home"; $X',            # a redirection before the assignment
+    'X="rm -rf /home" 2>/dev/null; $X',
+    'X=echo; < f X="rm -rf /home"; $X',
+])
+def test_deferred_and_redirected_destructive_values_are_hardline(command):
+    assert detect_hardline_command(command) == (True, "recursive delete of system directory")
+
+
+@pytest.mark.parametrize("command", [
+    "X=echo; $X hello",
+    "X=echo; read -r Y < f; $X \"$Y\"",
+    "X=echo; < f read -r Y; $X \"$Y\"",
+    "X=echo; mapfile -t A < f; $X \"${A[@]}\"",
+    "X=echo; cd /tmp; $X hi",
+    "X=echo; f() { echo hi; }; f; $X hi",
+    "X=echo; 2>/dev/null ls; $X hi",
+    "PY=python3; $PY -V 2>&1",
+    "c=(ls -la); \"${c[@]}\" /tmp",
+    "X=echo; alias ll=\"ls -l\"; $X hi",
+    "X=echo; alias; $X hi",
+])
+def test_round5_benign_controls_still_approve(single_query, command):
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        assert check_all_command_guards(command, "local")["approved"] is True
+
+
+@pytest.mark.parametrize("words, expected", [
+    (["mapfile", "-t", "A"], {"A"}),
+    (["mapfile", "-C", "cb", "-c", "1", "A"], "late"),
+    (["mapfile", "-Ccb", "A"], "late"),
+    (["alias", "ll=ls -l"], set()),
+    (["alias", "echo=read"], "late"),
+    (["enable", "-f", "x.so", "foo"], None),
+    (["fc", "-s"], None),
+    (["cd", "/tmp"], set()),
+    (["ls", "-l"], set()),
+])
+def test_command_clobbers_callbacks_and_unmodeled_builtins(words, expected):
+    from tools.approval_detection_clobbers import command_clobbers
+    result = command_clobbers(words)
+    assert result == (frozenset(expected) if isinstance(expected, set) else expected)
+
+
+def test_every_bash_builtin_is_classified():
+    # A builtin on neither list would silently count as writing nothing; the lists must cover
+    # every bash builtin so a new handler-less one fails closed instead.
+    from tools.approval_detection_clobbers import _BASH_BUILTINS, _HANDLERS, _NON_WRITING_BUILTINS
+    assert set(_HANDLERS) <= _BASH_BUILTINS
+    assert not (_NON_WRITING_BUILTINS & set(_HANDLERS))

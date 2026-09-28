@@ -30,7 +30,9 @@ environment's value, the explicit ``UNKNOWN``. A builtin that writes a name the 
 ``approval_detection_clobbers``) makes that name UNKNOWN. A reader reached through a variable
 (``R=read; $R X``) is classified by what the variable holds, and an unreadable one clobbers every
 name. Writes that can happen LATER than where they are written (a function body, a ``trap``
-handler, a nameref alias) are never overridden by an intervening assignment. A value computed by a
+handler, a ``mapfile -C`` callback, an alias, a nameref) are never overridden by an intervening
+assignment: a write inside a function body runs at the CALL, which may follow any later assignment.
+Redirections are dropped wherever they sit before a command is classified (``< f read X``). A value computed by a
 command substitution (``X=$(cat f)``) is UNKNOWN too: the command's output is not in the text.
 
 For detection variants this over-approximates: a wrong guess only adds a variant, and a variant can
@@ -169,17 +171,54 @@ def _for_loop_binding(command: str, for_start: int, pos: int) -> _Binding | None
     return _Binding(for_start, pos, name, tuple(dict.fromkeys(words)) or (UNKNOWN,), truncated=truncated)
 
 
-def _simple_command_words(command: str, pos: int) -> list[str]:
-    """The raw words of the simple command starting at *pos* (an unquoted newline ends it)."""
-    from tools.approval_detection import _read_shell_word
-    words: list[str] = []
+# A redirection at a word start: optional fd number or `{NAME}` (bash stores a new fd number in
+# NAME), then the operator. Process substitutions `<(`/`>(` are words, not redirections.
+_REDIRECTION_START_RE = re.compile(
+    r"(?:[0-9]+|\{(?P<fdvar>[A-Za-z_][A-Za-z0-9_]*)\})?(?:&>>?|<<<|<<-?|<>|>>|>&|<&|>\||[<>])(?!\()")
+
+
+_ARRAY_OPEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")
+
+
+def _simple_command_spans(command: str, pos: int) -> tuple[list[tuple[int, int, str]], list[str]]:
+    """The raw words of the simple command starting at *pos* as ``(start, end, word)``, with every
+    redirection removed wherever it sits (``< in read X``, ``read X 2>/dev/null``), and the names
+    ``{NAME}>f`` redirections assign. An unquoted newline ends the command."""
+    from tools.approval_detection import _read_shell_word, _skip_shell_whitespace
+    spans: list[tuple[int, int, str]] = []
+    fd_vars: list[str] = []
+    seen_any = False
     while pos < len(command):
-        start, end, word = _read_shell_word(command, pos)
-        if start == end or (words and "\n" in command[pos:start]):
+        start = _skip_shell_whitespace(command, pos)
+        if seen_any and "\n" in command[pos:start]:
             break
-        words.append(word)
-        pos = end
-    return words
+        redirect = _REDIRECTION_START_RE.match(command, start)
+        if redirect:
+            if redirect.group("fdvar"):
+                fd_vars.append(redirect.group("fdvar"))
+            target_start, target_end, _ = _read_shell_word(command, redirect.end())
+            if target_start == target_end:
+                break
+            pos, seen_any = target_end, True
+            continue
+        start, end, word = _read_shell_word(command, start)
+        if start == end:
+            break
+        if _ARRAY_OPEN_RE.fullmatch(word) and command.startswith("(", end):
+            # `NAME=(a b c)` is one word to the shell; keep it whole (its value is re-read later).
+            array = _array_value(command, end)
+            if array is None:
+                break
+            end = array[1]
+            word = command[start:end]
+        spans.append((start, end, word))
+        pos, seen_any = end, True
+    return spans, fd_vars
+
+
+def _simple_command_words(command: str, pos: int) -> list[str]:
+    """The raw words of the simple command starting at *pos*, redirections removed."""
+    return [word for _, _, word in _simple_command_spans(command, pos)[0]]
 
 
 def _clobber_bindings(command: str, start: int, words: list[str]) -> list[_Binding]:
@@ -219,19 +258,21 @@ def _collect_bindings(command: str) -> list[_Binding]:
     are deobfuscated the way command words are (quotes and escapes removed, tiny literal
     substitutions folded), so ``X="rm -rf /home"`` binds X to ``rm -rf /home``."""
     from tools.approval_detection import (
-        _deobfuscate_shell_word_for_detection, _iter_shell_command_starts, _read_shell_word,
+        _deobfuscate_shell_word_for_detection, _iter_shell_command_starts, _shell_command_segment,
     )
     bindings: list[_Binding] = _default_assignment_bindings(command) if "${" in command else []
     for pos in _iter_shell_command_starts(command):
-        words = _simple_command_words(command, pos)
+        spans, fd_vars = _simple_command_spans(command, pos)
+        words = [word for _, _, word in spans]
         if words and words[0] not in _LOOP_BINDERS:
             bindings.extend(_clobber_bindings(command, pos, words))
+        if fd_vars:
+            # `exec {FD}<file`: bash stores the new descriptor number in FD.
+            end = pos + len(_shell_command_segment(command, pos))
+            bindings.extend(_Binding(pos, end, name, (UNKNOWN,), persistent=False) for name in fd_vars)
         first, declaration, wrapped = True, False, False
         pending: list[_Binding] = []
-        while pos < len(command):
-            start, end, word = _read_shell_word(command, pos)
-            if start == end or (not first and "\n" in command[pos:start]):
-                break   # an unquoted newline ends the simple command
+        for index, (start, end, word) in enumerate(spans):
             if first and not wrapped and word in _LOOP_BINDERS:
                 loop = _for_loop_binding(command, start, end)
                 if loop is not None:
@@ -246,19 +287,17 @@ def _collect_bindings(command: str) -> list[_Binding]:
             plain = _deobfuscate_shell_word_for_detection(word) if first else word
             if first and plain in _BUILTIN_WRAPPERS:
                 # `builtin declare X=v` runs the builtin in this shell.
-                wrapped, pos = True, end
+                wrapped = True
                 continue
             if first and wrapped and plain.startswith("-"):
-                pos = end
                 continue
             if first and plain in _DECLARATION_BUILTINS:
-                declaration, first, pos = True, False, end
+                declaration, first = True, False
                 continue
             if wrapped and first:
                 break   # `command ls ...`: an ordinary program
             first = False
             if declaration and word.startswith("-"):
-                pos = end
                 continue
             match = _ASSIGNMENT_WORD_RE.fullmatch(word)
             element = None if match else _ELEMENT_ASSIGNMENT_RE.fullmatch(word)
@@ -269,7 +308,6 @@ def _collect_bindings(command: str) -> list[_Binding]:
                                         (_deobfuscate_shell_word_for_detection(element.group("value")),),
                                         persistent=False,
                                         command_output=bool(_COMMAND_OUTPUT_RE.search(element.group("value")))))
-                pos = end
                 continue
             if not match:
                 # `X=v cmd ...`: the assignments only reach cmd's environment, not the shell.
@@ -278,16 +316,13 @@ def _collect_bindings(command: str) -> list[_Binding]:
                                         b.truncated, b.command_output) for b in pending]
                 break
             raw_value = match.group("value")
-            if raw_value == "" and end < len(command) and command[end] == "(":
-                array = _array_value(command, end)
-                if array is None:
-                    break
-                value, end = array
+            open_paren = end - len(raw_value)
+            if raw_value.startswith("(") and _ARRAY_OPEN_RE.fullmatch(command[start:open_paren]):
+                value = _array_value(command, open_paren)[0]
             else:
                 value = _deobfuscate_shell_word_for_detection(raw_value)
             pending.append(_Binding(start, end, match.group("name"), (value,), bool(match.group("append")),
                                     command_output=bool(_COMMAND_OUTPUT_RE.search(raw_value))))
-            pos = end
         bindings.extend(pending)
     bindings.sort(key=lambda binding: binding.end)
     return bindings
@@ -558,6 +593,9 @@ class _Resolution:
         """Possible values of *name* at *offset*; UNKNOWN is among them unless a binding fixes it.
         With *fallback*, a name no earlier binding touches also takes every value it is ever given."""
         values: list[str] = [UNKNOWN]
+        # Writes that run when a FUNCTION is called, not where they are written: the call may come
+        # after any later assignment, so no assignment in the text replaces them.
+        deferred: list[str] = []
         bound_before = False
         late = name in _SHELL_MANAGED_NAMES
         for k, b in enumerate(self.bindings):
@@ -571,10 +609,13 @@ class _Resolution:
                 continue
             bound_before = True
             late = late or self.is_late(k)
-            if b.persistent and self.scope.dominates(b.start, offset):
+            if self.scope.floating(b.start):
+                deferred.extend(self.binding_values(k))
+            elif b.persistent and self.scope.dominates(b.start, offset):
                 values = list(self.binding_values(k))
             else:
                 values.extend(self.binding_values(k))
+        values.extend(deferred)
         if late and UNKNOWN not in values:
             # A trap handler, nameref or sourced function can rewrite the name at any point.
             values.append(UNKNOWN)
