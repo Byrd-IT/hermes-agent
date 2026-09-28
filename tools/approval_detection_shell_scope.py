@@ -52,6 +52,9 @@ class HeredocBody:
     owner: str = ""
     owner_start: int = -1
     owner_dynamic: bool = False
+    # The consumer's OUTPUT goes to a shell (``cat <<EOF | bash``), or to a pipe reader the text
+    # does not name. Resolving the consumer to a non-shell never makes such a body data.
+    piped: bool = False
 
 
 class ShellScope:
@@ -301,6 +304,45 @@ def _blank_spans(text: str, spans) -> str:
 _PIPE_TO_SHELL_RE = re.compile(r"\|&?\s*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?(?:bash|sh|zsh|ksh|dash)\b")
 
 
+def _pipes_to_shell(rest: str) -> bool:
+    """Does the rest of a heredoc's operator line send the consumer's output to a shell? Every
+    pipeline reader after a ``|`` is checked with wrappers skipped (``| sudo -u x bash``,
+    ``| env -i sh``); a reader that is a shell, an expansion (``| $S``) or a wrapper whose program
+    cannot be read counts, and so does a pipe the line leaves open (``cat <<EOF |`` continues after
+    the body). Then resolving the consumer to a non-shell never makes the body data."""
+    from tools.approval_detection import (
+        _COMMAND_WRAPPER_WORDS, _deobfuscate_shell_word_for_detection, _read_shell_word, _scan_shell,
+    )
+    from tools.approval_detection_clobbers import is_dynamic
+    if _PIPE_TO_SHELL_RE.search(rest):
+        return True
+    if rest.rstrip().endswith(("|", "\\")):
+        return True
+    for kind, i, _, quote in _scan_shell(rest, subst="uq", brace=True):
+        if kind != "char" or quote is not None or rest[i] != "|" or rest.startswith("||", i):
+            continue
+        if i > 0 and rest[i - 1] == "|":
+            continue
+        pos = i + 1 + rest.startswith("&", i + 1)
+        wrapped = False     # after a wrapper, any word may be the program (`sudo -u root bash`)
+        while True:
+            start, end, raw = _read_shell_word(rest, pos)
+            if start == end:
+                break
+            if is_dynamic(raw):
+                return True
+            word = _deobfuscate_shell_word_for_detection(raw)
+            base = os.path.basename(word).lower()
+            if base in _HEREDOC_SHELL_CONSUMERS:
+                return True
+            wrapped = wrapped or base in _COMMAND_WRAPPER_WORDS
+            if wrapped or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", word, re.DOTALL):
+                pos = end
+                continue
+            break
+    return False
+
+
 def _heredoc_bodies(command: str) -> list[HeredocBody]:
     """Every heredoc body and whether a shell executes it (``bash <<EOF``, ``ssh h <<EOF``,
     ``cat <<EOF | sh``). Any doubt about which body belongs to which operator means executed."""
@@ -329,8 +371,9 @@ def _heredoc_bodies(command: str) -> list[HeredocBody]:
         name = os.path.basename(_deobfuscate_shell_word_for_detection(owner)).lower() if owner else ""
         newline = blanked.find("\n", op)
         rest = blanked[op:len(blanked) if newline < 0 else newline]
-        executed = dynamic or name in _HEREDOC_SHELL_CONSUMERS or bool(_PIPE_TO_SHELL_RE.search(rest))
-        consumers.append((executed, owner or "", owner_start, dynamic))
+        piped = _pipes_to_shell(rest)
+        executed = dynamic or name in _HEREDOC_SHELL_CONSUMERS or piped
+        consumers.append((executed, owner or "", owner_start, dynamic, piped))
     if len(consumers) != len(spans):
-        consumers = [(True, "", -1, False)] * len(spans)
+        consumers = [(True, "", -1, False, True)] * len(spans)
     return [HeredocBody(lo, hi, *consumer) for (lo, hi), consumer in zip(spans, consumers)]

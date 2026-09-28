@@ -988,3 +988,94 @@ def test_command_clobbers_compound_alias_values(words, expected):
     from tools.approval_detection_clobbers import command_clobbers
     result = command_clobbers(words)
     assert result == (frozenset(expected) if isinstance(expected, set) else expected)
+
+
+
+# ---- round 7 review: pipe-to-shell heredocs, per-span quoting, IFS, aliases with operands ------
+
+ROUND7_REFUSE_COMMANDS = [
+    # a resolved non-shell consumer does not make a body data when its output is piped to a shell
+    "C=cat; $C <<'EOF' | bash\n$X\nEOF",
+    "C=cat; $C <<'EOF' | sh\n$X\nEOF",
+    "C=cat; $C <<'EOF' | sudo -u root bash\n$X\nEOF",
+    "C=cat; $C <<'EOF' | env -i sh -s\n$X\nEOF",
+    "C=cat; $C <<'EOF' | tr a-z a-z | sh\n$X\nEOF",
+    "C=cat; $C <<'EOF' | $S\n$X\nEOF",
+    # quoting is per span: the unquoted expansion or glob part is still filename-expanded
+    'X="r?"; ""$X -rf /home',
+    'X="r?"; \'\'$X -rf /home',
+    'D=/usr; "$D"/bin/r? -rf /home',
+    'D=/usr; "$D"/bin/[r]m -rf /home',
+    "X='*'; ${X} -rf /home",
+    # an unquoted value is split on IFS: a same-command IFS the value is split on, or an unknown one
+    "IFS=$(cat f); X=echo; $X hi",
+    # an alias's replacement is composed with the words that follow it at the invocation
+    "shopt -s expand_aliases\nalias a='builtin '\nX=echo\na read X\n$X",
+    "shopt -s expand_aliases\nalias a='command '\nX=echo\na read X\n$X",
+    "shopt -s expand_aliases\nalias p=printf\nX=echo\np -v X %s \"$Y\"\n$X",
+    "shopt -s expand_aliases\nalias r=read\nX=echo\nr X\n$X",
+    "shopt -s expand_aliases\nalias a='true;'\nX=echo\na read X\n$X",
+]
+
+
+@pytest.mark.parametrize("scan", [_ALLOW_TIRITH, _INCOMPLETE], ids=["tirith-allow", "tirith-block"])
+@pytest.mark.parametrize("command", ROUND7_REFUSE_COMMANDS)
+def test_piped_heredoc_mixed_quoting_and_alias_operands_refused(single_query, command, scan):
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=scan):
+        assert check_all_command_guards(command, "local")["approved"] is False
+
+
+@pytest.mark.parametrize("command", [
+    'X="rm+-rf+/home"; IFS=+; $X',
+    'IFS=+; X="rm+-rf+/home"; $X',
+    "IFS=,; X=rm,-rf,/home; $X",
+])
+def test_ifs_split_destructive_value_is_hardline(command):
+    assert detect_hardline_command(command)[0] is True
+
+
+@pytest.mark.parametrize("command, executed", [
+    ("C=cat; $C <<'EOF' | bash\n$X\nEOF", True),
+    ("C=cat; $C <<'EOF' | sudo bash\n$X\nEOF", True),
+    ("C=cat; $C <<'EOF' | tr a-z A-Z\n$X\nEOF", False),
+    ("C=cat; $C <<'EOF' || true\n$X\nEOF", False),
+])
+def test_piped_heredoc_payload_inspected_only_when_a_shell_reads_it(command, executed):
+    payload_leaders = [f for f in opaque_command_leaders(command) if f[0] != command]
+    assert bool(payload_leaders) is executed
+
+
+@pytest.mark.parametrize("command", [
+    "X=echo; $X hello",
+    "C=cat; $C > notes.txt <<'EOF'\n$X\nEOF",
+    "C=cat; $C <<'EOF' | tr a-z A-Z\nhello\nEOF",
+    'X="r?"; "$X" --version',             # fully quoted: the literal program "r?"
+    "X='r*'; \"$X\" -rf ./build",
+    '"$HOME"/bin/tool --help',
+    'D=/usr; "$D"/bin/ls -la',
+    'X="a b"; "$X"/bin/ls',
+    "X=echo; IFS=o; $X hello",             # IFS holds no separator X's value is split into a program by
+    "IFS=:; D=/usr; $D/bin/ls",
+    "shopt -s expand_aliases\nalias ll='ls -l'\nX=echo\nll /tmp\n$X hi",
+    "shopt -s expand_aliases\nalias e=echo\nX=echo\ne hi\n$X hi",
+])
+def test_round7_benign_controls_still_approve(single_query, command):
+    with single_query("approve"), patch("tools.approval._tirith_scan", return_value=_ALLOW_TIRITH):
+        assert check_all_command_guards(command, "local")["approved"] is True
+
+
+@pytest.mark.parametrize("words, expected", [
+    (["alias", "a=builtin "], "late"),
+    (["alias", "a=command "], "late"),
+    (["alias", "p=printf"], "late"),
+    (["alias", "r=read"], "late"),
+    (["alias", "a=true;"], "late"),
+    (["alias", "a="], "late"),
+    (["alias", "e=echo"], set()),
+    (["alias", "ll=ls -l"], set()),
+    (["alias", "g=git status | cat"], set()),
+])
+def test_command_clobbers_alias_composed_with_invocation_operands(words, expected):
+    from tools.approval_detection_clobbers import command_clobbers
+    result = command_clobbers(words)
+    assert result == (frozenset(expected) if isinstance(expected, set) else expected)

@@ -368,8 +368,11 @@ class _Pieces:
         return picks, total <= limit
 
 
-def _reference_pieces(text: str, values_of) -> _Pieces:
-    """*values_of(name, offset)* returns the possible values, or None to leave the reference as is."""
+def _reference_pieces(text: str, values_of, seps_at=None) -> _Pieces:
+    """*values_of(name, offset)* returns the possible values, or None to leave the reference as is.
+    *seps_at(offset)*: the non-blank IFS characters that may be in effect there. An UNQUOTED
+    reference's value is word-split on them, so each such value also gets a variant with them as
+    blanks (``IFS=+; X=rm+-rf+/home; $X`` runs ``rm -rf /home``)."""
     from tools.approval_detection import _scan_shell
     spans: list[tuple[int, int, tuple | None]] = []
     choices: dict[tuple, tuple[str, ...]] = {}
@@ -383,6 +386,10 @@ def _reference_pieces(text: str, values_of) -> _Pieces:
             if match and values:
                 values = tuple(dict.fromkeys(text[i:match.end()] if v == UNKNOWN else v
                                              for v in _reference_values(match, values)))
+                seps = seps_at(i) if seps_at is not None and quote is None else ""
+                if seps:
+                    table = str.maketrans(seps, " " * len(seps))
+                    values = tuple(dict.fromkeys(values + tuple(v.translate(table) for v in values)))
                 key = (_reference_name(match), values)
                 choices[key] = values
                 spans.append((i, match.end(), key))
@@ -446,7 +453,7 @@ def _inert_segment(text: str, lo: int, hi: int) -> bool:
                    for kind, i, _, quote in _scan_shell(text, lo, hi))
 
 
-def _expand_command(text: str, values_of) -> tuple[list[str], bool]:
+def _expand_command(text: str, values_of, seps_at=None) -> tuple[list[str], bool]:
     """Detection variants of a whole command and whether they cover every combination.
 
     Up to _MAX_VARIANTS whole-command combinations cover the full product when it is that small.
@@ -455,7 +462,7 @@ def _expand_command(text: str, values_of) -> tuple[list[str], bool]:
     under every combination of its own choices: a hardline pattern matches within one simple
     command, so that is the combination set that decides it."""
     from tools.approval_detection import _iter_shell_command_starts
-    pieces = _reference_pieces(text, values_of)
+    pieces = _reference_pieces(text, values_of, seps_at)
     multi = [key for key, values in pieces.choices.items() if len(values) > 1]
     picks, complete = pieces.product(multi, _MAX_VARIANTS)
     if complete:
@@ -590,6 +597,24 @@ class _Resolution:
             names |= hit
         return frozenset(names)
 
+    def ifs_separators(self, offset: int) -> tuple[str, bool]:
+        """The non-blank characters IFS may hold at *offset*, and whether IFS may hold a value the
+        text does not show. bash never imports IFS from the environment (it starts as blank,
+        tab, newline), so IFS is default unless the command itself writes it."""
+        writes = [k for k, b in enumerate(self.bindings) if self.clobbers(k, "IFS")
+                  and (b.end <= offset or self.scope.in_loop_with(b.start, offset))]
+        if not writes:
+            return "", False
+        values = self.values_at("IFS", offset)
+        # values_at's own UNKNOWN is the default here; only a write of an unshown value is unknown:
+        # one that names IFS (`IFS=$(cat f)`, `read IFS`) or a late writer (trap, eval). `source`
+        # rewriting IFS is not singled out: the sourced code is unreadable and could run anything.
+        unknown = UNKNOWN in values and any(
+            self.is_late(k) or (self.bindings[k].name == "IFS" and UNKNOWN in self.binding_values(k))
+            for k in writes)
+        seps = "".join(sorted({c for v in values if v != UNKNOWN for c in v if c not in " \t\n"}))
+        return seps, unknown
+
     def values_at(self, name: str, offset: int, *, fallback: bool = False) -> tuple[str, ...]:
         """Possible values of *name* at *offset*; UNKNOWN is among them unless a binding fixes it.
         With *fallback*, a name no earlier binding touches also takes every value it is ever given."""
@@ -650,7 +675,8 @@ def _resolve(command: str) -> tuple[tuple[str, ...], bool]:
     if not resolution.bindings:
         return (), True
     variants, complete = _expand_command(
-        command, lambda name, offset: resolution.values_at(name, offset, fallback=True))
+        command, lambda name, offset: resolution.values_at(name, offset, fallback=True),
+        lambda offset: resolution.ifs_separators(offset)[0])
     complete = complete and not resolution.truncated
     return tuple(v for v in dict.fromkeys(variants) if v != command), complete
 
@@ -672,17 +698,12 @@ def resolve_shell_assignments(command: str) -> str | None:
 _GLOB_RE = re.compile(r"[*?]|\[[^\]]*\]|[@!+]\(")
 
 
-def _leader_is_opaque(value: str, *, globbed: bool = False) -> bool:
+def _leader_is_opaque(value: str) -> bool:
     """Does *value*, spliced into command position, leave the program unreadable (its first word
     is still a whole-word expansion or substitution, like an opaque command word written directly)?
-
-    *globbed*: the reference was unquoted, so its expansion is also filename-expanded. A first word
-    with glob syntax (``X="r?"; $X -rf /home``) is then whatever file in the working directory
-    matches, not the program its text spells; bash runs ``rm`` if that is the only match."""
+    Glob syntax in an unquoted value is judged by ``_program_globs``, which tracks quoting."""
     from tools.approval_detection import _read_shell_word
     if value == UNKNOWN or not value.strip():
-        return True
-    if globbed and _GLOB_RE.search(value.split(None, 1)[0]):
         return True
     start, end, first = _read_shell_word(value, 0)
     return start == end or bool(_OPAQUE_LEADER_RE.fullmatch(first)) or _basename_is_expansion(first)
@@ -703,13 +724,89 @@ def _basename_is_expansion(word: str) -> bool:
     return "\x01" in masked.rsplit("/", 1)[-1]
 
 
+# Placeholders in a glob view: a quoted character (never a glob), and a value the text does not fix.
+_QUOTED_CHAR = "q"
+_UNFIXED = "\x01"
+
+
+def _glob_views(word: str, values_of) -> tuple[list[str], bool]:
+    """What pathname expansion sees in the command word *word*, once per combination of its
+    references' values: quoting is tracked per span, not by the word's first character. A quoted
+    or escaped character (and every character of a quoted reference's value) becomes a
+    placeholder that is never glob syntax; an unquoted literal character stays itself; an unquoted
+    reference's value is spliced in as is (bash filename-expands the result of an unquoted
+    expansion). So ``""$X`` with X='r?' and ``"$D"/bin/r?`` both keep their ``?``, while
+    ``"$X"`` and ``'r?'`` do not. A value the text does not fix is _UNFIXED. Returns (views, whether
+    every combination was produced)."""
+    from tools.approval_detection import _scan_shell
+    parts: list = []    # str, or (values, quoted)
+    skip_to = 0
+    for kind, i, j, quote in _scan_shell(word):
+        if i < skip_to or kind == "quote":
+            continue
+        if kind == "char" and quote != "'" and word[i] == "$":
+            match = _REFERENCE_RE.match(word, i)
+            if match:
+                values = values_of(_reference_name(match)) or (UNKNOWN,)
+                values = tuple(dict.fromkeys(_UNFIXED if v == UNKNOWN else v
+                                             for v in _reference_values(match, values)))
+                parts.append((values, quote == '"'))
+                skip_to = match.end()
+                continue
+        if kind == "esc":
+            parts.append(word[i + 1] if word[i + 1] == "/" else _QUOTED_CHAR)
+        elif quote is not None and word[i] != "/":
+            parts.append(_QUOTED_CHAR)
+        else:
+            parts.append(word[i])
+    choices = [p[0] for p in parts if isinstance(p, tuple)]
+    total = math.prod(len(c) for c in choices)
+    views = []
+    for combo in itertools.islice(itertools.product(*choices), _MAX_VALUES_PER_NAME):
+        picks = iter(combo)
+        out = []
+        for p in parts:
+            if isinstance(p, tuple):
+                value = next(picks)
+                # A quoted value is neither split nor globbed: all of it is literal text.
+                out.append(_QUOTED_CHAR * max(len(value), 1) if p[1] else value)
+            else:
+                out.append(p)
+        views.append("".join(out))
+    return views, total <= _MAX_VALUES_PER_NAME
+
+
+def _has_unquoted_reference(word: str) -> bool:
+    """Is some expansion in *word* unquoted (so word splitting applies to its value)?"""
+    views, _ = _glob_views(word, lambda name: (_UNFIXED,))
+    return any(_UNFIXED in view for view in views)
+
+
+
+def _program_globs(word: str, values_of, seps: str = "") -> bool:
+    """Can pathname expansion change which program the command word *word* names? Only the
+    first field counts (an unquoted value is also word-split, on blanks and the non-blank IFS
+    characters *seps*). An incomplete enumeration counts."""
+    views, complete = _glob_views(word, values_of)
+    if not complete:
+        return True
+    table = str.maketrans(seps, " " * len(seps))
+    for view in views:
+        fields = view.translate(table).split()
+        if fields and _GLOB_RE.search(fields[0]):
+            return True
+    return False
+
+
 def _partial_leader_is_opaque(word: str, start: int, resolution) -> bool:
     """A command word that EMBEDS an expansion (``/bin/$X``): opaque if, with the same-command
-    values substituted, some possible form still has an expansion in its program name, or (the
-    word being unquoted there) a glob in it (``$D/bin/r?`` runs whatever file matches)."""
-    globbed = not word.startswith('"')
-    if (globbed and "$" in word
-            and _GLOB_RE.search(re.sub(r"'[^']*'", "q", word).rsplit("/", 1)[-1])):
+    values substituted, some possible form still has an expansion in its program name, or an
+    unquoted glob in its program (``$D/bin/r?``, ``""$X`` with X='r?'): that runs whatever file
+    matches."""
+    values_of = ((lambda name: resolution.values_at(name, start)) if resolution is not None
+                 else (lambda name: None))
+    seps, ifs_unknown = resolution.ifs_separators(start) if resolution is not None else ("", False)
+    if "$" in word and (_program_globs(word, values_of, seps) or (ifs_unknown and _has_unquoted_reference(word))):
         return True
     if not _basename_is_expansion(word):
         return False
@@ -717,9 +814,7 @@ def _partial_leader_is_opaque(word: str, start: int, resolution) -> bool:
         return True
     pieces = _reference_pieces(word, lambda name, _offset: resolution.values_at(name, start))
     picks, complete = pieces.product(pieces.choices, _MAX_VALUES_PER_NAME)
-    return not complete or any(
-        _basename_is_expansion(form) or (globbed and _GLOB_RE.search(form.rsplit("/", 1)[-1]))
-        for form in (pieces.render(pick) for pick in picks))
+    return not complete or any(_basename_is_expansion(form) for form in (pieces.render(pick) for pick in picks))
 
 
 def _heredoc_owner_is_data(heredoc, resolution) -> bool:
@@ -748,7 +843,7 @@ def _heredoc_owner_is_data(heredoc, resolution) -> bool:
 
 def _executed_heredocs(heredocs, resolution) -> list:
     return [h for h in heredocs
-            if h.executed and not (h.owner_dynamic and _heredoc_owner_is_data(h, resolution))]
+            if h.executed and not (h.owner_dynamic and not h.piped and _heredoc_owner_is_data(h, resolution))]
 
 
 def eval_payloads(command: str) -> tuple[list[str], bool]:
@@ -809,8 +904,15 @@ def _inspect(command: str, depth: int, found: list, reasons: list[str]) -> None:
         if reference and reference.end() == len(bare):
             values = (_reference_values(reference, resolution.values_at(_reference_name(reference), start))
                       if resolution else (UNKNOWN,))
-            globbed = not word.startswith('"')
-            if not any(_leader_is_opaque(value, globbed=globbed) for value in values):
+            seps, ifs_unknown = resolution.ifs_separators(start) if resolution else ("", False)
+            unquoted = not word.startswith('"')
+            if unquoted and seps:
+                table = str.maketrans(seps, " " * len(seps))
+                values = tuple(dict.fromkeys(values + tuple(v.translate(table) for v in values)))
+            if (not (unquoted and ifs_unknown)
+                    and not any(_leader_is_opaque(value) for value in values)
+                    and not _program_globs(word, lambda name, at=start: resolution.values_at(name, at)
+                                           if resolution else None, seps)):
                 continue
         found.append((command, start, end, word))
     if not _resolve(command)[1]:

@@ -223,18 +223,32 @@ def _alias(args):
 _ALIAS_COMPOUND_RE = re.compile(r"[(){}`]")
 
 
+# Stands for the words that follow an alias at its invocation (unknown here).
+_INVOCATION_OPERANDS = '"$@"'
+
+
 def _alias_value_writes(value: str) -> bool:
+    """Can running *value* as an alias write a name? The words after the alias at its invocation
+    are appended to its LAST simple command (``alias a='builtin '``; ``a read X`` runs
+    ``builtin read X``; ``alias p=printf``; ``p -v X``), so that command is classified with
+    unknown operands added. A value ending in a separator starts a new command with them
+    (``alias a='true;'``; ``a read X``)."""
     from tools.approval_detection import _iter_shell_command_starts
     from tools.approval_detection_assignments import _simple_command_words
     if is_dynamic(value) or _ALIAS_COMPOUND_RE.search(value):
         return True
-    for pos in _iter_shell_command_starts(value):
+    if not value.strip() or value.rstrip()[-1] in ";&|\n\\":
+        return True
+    starts = sorted(_iter_shell_command_starts(value))
+    for pos in starts:
         words = _simple_command_words(value, pos)
+        if pos == starts[-1]:
+            words = words + [_INVOCATION_OPERANDS]
         if words and _ASSIGNMENT_PREFIX_RE.match(words[0]):
             return True
         if command_clobbers(words) != frozenset():
             return True
-    return False
+    return not starts
 
 
 _HANDLERS = {
