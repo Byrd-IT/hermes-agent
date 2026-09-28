@@ -292,8 +292,7 @@ DEFAULT_CONFIG = {
         # Menlo, Consolas, monospace"). Lets users use a Nerd Font without patching the app.
         "font_family": "",
         "timeout": 180,
-        # Seconds between SIGTERM and escalated SIGKILL for host process trees (browser daemons). 0
-        # = SIGTERM only.
+        # Seconds between SIGTERM and escalated SIGKILL for host process trees (browser daemons); 0 = SIGTERM only.
         "daemon_term_grace_seconds": 2.0,
         # Max seconds a one-shot CLI run (-q/-Q/-z) lingers for tracked notify_on_complete
         # background processes to finish. The dying parent owns their stdout pipes, so exiting
@@ -339,9 +338,9 @@ DEFAULT_CONFIG = {
         "container_cpu": 1,
         "container_memory": 5120,       # MB (default 5GB)
         "container_disk": 51200,        # MB (default 50GB)
-        # Per-worker systemd scope MemoryMax. "auto" retains the conservative
-        # host-aware bound; an explicit MiB value may raise it, but never beyond
-        # a finite enclosing cgroup memory.max limit.
+        # Per-worker systemd scope MemoryMax (MiB). "auto" = min(enclosing cgroup
+        # memory.max, RAM/2, 4 GiB). An explicit whole number of MiB may raise it
+        # past 4 GiB, but never beyond a finite enclosing memory.max or physical RAM.
         "worker_memory_max_mb": "auto",
         "container_persistent": True,   # Persist filesystem across sessions
         # Docker volume mounts, "host_path:container_path" (docker -v syntax), e.g.
