@@ -12,6 +12,7 @@ import shlex
 import tempfile
 import unicodedata
 
+from tools.approval_detection_assignments import eval_payloads, resolve_shell_assignment_variants
 from tools.approval_detection_awk import AWK_EXEC_DESCRIPTION, AWK_NAMES, awk_program_runs_shell
 
 logger = logging.getLogger("tools.approval")
@@ -1092,8 +1093,9 @@ def _substitution_body(text: str, i: int, j: int) -> str:
     return text[i + (1 if text[i] == "`" else 2):j - 1]
 
 
-def _quoted_heredoc_body_spans(text: str) -> list[tuple[int, int]]:
-    """``(start, end)`` of each heredoc body whose delimiter word is quoted or escaped
+def _quoted_heredoc_body_spans(text: str, *, quoted_only: bool = True) -> list[tuple[int, int]]:
+    """``(start, end)`` of each heredoc body whose delimiter word is quoted or escaped; with
+    *quoted_only* False, of every heredoc body.
     (``<<'EOF'``, ``<<"EOF"``, ``<<\\EOF``, ``<<E'O'F``). The shell performs no expansion there, so a
     ``$(...)`` in such a body is data. Bodies are read line by line, not through the quote scanner:
     an apostrophe in heredoc text is not a quote."""
@@ -1123,7 +1125,7 @@ def _quoted_heredoc_body_spans(text: str) -> list[tuple[int, int]]:
                     break
             else:
                 end = n
-            if any(ch in word for ch in "'\"\\"):
+            if not quoted_only or any(ch in word for ch in "'\"\\"):
                 spans.append((start, end))
     return spans
 
@@ -1624,7 +1626,55 @@ def _deny_command_variants(command: str):
                 pending.append(payload)
 
 
-def _command_detection_variants(command: str):
+def _command_detection_variants(command: str, *, resolve_assignments: bool = True, _eval_depth: int = 0):
+    """Every detection view of *command*. With *resolve_assignments*, variables assigned in the
+    same command are then substituted into each view (per use; one form per possible value) and
+    each result expanded once more, so
+    ``X="rm -rf /home"; $X`` is seen as ``rm -rf /home`` (see approval_detection_assignments)."""
+    seen: set[str] = set()
+    for variant in _command_detection_variants_unresolved(command):
+        if variant is None:
+            continue
+        seen.add(variant)
+        yield variant
+    if not resolve_assignments:
+        return
+    # `eval` re-parses its (expanded) arguments as a script: that script is a command of its own,
+    # like a `bash -c` payload. Payloads are expanded with the same-command values, so
+    # `X="rm -rf /home"; eval "$X"` is seen as `rm -rf /home`.
+    evaluated, _ = eval_payloads(command) if _eval_depth < _MAX_EVAL_DEPTH else ([], True)
+    for payload in evaluated:
+        for variant in _command_detection_variants(payload, _eval_depth=_eval_depth + 1):
+            if variant not in seen:
+                seen.add(variant)
+                yield variant
+    # Variants that differ from an earlier source only by whitespace (the command-start-marked
+    # forms insert newlines) resolve to the same command, so each is resolved and expanded once.
+    # Quoting is NOT folded: `"rm" -rf /` and `rm -rf /` expand to different variant sets.
+    done: set[str] = set()
+    for source in [command, *seen]:
+        key = _RESOLVE_DEDUP_RE.sub("", source)
+        if key in done:
+            continue
+        done.add(key)
+        for resolved in resolve_shell_assignment_variants(source):
+            resolved_key = _RESOLVE_DEDUP_RE.sub("", resolved)
+            if resolved_key in done:
+                continue
+            done.add(resolved_key)
+            for variant in _command_detection_variants_unresolved(resolved):
+                if variant is not None and variant not in seen:
+                    seen.add(variant)
+                    yield variant
+
+
+_RESOLVE_DEDUP_RE = re.compile(r"\s")
+# Nested `eval` payloads expanded for detection. Deeper nesting is refused in unattended approve
+# mode by approval_detection_assignments.uninspectable_reasons (same depth bound).
+_MAX_EVAL_DEPTH = 3
+
+
+def _command_detection_variants_unresolved(command: str):
     # Mask quoted newlines BEFORE normalization: normalization strips escapes (\" -> ") and ""
     # pairs, corrupting quote tracking (`echo "a\""` becomes an unterminated quote) so masking
     # afterwards could swallow a REAL unquoted newline separator. The raw command carries faithful quote state.
