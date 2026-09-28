@@ -311,6 +311,18 @@ kanban:
   review_dispatch: true            # default: spawn the assigned profile with
                                    # the bundled sdlc-review skill. Set false
                                    # for human-only review boards.
+  default_reviewer: ""             # default: the card's assignee reviews it.
+                                   # Set to a profile (e.g. code-reviewer) so a
+                                   # card that reaches review still assigned to
+                                   # its implementer is reassigned to that
+                                   # profile first: no profile approves its own
+                                   # work. A card implemented BY the default
+                                   # reviewer stays in review for a human. An
+                                   # uninstalled name logs a warning and falls
+                                   # back to the legacy behaviour. A reviewer
+                                   # this home's dispatch_profiles excludes
+                                   # leaves the card untouched for a home that
+                                   # may claim it.
   # dispatch_profiles: [sage]       # unset (key omitted): this home may claim
                                    # cards for any existing profile. Set to a
                                    # list (or comma-separated string) of profile
@@ -878,7 +890,7 @@ All routes are mounted under `/api/plugins/kanban/` and protected by the dashboa
 | `DELETE` | `/links?parent_id=…&child_id=…` | Remove a dependency |
 | `POST` | `/dispatch?max=…&dry_run=…` | Nudge the dispatcher — skip the 60 s wait |
 | `GET` | `/config` | Read `dashboard.kanban` preferences from `config.yaml` — `default_tenant`, `lane_by_profile`, `include_archived_by_default`, `render_markdown` |
-| `WS` | `/events?since=<event_id>` | Live stream of `task_events` rows |
+| `WS` | `/events?since=<event_id>` | Live stream of `task_events` rows. Without `since` the stream starts at the board's current tail (the `/board` snapshot already holds the past); pass `since=<latest_event_id>` to catch up from there, or `since=0` to replay history |
 
 Every handler is a thin wrapper — the plugin is ~700 lines of Python (router + WebSocket tail + bulk batcher + config reader) and adds no new business logic. A tiny `_conn()` helper auto-initializes `kanban.db` on every read and write, so a fresh install works whether the user opened the dashboard first, hit the REST API directly, or ran `hermes kanban init`.
 

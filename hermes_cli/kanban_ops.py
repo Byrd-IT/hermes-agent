@@ -106,6 +106,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "reviewer_reassigned": [
+                {"task_id": tid, "implementer": imp, "reviewer": rev}
+                for (tid, imp, rev) in res.reviewer_reassigned
+            ],
+            "skipped_self_review": res.skipped_self_review,
             "respawn_guarded": [
                 {"task_id": tid, "reason": reason}
                 for (tid, reason) in res.respawn_guarded
@@ -148,6 +153,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     for tid, reason in res.respawn_guarded:
         print(f"Guarded ({reason}): {tid}")
+    for tid, implementer, reviewer in res.reviewer_reassigned:
+        print(f"Review routed {implementer} -> {reviewer} (kanban.default_reviewer): {tid}")
+    if res.skipped_self_review:
+        print(
+            f"Held in review (implementer is kanban.default_reviewer; needs a human): "
+            f"{', '.join(res.skipped_self_review)}"
+        )
     if res.rate_limited:
         print(f"Rate-limited (released to ready, no failure counted): {', '.join(res.rate_limited)}")
     if res.skipped_locked:

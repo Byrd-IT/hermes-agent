@@ -3529,7 +3529,18 @@ export const deOverrides = {
       gatewayUnreachable: gateway => `${gateway} · nicht erreichbar`,
       onGateway: (name, gateway) => `${name} · ${gateway}`,
       switchTo: (name, gateway) => `Zu ${name} auf ${gateway} wechseln`,
-      deleteOn: gateway => ` auf ${gateway}`
+      deleteOn: gateway => ` auf ${gateway}`,
+      localDevice:
+        'Dieses Gerät (lokales Backend — installiert Hermes, falls es fehlt, sonst öffnet es eine neue Sitzung)',
+      switchDeviceTitle: 'Zu diesem Gerät wechseln?',
+      switchDeviceDesc:
+        'Das öffnet eine neue Sitzung auf diesem Computer. Das aktuelle Gespräch bleibt auf dem anderen Gateway.',
+      switchDeviceConfirm: 'Wechseln',
+      installDeviceTitle: 'Zu diesem Gerät wechseln?',
+      installDeviceDesc:
+        'Hermes wird lokal installiert und danach eine neue Sitzung auf diesem Computer geöffnet. Ohne Bestätigung startet keine Installation.',
+      installDeviceConfirm: 'Lokal installieren',
+      connectExistingInstead: 'Stattdessen vorhandenes verbinden'
     },
     status: {
       unread: (count: number) => (count === 1 ? '1 ungelesene Sitzung' : `${count} ungelesene Sitzungen`),
@@ -4031,6 +4042,7 @@ export const deOverrides = {
       branchFrom: 'Branch',
       rename: 'Umbenennen…',
       archive: 'Archivieren',
+      unarchive: 'Archivierung aufheben',
       newWindow: 'Neues Fenster',
       openInTerminal: 'Im Terminal öffnen',
       hideTabBar: 'Tab-Leiste ausblenden',
@@ -4433,7 +4445,7 @@ export const deOverrides = {
       copyFailure: 'Kriterium konnte nicht in die Zwischenablage kopiert werden',
       continuationFailed: 'Ziel-Fortsetzung konnte nicht übermittelt werden',
       continuationQueued: 'Ziel fortgesetzt — Fortsetzung in der Warteschlange, bis die aktuelle Runde endet',
-      continuationBusy: 'Ziel fortgesetzt — Session ist beschäftigt, /interrupt zum Fortsetzen der aktuellen Runde',
+      continuationBusy: 'Ziel fortgesetzt — Session ist beschäftigt; stoppe zuerst die aktuelle Antwort (Stopp-Button oder Esc), um fortzufahren',
       controlUnavailable: msg => `Session-Steuerung nicht verfügbar: ${msg}`,
       dismissError: 'Fehler verwerfen',
       add: 'Hinzufügen'
@@ -4934,6 +4946,7 @@ export const deOverrides = {
       search: 'Modelle durchsuchen',
       noModels: 'Keine Modelle gefunden',
       editModels: 'Modelle bearbeiten…',
+      followDefault: 'Standard aus den Einstellungen verwenden',
       refreshModels: 'Modelle aktualisieren',
       fast: 'Schnell'
     },
@@ -5069,7 +5082,8 @@ export const deOverrides = {
         title: 'Kontext-Verbrauch',
         tokenSummary: (used, max) => `${used} / ${max} Tokens`
       },
-      session: 'Session',
+      focusedSince: 'Fokussiert seit',
+      focusedSinceTitle: 'Zeit seit dem Fokussieren dieses Chats — nicht die Laufzeit eines Turns',
       yoloOn: 'YOLO an — gefährliche Befehle werden automatisch genehmigt. Shift+Klick schaltet global um.',
       yoloOff: 'YOLO aus. Shift+Klick schaltet global um.',
       modelNone: 'keines',
@@ -5932,6 +5946,8 @@ export const deOverrides = {
     deleteFailed: 'Löschen fehlgeschlagen',
     archived: 'Archiviert',
     archiveFailed: 'Archivieren fehlgeschlagen',
+    restored: 'Wiederhergestellt',
+    unarchiveFailed: 'Archivierung aufheben fehlgeschlagen',
     cwdChangeFailed: 'Arbeitsverzeichnis-Änderung fehlgeschlagen',
     cwdStagedTitle: 'Arbeitsverzeichnis bereitgestellt',
     cwdStagedMessage: 'Starten Sie das Desktop-Backend neu, um cwd-Änderungen auf diese aktive Session anzuwenden.',

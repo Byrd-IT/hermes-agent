@@ -1873,6 +1873,11 @@ DEFAULT_CONFIG = {
         # Auto-claim tasks in the review column and spawn the assigned profile with the bundled
         # sdlc-review skill. Disable where every review is done manually from the dashboard.
         "review_dispatch": True,
+        # Profile that reviews a card still assigned to its own implementer when it reaches the
+        # review column (kanban_request_review without reviewer=). The dispatcher reassigns the
+        # card to it before claiming, so no profile approves its own work; a card whose
+        # implementer IS this profile waits for a human. "" = legacy: the assignee reviews.
+        "default_reviewer": "",
         # Seconds between dispatcher ticks. Lower = snappier pickup; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,

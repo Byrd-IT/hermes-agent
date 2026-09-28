@@ -2269,6 +2269,17 @@ export const ru = defineLocale({
     switchConnectionFailed: name => `Не удалось подключиться к ${name}`,
     manageProfiles: 'Управлять профилями…',
     connectGateway: 'Управлять шлюзами…',
+    fleet: {
+      localDevice: 'Это устройство (локальный бэкенд — установит Hermes, если его нет, иначе откроет новую сессию)',
+      switchDeviceTitle: 'Переключиться на это устройство?',
+      switchDeviceDesc: 'Откроется новая сессия на этом компьютере. Текущий разговор останется на другом шлюзе.',
+      switchDeviceConfirm: 'Переключить',
+      installDeviceTitle: 'Переключиться на это устройство?',
+      installDeviceDesc:
+        'Hermes будет установлен локально, затем откроется новая сессия на этом компьютере. Установка не начнётся, пока вы не подтвердите.',
+      installDeviceConfirm: 'Установить локально',
+      connectExistingInstead: 'Вместо этого подключить существующий'
+    },
     actions: 'Действия',
     color: 'Цвет…',
     colorFor: 'Цвет',
@@ -2710,6 +2721,7 @@ export const ru = defineLocale({
       branchFrom: 'Ветка',
       rename: 'Переименовать',
       archive: 'В архив',
+      unarchive: 'Восстановить',
       newWindow: 'Новое окно',
       openInTerminal: 'Открыть в терминале',
       hideTabBar: 'Скрыть панель вкладок',
@@ -3100,7 +3112,7 @@ export const ru = defineLocale({
       copyFailure: 'Не удалось скопировать критерий в буфер обмена',
       continuationFailed: 'Не удалось отправить продолжение цели',
       continuationQueued: 'Цель возобновлена — продолжение поставлено в очередь до конца текущего хода',
-      continuationBusy: 'Цель возобновлена — сессия занята, выполните /interrupt, чтобы продолжить',
+      continuationBusy: 'Цель возобновлена — сессия занята; сначала остановите текущий ответ (кнопка Stop или Esc), чтобы продолжить',
       controlUnavailable: msg => `Управление сессией недоступно: ${msg}`,
       dismissError: 'Скрыть ошибку',
       add: 'Добавить'
@@ -3465,6 +3477,7 @@ export const ru = defineLocale({
       search: 'Поиск моделей',
       noModels: 'Модели не найдены',
       editModels: 'Изменить модели…',
+      followDefault: 'Использовать модель по умолчанию из настроек',
       refreshModels: 'Обновить модели',
       fast: 'Быстрая'
     },
@@ -3588,7 +3601,8 @@ export const ru = defineLocale({
         title: 'Использование контекста',
         tokenSummary: (used, max) => `${used} / ${max} токенов`
       },
-      session: 'Сеанс',
+      focusedSince: 'В фокусе с',
+      focusedSinceTitle: 'Время с момента фокуса этого чата — не длительность хода',
       yoloOn: 'YOLO включён — автоматическое подтверждение опасных команд. Shift-клик переключает глобально.',
       yoloOff: 'YOLO выключен. Shift-клик переключает глобально.',
       modelNone: 'нет',
@@ -4121,6 +4135,8 @@ export const ru = defineLocale({
     deleteFailed: 'Удаление не удалось',
     archived: 'В архиве',
     archiveFailed: 'Архивирование не удалось',
+    restored: 'Восстановлено',
+    unarchiveFailed: 'Не удалось восстановить',
     cwdChangeFailed: 'Изменение рабочего каталога не удалось',
     cwdStagedTitle: 'Рабочий каталог поставлен в очередь',
     cwdStagedMessage: 'Перезапустите бэкенд desktop, чтобы применить изменения cwd к этому активному сеансу.',
