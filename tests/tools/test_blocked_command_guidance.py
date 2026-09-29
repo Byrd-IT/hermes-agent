@@ -72,3 +72,43 @@ class TestBackgroundGuidanceRecipes:
 
     def test_quoted_ampersand_not_flagged(self):
         assert _foreground_background_guidance('git commit -m "a & b"') is None
+
+
+LONG_LIVED = "appears to start a long-lived server/watch process"
+
+
+class TestDetachedContainerStartsAllowed:
+    """A detached start returns in seconds, so it runs in the foreground."""
+
+    def test_detached_compose_up_runs_in_foreground(self):
+        # The two commands refused on S3 (t_1eba0746).
+        for cmd in (
+            "cd /opt/buzz && sudo docker compose up -d postgres redis relay",
+            "cd /opt/buzz && sudo docker compose up --detach postgres redis relay > /tmp/up.log 2>&1",
+            "docker compose up -dV --remove-orphans",
+            "docker compose up relay -d",
+            "docker compose up --wait",
+            "docker compose up --detach=true",
+            "docker compose pull && docker compose up -d && docker compose ps",
+            "docker run -d --name web nginx",
+        ):
+            assert _foreground_background_guidance(cmd) is None, cmd
+
+    def test_attached_compose_up_still_blocked(self):
+        for cmd in (
+            "docker compose up",
+            "docker compose up postgres",
+            "docker compose up -d --watch",
+            "docker compose up -dw",
+            "docker compose up --build 2>&1 | tee up.log",
+            # Detached in one command does not clear an attached one later.
+            "docker compose up -d db; docker compose up web",
+            # -d belongs to the next command, not to `up`.
+            "docker compose up && docker ps -d",
+        ):
+            msg = _foreground_background_guidance(cmd)
+            assert msg is not None and LONG_LIVED in msg, cmd
+
+    def test_detach_flag_inside_quotes_does_not_count(self):
+        msg = _foreground_background_guidance("docker compose up web --label 'x -d'")
+        assert msg is not None and LONG_LIVED in msg

@@ -86,9 +86,50 @@ def _strip_quotes(command: str) -> str:
     return re.sub(r"`[^`]*`", "``", result)
 
 
-_LONG_LIVED_FOREGROUND_PATTERNS = tuple(re.compile(p, re.IGNORECASE) for p in (
+_COMPOSE_UP_RE = re.compile(r"\bdocker\s+compose\s+up\b", re.IGNORECASE)
+# End of one simple command: ; | || && & or newline, but not the & of a
+# redirect (2>&1, &>file), which belongs to the same command.
+_SIMPLE_COMMAND_END_RE = re.compile(r"[;|\n]|(?<![<>])&(?!>)")
+# `up` flags that take no value, so they may be clustered (-dV).
+_COMPOSE_UP_BOOL_SHORT_FLAGS = "dVwy"
+
+
+def _compose_up_is_detached(args: list[str]) -> bool:
+    """True when `compose up` *args* return once the containers start.
+
+    ``-d``/``--detach`` detach, and ``--wait`` implies detached mode
+    (docs.docker.com/reference/cli/docker/compose/up). ``-w``/``--watch``
+    keeps the command running to sync files, so it stays long-lived.
+    """
+    detached = False
+    for arg in args:
+        if arg in ("--watch", "-w") or arg.startswith("--watch="):
+            return False
+        if arg in ("--detach", "--wait") or arg.lower() in ("--detach=true", "--wait=true"):
+            detached = True
+        elif re.fullmatch(f"-[{_COMPOSE_UP_BOOL_SHORT_FLAGS}]+", arg):
+            if "w" in arg:
+                return False
+            detached = detached or "d" in arg
+    return detached
+
+
+def _attached_compose_up(unquoted: str) -> bool:
+    """True when any `docker compose up` in *unquoted* stays attached.
+
+    A detached start returns in seconds, so it is not a long-lived process
+    and must not be pushed to background=true.
+    """
+    for match in _COMPOSE_UP_RE.finditer(unquoted):
+        rest = unquoted[match.end():]
+        end = _SIMPLE_COMMAND_END_RE.search(rest)
+        if not _compose_up_is_detached(rest[: end.start() if end else len(rest)].split()):
+            return True
+    return False
+
+
+_LONG_LIVED_FOREGROUND_PATTERNS = (_attached_compose_up,) + tuple(re.compile(p, re.IGNORECASE).search for p in (
     r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|start|serve|watch)\b",
-    r"\bdocker\s+compose\s+up\b",
     r"\bnext\s+dev\b",
     r"\bvite(?:\s|$)",
     r"\bnodemon\b",
@@ -113,7 +154,7 @@ _FOREGROUND_GUIDANCE = (
         "for bounded jobs — then run health checks and tests in follow-up terminal calls.",
     ),
     (
-        lambda s: any(p.search(s) for p in _LONG_LIVED_FOREGROUND_PATTERNS),
+        lambda s: any(hit(s) for hit in _LONG_LIVED_FOREGROUND_PATTERNS),
         "This foreground command appears to start a long-lived server/watch process. "
         "Run it with background=true, verify readiness (health endpoint/log signal), "
         "then execute tests in a separate command.",
