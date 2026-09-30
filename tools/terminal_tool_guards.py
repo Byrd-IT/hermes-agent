@@ -86,10 +86,10 @@ def _strip_quotes(command: str) -> str:
     return re.sub(r"`[^`]*`", "``", result)
 
 
-_COMPOSE_UP_RE = re.compile(r"\bdocker\s+compose\s+up\b", re.IGNORECASE)
-# End of one simple command: ; | || && & or newline, but not the & of a
-# redirect (2>&1, &>file), which belongs to the same command.
-_SIMPLE_COMMAND_END_RE = re.compile(r"[;|\n]|(?<![<>])&(?!>)")
+# End of one simple command: ; | || && & newline or a subshell/group
+# paren, but not the & of a redirect (2>&1, &>file), which belongs to the
+# same command.
+_SIMPLE_COMMAND_END_RE = re.compile(r"[;|\n()]|(?<![<>])&(?!>)")
 # `up` flags that take no value, so they may be clustered (-dV).
 _COMPOSE_UP_BOOL_SHORT_FLAGS = "dVwy"
 
@@ -114,29 +114,137 @@ def _compose_up_is_detached(args: list[str]) -> bool:
     return detached
 
 
-def _attached_compose_up(unquoted: str) -> bool:
-    """True when any `docker compose up` in *unquoted* stays attached.
+# The long-lived check looks only at the COMMAND POSITION of each simple
+# command, so `grep uvicorn ...`, `ls .../uvicorn/...` or `ps | grep serve`
+# (read-only, argument-only mentions) are never mistaken for a server start.
+_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_REDIRECT_RE = re.compile(r"\d*(?:>>?|<<?<?|>&|<&|&>>?)")
+# Reserved words / prefixes that precede the real command word.
+_COMMAND_PREFIX_WORDS = frozenset((
+    "!", "{", "}", "if", "then", "elif", "else", "while", "until", "do",
+    "time", "exec", "command", "builtin", "caffeinate",
+))
+# Wrappers that run their argv tail as the command; value is the set of
+# short/long options that consume a following value.
+_COMMAND_WRAPPERS = {
+    "sudo": frozenset(("-u", "-g", "-h", "-p", "-C", "-U", "-r", "-t", "-D", "-R", "-T",
+                       "--user", "--group", "--host", "--prompt", "--chdir", "--role", "--type")),
+    "doas": frozenset(("-u", "-C")),
+    "env": frozenset(("-u", "-C", "-S", "--unset", "--chdir", "--split-string")),
+    "nice": frozenset(("-n", "--adjustment")),
+    "ionice": frozenset(("-c", "-n", "-p", "--class", "--classdata")),
+    "stdbuf": frozenset(("-i", "-o", "-e")),
+    "timeout": frozenset(("-s", "-k", "--signal", "--kill-after")),
+}
+# `<launcher> <sub> <cmd...>` style runners that exec a named program.
+_RUNNER_SUBCOMMANDS = {
+    "poetry": frozenset(("run",)), "uv": frozenset(("run",)), "pipenv": frozenset(("run",)),
+    "pdm": frozenset(("run",)), "hatch": frozenset(("run",)), "rye": frozenset(("run",)),
+    "npm": frozenset(("exec", "x")), "pnpm": frozenset(("exec", "dlx")),
+    "yarn": frozenset(("exec", "dlx")), "bun": frozenset(("x", "exec")),
+}
+_NPX_LIKE = frozenset(("npx", "bunx", "pnpx"))
+_SCRIPT_RUNNERS = frozenset(("npm", "pnpm", "yarn", "bun"))
+_LONG_LIVED_SCRIPT_RE = re.compile(r"(?:dev|start|serve|watch)\b", re.IGNORECASE)
+_ALWAYS_LONG_LIVED_BINARIES = frozenset(("nodemon", "uvicorn", "gunicorn", "hypercorn", "daphne"))
+_LONG_LIVED_PYTHON_MODULES = frozenset(("http.server", "uvicorn", "gunicorn", "hypercorn", "daphne"))
+_PYTHON_RE = re.compile(r"python(?:\d+(?:\.\d+)?)?")
+_VITE_BOUNDED_SUBCOMMANDS = frozenset(("build", "optimize"))
 
-    A detached start returns in seconds, so it is not a long-lived process
-    and must not be pushed to background=true.
-    """
-    for match in _COMPOSE_UP_RE.finditer(unquoted):
-        rest = unquoted[match.end():]
-        end = _SIMPLE_COMMAND_END_RE.search(rest)
-        if not _compose_up_is_detached(rest[: end.start() if end else len(rest)].split()):
+
+def _strip_command_prefix(words: list[str]) -> tuple[list[str], bool]:
+    """Drop assignments, redirections, reserved words and wrapper commands
+    (with their options) until the real command word is first.
+
+    Also returns whether a ``timeout`` wrapper bounds the command: a
+    foreground ``timeout 30 tail -f log`` cannot hang, so it is never
+    long-lived."""
+    i = 0
+    bounded = False
+    while i < len(words):
+        word = words[i]
+        if word in _COMMAND_PREFIX_WORDS or _ASSIGNMENT_RE.match(word):
+            i += 1
+            continue
+        redirect = _REDIRECT_RE.match(word)
+        if redirect:
+            # `>file` carries its target; a bare `>` takes the next word.
+            i += 1 if redirect.end() < len(word) else 2
+            continue
+        name = word.rsplit("/", 1)[-1]
+        if name in _COMMAND_WRAPPERS:
+            value_opts = _COMMAND_WRAPPERS[name]
+            i += 1
+            while i < len(words) and (words[i].startswith("-") or (name == "env" and _ASSIGNMENT_RE.match(words[i]))):
+                i += 2 if words[i] in value_opts else 1
+            if name == "timeout" and i < len(words):
+                i += 1  # the DURATION operand
+                bounded = True
+            continue
+        break
+    return words[i:], bounded
+
+
+def _argv_is_long_lived(words: list[str], depth: int = 0) -> bool:
+    """True when the command word of *words* starts a server/watch process."""
+    words, bounded = _strip_command_prefix(words)
+    if not words or bounded or depth > 4:
+        return False
+    name = words[0].rsplit("/", 1)[-1].lower()
+    args = words[1:]
+    if name in _ALWAYS_LONG_LIVED_BINARIES:
+        return True
+    if name == "vite":
+        return not (args and args[0].lower() in _VITE_BOUNDED_SUBCOMMANDS)
+    if name == "next":
+        return bool(args) and args[0].lower() == "dev"
+    if name == "tail":
+        return any(a in ("-f", "-F", "--follow") or a.startswith("--follow=")
+                   or re.fullmatch(r"-[A-Za-z0-9]*[fF][A-Za-z0-9]*", a) is not None
+                   for a in args)
+    if name == "docker-compose":
+        return bool(args) and args[0] == "up" and not _compose_up_is_detached(args[1:])
+    if name == "docker":
+        return (len(args) >= 2 and args[0] == "compose" and args[1] == "up"
+                and not _compose_up_is_detached(args[2:]))
+    if _PYTHON_RE.fullmatch(name):
+        for idx, arg in enumerate(args):
+            if arg == "-m":
+                return idx + 1 < len(args) and args[idx + 1] in _LONG_LIVED_PYTHON_MODULES
+            if not arg.startswith("-"):
+                return False  # a script path: `python server.py` is not judged here
+        return False
+    if name in _NPX_LIKE:
+        tail = list(args)
+        while tail and tail[0].startswith("-"):
+            tail.pop(0)
+        return _argv_is_long_lived(tail, depth + 1)
+    if name in _RUNNER_SUBCOMMANDS and args and args[0] in _RUNNER_SUBCOMMANDS[name]:
+        tail = args[1:]
+        while tail and tail[0].startswith("-"):
+            tail = tail[1:]
+        return _argv_is_long_lived(tail, depth + 1)
+    if name in _SCRIPT_RUNNERS and args:
+        script = args[1] if args[0] == "run" and len(args) > 1 else args[0]
+        if _LONG_LIVED_SCRIPT_RE.match(script):
             return True
+        # `yarn vite`, `pnpm nodemon`, `bun uvicorn`: a bin run directly.
+        return name != "npm" and _argv_is_long_lived(args, depth + 1)
     return False
 
 
-_LONG_LIVED_FOREGROUND_PATTERNS = (_attached_compose_up,) + tuple(re.compile(p, re.IGNORECASE).search for p in (
-    r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|start|serve|watch)\b",
-    r"\bnext\s+dev\b",
-    r"\bvite(?:\s|$)",
-    r"\bnodemon\b",
-    r"\buvicorn\b",
-    r"\bgunicorn\b",
-    r"\bpython(?:3)?\s+-m\s+http\.server\b",
-))
+def _starts_long_lived_process(unquoted: str) -> bool:
+    """True when any simple command in *unquoted* starts a server/watch process.
+
+    Only the command word of each ``;``/``|``/``&&``/``||``/``&``/newline/
+    subshell segment is judged; a keyword in an argument (grep pattern, path,
+    ps filter) never counts.
+    """
+    return any(_argv_is_long_lived(segment.split())
+               for segment in _SIMPLE_COMMAND_END_RE.split(unquoted))
+
+
+_LONG_LIVED_FOREGROUND_PATTERNS = (_starts_long_lived_process,)
 
 # Ordered (predicate on the unquoted command, guidance) — first hit wins.
 _FOREGROUND_GUIDANCE = (

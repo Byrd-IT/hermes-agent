@@ -112,3 +112,62 @@ class TestDetachedContainerStartsAllowed:
     def test_detach_flag_inside_quotes_does_not_count(self):
         msg = _foreground_background_guidance("docker compose up web --label 'x -d'")
         assert msg is not None and LONG_LIVED in msg
+
+
+VENV = "/home/x/.venv/lib/python3.11/site-packages"
+
+
+class TestLongLivedGuardAnchoredToCommandWord:
+    """Only the command word of each simple command is judged (t_259c6086):
+    server names in grep patterns, paths or ps filters are read-only."""
+
+    def test_read_only_mentions_run_in_foreground(self):
+        # The four commands refused on S3 in t_d8b61605.
+        for cmd in (
+            f"grep -n 'legacy\\|ping_interval' {VENV}/uvicorn/protocols/websockets/websockets_impl.py",
+            f"ps -o pid,lstart,cmd -p 2538370; ss -tnp | grep 'pid=2538370,'; grep -n ping {VENV}/uvicorn/config.py",
+            f'grep -n "import\\|return" {VENV}/uvicorn/protocols/websockets/auto.py',
+            "grep -rn -E 'websockets\\.serve\\(|uvicorn\\.run' /usr/local/lib/hermes-agent",
+            # Unquoted keyword arguments are still arguments.
+            "grep -rn -E websockets.serve /usr/local/lib/hermes-agent",
+            "ps aux | grep uvicorn",
+            "pgrep -af gunicorn",
+            "ls tools/vite plugins",
+            "cat docker-compose.yml | grep nodemon",
+            "pip show uvicorn",
+            "vite build",
+            "npx vite build",
+            "tail -n 50 /var/log/syslog",
+            "timeout 20 tail -f /var/log/syslog",
+        ):
+            assert _foreground_background_guidance(cmd) is None, cmd
+
+    def test_server_starts_still_blocked(self):
+        for cmd in (
+            "uvicorn app:app",
+            "/opt/venv/bin/uvicorn app:app --reload",
+            "FOO=1 uvicorn app:app --port 8000",
+            "python -m http.server",
+            "python3 -m http.server 8000",
+            "python3 -m uvicorn app:app",
+            "tail -f /var/log/syslog",
+            "tail -n 20 -F app.log",
+            "npm run dev",
+            "cd web && npm run dev",
+            "npm start",
+            "yarn dev",
+            "pnpm run watch",
+            "sudo gunicorn app:app",
+            "sudo -u www gunicorn app:app",
+            "env X=1 vite",
+            "npx vite",
+            "poetry run uvicorn app:app",
+            "uv run uvicorn app:app",
+            "next dev",
+            "nodemon app.js",
+            "(cd web && vite)",
+            "ls; uvicorn app:app",
+            "docker-compose up",
+        ):
+            msg = _foreground_background_guidance(cmd)
+            assert msg is not None and LONG_LIVED in msg, cmd
