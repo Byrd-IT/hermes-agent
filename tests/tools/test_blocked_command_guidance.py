@@ -91,6 +91,14 @@ class TestDetachedContainerStartsAllowed:
             "docker compose up --detach=true",
             "docker compose pull && docker compose up -d && docker compose ps",
             "docker run -d --name web nginx",
+            # The two commands refused on S3 (t_c3a15280, t_49763c64).
+            "cd ~/firecrawl && docker compose up -d --no-deps api > $TMPDIR/up.log 2>&1",
+            "cd ~/firecrawl && docker compose up -d --no-deps api 2>&1 | grep -v Pulling",
+            # Compose global options before `up`.
+            "docker compose -f docker-compose.prod.yml up -d api",
+            "docker compose --project-directory /opt/app -p app --profile web up --detach",
+            "docker compose --file=a.yml up --wait",
+            "sudo docker-compose -f a.yml up -d",
         ):
             assert _foreground_background_guidance(cmd) is None, cmd
 
@@ -105,6 +113,10 @@ class TestDetachedContainerStartsAllowed:
             "docker compose up -d db; docker compose up web",
             # -d belongs to the next command, not to `up`.
             "docker compose up && docker ps -d",
+            # Attached even with compose global options before `up`.
+            "docker compose -f docker-compose.prod.yml up api",
+            "docker compose -p app --env-file .env up",
+            "docker-compose --file a.yml up",
         ):
             msg = _foreground_background_guidance(cmd)
             assert msg is not None and LONG_LIVED in msg, cmd

@@ -114,6 +114,22 @@ def _compose_up_is_detached(args: list[str]) -> bool:
     return detached
 
 
+# Compose global options that take a separate value (`-f a.yml up`).
+_COMPOSE_GLOBAL_VALUE_OPTS = frozenset((
+    "-f", "--file", "-p", "--project-name", "--project-directory", "--env-file",
+    "--profile", "--ansi", "--progress", "--parallel",
+))
+
+
+def _compose_starts_attached_up(args: list[str]) -> bool:
+    """True when compose *args* (after `docker compose`/`docker-compose`)
+    run an attached `up`; global options before the subcommand are skipped."""
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        i += 2 if args[i] in _COMPOSE_GLOBAL_VALUE_OPTS else 1
+    return i < len(args) and args[i] == "up" and not _compose_up_is_detached(args[i + 1:])
+
+
 # The long-lived check looks only at the COMMAND POSITION of each simple
 # command, so `grep uvicorn ...`, `ls .../uvicorn/...` or `ps | grep serve`
 # (read-only, argument-only mentions) are never mistaken for a server start.
@@ -203,10 +219,9 @@ def _argv_is_long_lived(words: list[str], depth: int = 0) -> bool:
                    or re.fullmatch(r"-[A-Za-z0-9]*[fF][A-Za-z0-9]*", a) is not None
                    for a in args)
     if name == "docker-compose":
-        return bool(args) and args[0] == "up" and not _compose_up_is_detached(args[1:])
+        return _compose_starts_attached_up(args)
     if name == "docker":
-        return (len(args) >= 2 and args[0] == "compose" and args[1] == "up"
-                and not _compose_up_is_detached(args[2:]))
+        return bool(args) and args[0] == "compose" and _compose_starts_attached_up(args[1:])
     if _PYTHON_RE.fullmatch(name):
         for idx, arg in enumerate(args):
             if arg == "-m":
