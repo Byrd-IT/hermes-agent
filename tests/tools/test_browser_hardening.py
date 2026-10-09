@@ -75,11 +75,11 @@ class TestChromiumSandboxArgs:
         self.session._apply_chromium_sandbox_args(env)
         assert env["AGENT_BROWSER_ARGS"] == "--foo,--no-sandbox,--disable-dev-shm-usage"
 
-    def test_legacy_chrome_flags_count_as_present(self):
+    def test_legacy_chrome_flags_do_not_count_as_delivered(self):
+        # agent-browser never reads AGENT_BROWSER_CHROME_FLAGS; only AGENT_BROWSER_ARGS reaches Chromium.
         env = {"AGENT_BROWSER_CHROME_FLAGS": "--no-sandbox"}
         self.session._apply_chromium_sandbox_args(env)
-        assert env["AGENT_BROWSER_CHROME_FLAGS"] == "--no-sandbox"
-        assert env["AGENT_BROWSER_ARGS"] == "--disable-dev-shm-usage"
+        assert env["AGENT_BROWSER_ARGS"] == "--no-sandbox,--disable-dev-shm-usage"
 
 
 # ---------------------------------------------------------------------------

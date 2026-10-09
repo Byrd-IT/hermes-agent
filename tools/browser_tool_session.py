@@ -61,13 +61,14 @@ def _apply_chromium_sandbox_args(browser_env: dict[str, str]) -> None:
     """Append host-required Chromium sandbox flags, keeping any user launch flags."""
     if not _needs_chromium_sandbox_bypass():
         return
-    current = "\n".join(browser_env.get(key, "") for key in ("AGENT_BROWSER_ARGS", "AGENT_BROWSER_CHROME_FLAGS"))
-    present = set(filter(None, re.split(r"[\s,]+", current)))
+    # Only AGENT_BROWSER_ARGS reaches Chromium: agent-browser has no AGENT_BROWSER_CHROME_FLAGS
+    # input, so a flag set only there was never delivered and must not suppress the bypass.
+    existing = browser_env.get("AGENT_BROWSER_ARGS", "")
+    present = set(filter(None, re.split(r"[\s,]+", existing)))
     missing = [flag for flag in CHROMIUM_SANDBOX_BYPASS_ARGS if flag not in present]
     if not missing:
         return
     _bt.logger.debug("browser: sandbox bypass needed (root/docker/AppArmor userns) — adding %s", ",".join(missing))
-    existing = browser_env.get("AGENT_BROWSER_ARGS", "")
     browser_env["AGENT_BROWSER_ARGS"] = ",".join(part for part in (existing, *missing) if part)
 
 
