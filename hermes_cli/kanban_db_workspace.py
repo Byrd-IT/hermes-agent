@@ -7,6 +7,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -248,8 +249,43 @@ def _lexical_path(path: Path | str) -> Path:
     return Path(_path_key(os.path.abspath(path)))
 
 
+def _board_json_scratch_settings(board_dir: Path) -> tuple[Optional[Path], Optional[Path]]:
+    """``(configured workspaces_root, resolved default_workdir)`` from a board
+    dir's ``board.json``; either is ``None`` when unset, unsafe or unreadable.
+    Read from disk, never the env, so every process sees the same settings."""
+    try:
+        raw = json.loads((board_dir / "board.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None, None
+    if not isinstance(raw, dict):
+        return None, None
+    configured = _kb.board_configured_workspaces_root({**raw, "slug": board_dir.name})
+    workdir: Optional[Path] = None
+    value = raw.get("default_workdir")
+    if isinstance(value, str) and value.strip():
+        with contextlib.suppress(OSError, RuntimeError):
+            workdir = Path(value.strip()).expanduser().resolve(strict=False)
+    return configured, workdir
+
+
+def _overlaps_workdir_inside_root(p_abs: Path, root: Path, workdirs: list[Path]) -> bool:
+    """True when *p_abs* contains, equals or sits inside a board ``default_workdir``
+    that itself lies under *root*: removing it would delete a source tree (#28818).
+    A workdir outside the root (or an ancestor of it) never vetoes a task dir."""
+    return any(
+        w.is_relative_to(root) and (p_abs.is_relative_to(w) or w.is_relative_to(p_abs))
+        for w in workdirs
+    )
+
+
 def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
     """Return whether *p* is managed scratch storage and the matching board.
+
+    Managed roots: ``HERMES_KANBAN_WORKSPACES_ROOT`` (when this process carries
+    it), ``<kanban_home>/kanban/workspaces``, ``<kanban_home>/kanban/boards/<slug>/workspaces``
+    and each board's persistent ``board.json`` ``workspaces_root``. The last
+    one makes the answer independent of per-process env: the CLI and the
+    dashboard see the same roots as the dispatcher's workers.
 
     *p* must be strictly below a managed root both after resolving symlinks
     AND lexically (as spelled, without resolving). Resolved containment alone
@@ -259,9 +295,11 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
     directly would get it rmtree'd. Tasks created through the root are spelled
     through it, so the lexical check keeps them managed. A root's lexical form
     is accepted both as configured and with its anchor (kanban home, or the
-    override's parent) resolved, so a process spelling a symlinked home by its
-    real path still matches; the managed ``kanban/.../workspaces`` components
-    themselves are never resolved for the lexical check.
+    configured root's parent) resolved, so a process spelling a symlinked home
+    by its real path still matches; the managed ``kanban/.../workspaces``
+    components themselves are never resolved for the lexical check. A path
+    overlapping a board ``default_workdir`` that lies under the root is never
+    managed (#28818).
     """
     try:
         p_abs = p.resolve(strict=False)
@@ -270,6 +308,7 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
     p_lex = _lexical_path(p)
     # (resolved root, lexical spellings of the root, board)
     roots: list[tuple[Path, tuple[Path, ...], Optional[str]]] = []
+    workdirs: list[Path] = []
 
     def _add_root(
         anchor: Path, anchor_real: Path, parts: tuple[str, ...], board: Optional[str]
@@ -282,17 +321,13 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
                 board,
             ))
 
+    def _add_named_root(root: Path, board: Optional[str]) -> None:
+        with contextlib.suppress(OSError):
+            _add_root(root.parent, root.parent.resolve(strict=False), (root.name,), board)
+
     override = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
     if override:
-        override_root = Path(override).expanduser()
-        with contextlib.suppress(OSError):
-            override_parent = override_root.parent
-            _add_root(
-                override_parent,
-                override_parent.resolve(strict=False),
-                (override_root.name,),
-                None,
-            )
+        _add_named_root(Path(override).expanduser(), None)
     try:
         home = _kb.kanban_home()
         # Resolve the shared anchor once, not once per board root.
@@ -310,12 +345,19 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
                     _add_root(
                         home, home_real, ("kanban", "boards", entry.name, "workspaces"), entry.name
                     )
+                    configured, workdir = _board_json_scratch_settings(entry)
+                    if configured is not None:
+                        _add_named_root(configured, entry.name)
+                    if workdir is not None:
+                        workdirs.append(workdir)
     for root, lexical_roots, board in roots:
         if p_abs == root:
             continue
         try:
-            if p_abs.is_relative_to(root) and any(
-                p_lex != lex and p_lex.is_relative_to(lex) for lex in lexical_roots
+            if (
+                p_abs.is_relative_to(root)
+                and any(p_lex != lex and p_lex.is_relative_to(lex) for lex in lexical_roots)
+                and not _overlaps_workdir_inside_root(p_abs, root, workdirs)
             ):
                 return True, board
         except ValueError:
@@ -337,7 +379,8 @@ def _scratch_workspace(conn: sqlite3.Connection, task_id: str) -> Optional[Path]
 def _is_managed_scratch_path(p: Path) -> bool:
     """True iff *p* is a STRICT descendant of a kanban-managed ``workspaces/``
     root (``HERMES_KANBAN_WORKSPACES_ROOT``, ``<kanban_home>/kanban/workspaces``,
-    or ``<kanban_home>/kanban/boards/<slug>/workspaces``). A path equal to a
+    ``<kanban_home>/kanban/boards/<slug>/workspaces``, or a board's
+    ``board.json`` ``workspaces_root``). A path equal to a
     root is not managed (deleting it would wipe every task's scratch dir);
     ``<kanban_home>/kanban``, ``.../logs`` and ``.../boards/<slug>`` hold
     Hermes' own DB and metadata. :func:`_cleanup_workspace` refuses

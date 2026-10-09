@@ -589,9 +589,25 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
 
 
 def workspaces_root(board: Optional[str] = None) -> Path:
-    """Per-board scratch workspace root (``HERMES_KANBAN_WORKSPACES_ROOT`` wins);
-    ``default`` keeps the legacy ``<root>/kanban/workspaces/``."""
-    return _board_path("HERMES_KANBAN_WORKSPACES_ROOT", board, ("kanban", "workspaces"), "workspaces")
+    """Per-board scratch workspace root. ``HERMES_KANBAN_WORKSPACES_ROOT`` wins
+    (same precedence as :func:`_board_path`), then the board's persistent
+    ``workspaces_root`` in ``board.json``, then ``default``'s legacy
+    ``<root>/kanban/workspaces/`` or ``boards/<slug>/workspaces/``.
+
+    The board.json setting exists so every process (gateway, dashboard, a
+    one-off ``hermes kanban archive``) agrees on the root; an env pin only
+    reaches the processes that carry it, and the scratch cleanup guard
+    refuses dirs under a root it cannot see."""
+    pin = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
+    slug = _explicit_board_slug(board)
+    if pin and (slug is None or _explicit_board_intent_pinned()):
+        return Path(pin).expanduser()
+    configured = board_configured_workspaces_root(
+        read_board_metadata(slug if slug is not None else get_current_board())
+    )
+    if configured is not None:
+        return configured
+    return _board_path(None, board, ("kanban", "workspaces"), "workspaces")
 
 
 def attachments_root(board: Optional[str] = None) -> Path:
@@ -609,97 +625,6 @@ def worker_logs_dir(board: Optional[str] = None) -> Path:
     """Per-board worker log dir (logs follow the board so ``hermes kanban log``
     is unambiguous when two boards share a task id)."""
     return _board_path(None, board, ("kanban", "logs"), "logs")
-
-
-def board_metadata_path(board: Optional[str] = None) -> Path:
-    """``board.json`` path — display metadata only; the directory slug is the identity."""
-    return board_dir(_slug_or_default(board)) / "board.json"
-
-
-def _default_board_display_name(slug: str) -> str:
-    """``atm10-server`` -> ``Atm10 Server``."""
-    return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
-
-
-def read_board_metadata(board: Optional[str] = None) -> dict:
-    """``board.json`` merged over defaults, plus ``slug`` and ``db_path``. Never
-    raises — a missing/malformed file yields the synthesized entry."""
-    slug = _slug_or_default(board)
-    meta: dict[str, Any] = {
-        "slug": slug,
-        "name": _default_board_display_name(slug),
-        "description": "",
-        "icon": "",
-        "color": "",
-        "default_workdir": None,
-        # Project scope: new tasks inherit it (deterministic worktree + branch).
-        "project_id": None,
-        "created_at": None,
-        "archived": False,
-    }
-    try:
-        p = board_metadata_path(slug)
-        if p.exists():
-            raw = json.loads(p.read_text(encoding="utf-8-sig"))
-            if isinstance(raw, dict):
-                # Never let the metadata file claim a different slug than
-                # its directory — trust the filesystem.
-                raw["slug"] = slug
-                meta.update(raw)
-    except (OSError, json.JSONDecodeError):
-        pass
-    meta["db_path"] = str(kanban_db_path(slug))
-    return meta
-
-
-def write_board_metadata(
-    board: Optional[str], *, name: Optional[str] = None, description: Optional[str] = None,
-    icon: Optional[str] = None, color: Optional[str] = None, archived: Optional[bool] = None,
-    default_workdir: Optional[str] = None, project_id: Optional[str] = None,
-) -> dict:
-    """Create/update ``board.json``; unmentioned fields are preserved, ``created_at``
-    set on first write. ``project_id``/``default_workdir``: ``None`` = unchanged,
-    "" = clear (``project_id`` is not validated here)."""
-    _assert_not_delegated_child_mutation()
-    slug = _slug_or_default(board)
-    meta = read_board_metadata(slug)
-    # db_path is derived on every read; never persist it into board.json.
-    meta.pop("db_path", None)
-    if name is not None:
-        meta["name"] = str(name).strip() or _default_board_display_name(slug)
-    for key, value in (("description", description), ("icon", icon), ("color", color)):
-        if value is not None:
-            meta[key] = str(value)
-    if archived is not None:
-        meta["archived"] = bool(archived)
-    for key, value in (("default_workdir", default_workdir), ("project_id", project_id)):
-        if value is not None:
-            meta[key] = str(value) if value else None
-    if not meta.get("created_at"):
-        meta["created_at"] = int(time.time())
-    path = board_metadata_path(slug)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
-    )
-    meta["db_path"] = str(kanban_db_path(slug))
-    return meta
-
-
-def create_board(
-    slug: str, *, name: Optional[str] = None, description: Optional[str] = None,
-    icon: Optional[str] = None, color: Optional[str] = None, default_workdir: Optional[str] = None,
-    project_id: Optional[str] = None,
-) -> dict:
-    """Create board dir + DB + metadata (``mkdir -p`` semantics: existing board returns its metadata)."""
-    normed = _require_slug(slug)
-    meta = write_board_metadata(
-        normed, name=name, description=description, icon=icon, color=color,
-        default_workdir=default_workdir, project_id=project_id,
-    )
-    # Touch the DB so list_boards() sees it immediately.
-    init_db(board=normed)
-    return meta
 
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:
@@ -4563,6 +4488,15 @@ from hermes_cli.kanban_db_connect import (  # noqa: E402
     _INITIALIZED_PATHS,
     init_db,
     write_txn,
+)
+from hermes_cli.kanban_db_boards import (  # noqa: E402
+    _default_board_display_name,
+    board_configured_workspaces_root,
+    board_metadata_path,
+    create_board,
+    read_board_metadata,
+    workspaces_root_rejection,
+    write_board_metadata,
 )
 from hermes_cli.kanban_db_workspace import (  # noqa: E402
     _cleanup_workspace,

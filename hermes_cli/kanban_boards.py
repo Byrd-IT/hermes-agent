@@ -155,6 +155,22 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_boards_set_workspaces_root(args: argparse.Namespace) -> int:
+    normed, rc = _board_slug_arg(args, "set-workspaces-root", must_exist=True)
+    if rc:
+        return rc
+    try:
+        meta = kb.write_board_metadata(normed, workspaces_root=args.path or "")
+    except ValueError as exc:
+        return _err(f"kanban boards set-workspaces-root: {exc}", 2)
+    new_val = meta.get("workspaces_root")
+    if new_val:
+        print(f"Board {normed!r} scratch workspaces root set to {new_val!r}.")
+    else:
+        print(f"Board {normed!r} scratch workspaces root cleared (built-in default).")
+    return 0
+
+
 def _cmd_boards_export(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_transfer
     from hermes_cli.sizefmt import format_bytes
@@ -209,6 +225,7 @@ _BOARD_HANDLERS = {
     "show": _cmd_boards_show, "current": _cmd_boards_show,
     "rename": _cmd_boards_rename,
     "set-default-workdir": _cmd_boards_set_default_workdir,
+    "set-workspaces-root": _cmd_boards_set_workspaces_root,
     "export": _cmd_boards_export,
     "import": _cmd_boards_import,
 }

@@ -122,6 +122,11 @@ _BOARD_SPECS = [
         _SLUG,
         _arg("path", nargs="?", help="Absolute path to use as default workdir. Omit to clear."),
     ], help="Set the default workspace path for tasks on a board"),
+    _cmd("set-workspaces-root", [
+        _SLUG,
+        _arg("path", nargs="?",
+             help="Absolute directory that holds this board's scratch workspaces. Omit to clear."),
+    ], help="Persist a board's scratch workspaces root in board.json (seen by every process)"),
     _cmd("export", [
         _arg("slug", nargs="?", help="Board to export (default: the current board)"),
         _arg("-o", "--output", help="Archive path (default: ./<slug>.tar.gz)"),

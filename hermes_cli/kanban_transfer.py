@@ -150,6 +150,7 @@ def export_board(
         meta.pop("db_path", None)
         meta["default_workdir"] = None
         meta["project_id"] = None
+        meta.pop("workspaces_root", None)
         _write_json(staged / "board.json", meta)
 
         attachments = copy_regular_files(kb.attachments_root(slug), staged / "attachments") if include_attachments else 0
