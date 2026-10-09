@@ -300,6 +300,12 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
     components themselves are never resolved for the lexical check. A path
     overlapping a board ``default_workdir`` that lies under the root is never
     managed (#28818).
+
+    Roots may overlap (a board root nested in another, or the env root nesting
+    with a configured one). A path that equals or contains ANY managed root,
+    resolved or lexically, is never managed, even when an outer root contains
+    it. Removing it would delete every task dir under the inner root. A task dir
+    under nested roots belongs to the innermost root's board.
     """
     try:
         p_abs = p.resolve(strict=False)
@@ -350,18 +356,29 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
                         _add_named_root(configured, entry.name)
                     if workdir is not None:
                         workdirs.append(workdir)
+    # Global veto, checked against EVERY root before any containment match: a
+    # path equal to a managed root, or containing one, holds other tasks'
+    # scratch dirs. Roots may nest (board a's root an ancestor of board b's,
+    # or the env root overlapping a configured one), so a per-root check
+    # would let the outer root "contain" the inner root and remove it whole.
+    for root, lexical_roots, _board in roots:
+        if root.is_relative_to(p_abs) or any(lex.is_relative_to(p_lex) for lex in lexical_roots):
+            return False, None
+    match: Optional[tuple[Path, Optional[str]]] = None
     for root, lexical_roots, board in roots:
-        if p_abs == root:
-            continue
         try:
             if (
                 p_abs.is_relative_to(root)
-                and any(p_lex != lex and p_lex.is_relative_to(lex) for lex in lexical_roots)
+                and any(p_lex.is_relative_to(lex) for lex in lexical_roots)
                 and not _overlaps_workdir_inside_root(p_abs, root, workdirs)
+                # Nested roots: the innermost one owns the path.
+                and (match is None or len(root.parts) > len(match[0].parts))
             ):
-                return True, board
+                match = (root, board)
         except ValueError:
             continue
+    if match is not None:
+        return True, match[1]
     return False, None
 
 
