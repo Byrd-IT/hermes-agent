@@ -1,9 +1,10 @@
-"""Default Kanban scratch roots live beside the dot-prefixed Hermes home.
+"""Default Kanban scratch roots live beside a dot-prefixed Hermes home.
 
 Web-framework file senders reject an absolute path with a dot-directory
-ancestor, so scratch workspaces default to
-``<kanban-home-parent>/hermes-workspaces/<slug>`` instead of a path below
-``~/.hermes``. The legacy ``kanban/.../workspaces`` roots stay managed.
+ancestor, so when the kanban home is below one (``~/.hermes``) scratch
+workspaces default to ``<kanban-home-parent>/hermes-workspaces/<slug>``.
+Any other home (a container's ``/opt/data``) keeps the legacy
+``kanban/.../workspaces`` roots, which also stay managed for older tasks.
 """
 
 from __future__ import annotations
@@ -47,6 +48,23 @@ def test_default_scratch_root_has_no_dot_dir_ancestor(kanban_home, tmp_path):
         assert root == kbw.default_workspaces_root(board)
         assert root.is_relative_to(tmp_path)
         assert not any(part.startswith(".") for part in root.relative_to(tmp_path).parts)
+
+
+@pytest.mark.parametrize(
+    ("home", "default_root", "ops_root"),
+    [
+        ("/srv/u/.hermes", "/srv/u/hermes-workspaces/default", "/srv/u/hermes-workspaces/ops"),
+        ("/opt/data", "/opt/data/kanban/workspaces", "/opt/data/kanban/boards/ops/workspaces"),
+    ],
+)
+def test_scratch_root_moves_only_for_a_dot_dir_home(monkeypatch, home, default_root, ops_root):
+    """Only a home below a dot-directory moves scratch beside it; any other home
+    keeps the legacy roots, since its parent (root-owned ``/opt`` in the Docker
+    image) may be unwritable or outside the data volume."""
+    monkeypatch.setenv("HERMES_KANBAN_HOME", home)
+    monkeypatch.delenv("HERMES_KANBAN_WORKSPACES_ROOT", raising=False)
+    assert kb.workspaces_root(board=kb.DEFAULT_BOARD) == Path(default_root)
+    assert kb.workspaces_root(board="ops") == Path(ops_root)
 
 
 def test_archived_boards_dir_does_not_break_scratch_cleanup(kanban_home):
