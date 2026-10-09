@@ -68,7 +68,10 @@ hermes_compose_env() {
         echo "no bootstrap Python found; run setup-hermes.sh" >&2
         return 1
     }
-    script="$(PYTHONHOME= PYTHONPATH="$repo" "$python" -m pm.environments --format "$dialect")" &&
+    # -P: `python -m` puts the CWD ahead of PYTHONPATH, so composing from inside
+    # another checkout (run_tests.sh <this-checkout>/... from a different tree)
+    # would import THAT checkout's pm and describe its install, not this one.
+    script="$(PYTHONHOME= PYTHONPATH="$repo" "$python" -P -m pm.environments --format "$dialect")" &&
         [ -n "$script" ] || {
         echo "could not read pm env (run ./setup-hermes.sh first)" >&2
         return 1
