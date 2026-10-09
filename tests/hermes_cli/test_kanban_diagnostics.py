@@ -86,7 +86,8 @@ def test_running_with_open_parents_fires_only_while_running():
     """A running card whose parent is not terminal is flagged; the same graph
     on a ready/todo card (the gate is holding it) and a done parent are not."""
     graph = {"parents": [{"id": "t_parent", "title": "p", "status": "todo"}], "children": []}
-    diags = kd.compute_task_diagnostics(_task(status="running", started_at=100), [], [], graph=graph)
+    # Freshly started, so the run is not also flagged for missing liveness.
+    diags = kd.compute_task_diagnostics(_task(status="running", started_at=int(time.time())), [], [], graph=graph)
     assert [d.kind for d in diags] == ["running_with_open_parents"]
     assert diags[0].data["open_parents"] == [{"id": "t_parent", "status": "todo"}]
     assert "hermes kanban unlink t_parent t_demo00" in diags[0].actions[0].payload["command"]
@@ -253,6 +254,35 @@ def test_running_liveness_reports_unavailable_heartbeat_without_zero_age(monkeyp
     assert "heartbeat timestamp unavailable" in liveness[0].detail.lower()
     assert "for 0s" not in liveness[0].detail.lower()
     assert liveness[0].data["heartbeat_age_seconds"] is None
+
+
+def test_running_liveness_never_reports_runtime_as_heartbeat_age():
+    """A record that never heartbeated is stale by runtime, not by heartbeat age.
+
+    The time since ``started_at`` must surface as its own field and wording so
+    a dashboard cannot read a runtime as the age of a heartbeat that never
+    happened (the dispatcher keeps the two apart the same way).
+    """
+    now = 100_000
+    task = _task(
+        status="running",
+        claim_lock="other-host:123",
+        worker_pid=4242,
+        started_at=now - 2 * 3600,
+        last_heartbeat_at=None,
+    )
+
+    diags = kd.compute_task_diagnostics(task, [], [], now=now)
+    liveness = [d for d in diags if d.kind == "running_liveness_stale"]
+
+    assert len(liveness) == 1
+    data = liveness[0].data
+    assert data["heartbeat_age_seconds"] is None
+    assert data["running_age_seconds"] == now - task["started_at"]
+    assert data["heartbeat_stale"] is True
+    detail = liveness[0].detail.lower()
+    assert "no fresh heartbeat for" not in detail
+    assert f"no heartbeat recorded; running for {data['running_age_seconds']}s" in detail
 
 
 # ---------------------------------------------------------------------------
