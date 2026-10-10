@@ -260,6 +260,13 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
 class A2AAdapter(BasePlatformAdapter):
     """Inbound A2A server adapter."""
 
+    # An A2A reply is one task artifact: nothing sent can be edited afterwards. Without this the
+    # gateway streamed deltas in, the first preview send was ignored (no notify), edit_message
+    # failed, and the stream consumer's fallback sent only the unseen TAIL with notify=True, which
+    # resolved the task without the reply's first words (t_3e546b71). False makes the gateway skip
+    # delta streaming (as for Signal/WeCom/WeChat) so the full reply arrives in one final send.
+    SUPPORTS_MESSAGE_EDITING = False
+
     def __init__(self, config, **kwargs):
         super().__init__(config=config, platform=Platform("a2a"))
         extra = getattr(config, "extra", {}) or {}

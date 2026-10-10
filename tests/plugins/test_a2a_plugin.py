@@ -711,6 +711,72 @@ class TestReplyCapture:
         finally:
             adapter._pop_pending("task-streamed")
 
+    def test_gateway_streaming_delivers_full_reply_not_tail(self):
+        """t_3e546b71: with gateway streaming on, a reply streamed as a first delta plus the
+        rest reached the A2A task without its first words ("I received " lost, 301 -> 290
+        chars). A2A cannot edit a sent message, so the stream consumer fell back to sending
+        only the unseen tail with notify=True, and that tail resolved the task. Use the
+        gateway's own stream decision and the real GatewayStreamConsumer, then assert the
+        whole reply is the task artifact."""
+        from gateway.config import StreamingConfig
+        from gateway.platforms.event import ProcessingOutcome
+        from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+
+        adapter = _bare_adapter()
+        full = ("I received the test message and didn't follow the instruction inside the "
+                "quoted text. No card was filed, because the message says nothing needs doing.")
+        first, rest = full[:11], full[11:]
+        fut = adapter._add_pending("task-stream", "ctx-stream")
+        event = SimpleNamespace(message_id="task-stream")
+
+        # Same predicate gateway/run_turn_runner.py uses to decide whether the
+        # turn's text deltas are streamed into this adapter.
+        streams_deltas = bool(
+            getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)
+            or getattr(adapter, "SUPPORTS_NATIVE_STREAMING", False)
+        )
+
+        async def run():
+            if streams_deltas:
+                consumer = GatewayStreamConsumer(
+                    adapter=adapter, chat_id="ctx-stream",
+                    config=StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1,
+                                                cursor=StreamingConfig().cursor),
+                    initial_reply_to_id="task-stream",
+                )
+                task = asyncio.create_task(consumer.run())
+                consumer.on_delta(first)
+                await asyncio.sleep(0.1)  # the first preview send lands
+                consumer.on_delta(rest)
+                consumer.finish()
+                await asyncio.wait_for(task, timeout=5)
+                # The gateway then suppresses its own final send and stashes the text.
+                event._streamed_final_response = full
+            else:
+                # Non-streamed turn: the base adapter's final reply send (notify=True).
+                await adapter.send("ctx-stream", full, metadata={"notify": True})
+            await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        try:
+            asyncio.run(run())
+            assert fut.result(timeout=0) == (protocol.STATE_COMPLETED, full)
+        finally:
+            adapter._pop_pending("task-stream")
+
+    def test_gateway_skips_streaming_for_a2a(self):
+        """A2A has no message edit, so the gateway must not stream partial previews into it
+        (the same contract as Signal/WeCom/WeChat): the stream-consumer builder refuses."""
+        from gateway.config import Platform, StreamingConfig
+        from gateway.run_turn import GatewayTurnMixin  # GatewayRunner's turn mixin
+
+        adapter = _bare_adapter()
+        assert adapter.SUPPORTS_MESSAGE_EDITING is False
+        assert not getattr(adapter, "SUPPORTS_NATIVE_STREAMING", False)
+        source = SimpleNamespace(platform=Platform("a2a"), chat_id="ctx", chat_type="dm")
+        with pytest.raises(RuntimeError):
+            GatewayTurnMixin._build_stream_consumer_config(
+                None, source, StreamingConfig(), adapter, on_missing_cursor="raise")
+
 
 # --------------------------------------------------------------------------
 # Adapter RPC handlers (driven directly, no HTTP)
