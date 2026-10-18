@@ -2743,9 +2743,17 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 
 
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
-    """The profile owner executes; this subprocess only waits for its receipt."""
+    """The profile owner executes; this subprocess only waits for its receipt.
+
+    ``-P`` (safe path): the worker runs with ``cwd=<task workspace>``, and plain ``-m`` puts the
+    cwd first on ``sys.path``. A workspace that is a hermes-agent checkout (a worktree card on
+    this repo) then shadows the running install, so the client boots *that* tree's
+    ``hermes_bootstrap`` and dies before its first turn ("no dependency environment is
+    committed"). The install root is pinned on PYTHONPATH by ``_default_spawn``
+    (``pin_hermes_tree_on_pythonpath``) or is site-packages itself, so ``-P`` loses nothing.
+    """
     import sys
-    return [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
+    return [sys.executable, "-P", "-m", "hermes_cli.kanban_worker_client"]
 
 
 def _open_worker_log(task: Task, board: Optional[str]):
