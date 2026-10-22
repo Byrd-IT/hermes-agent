@@ -26,7 +26,7 @@ import pytest
 from tools.file_operations import ShellFileOperations
 from tools.file_operations_search import (
     _extract_unreadable_paths,
-    _is_permission_only_error,
+    _is_recoverable_path_only_error,
 )
 from tools.environments.local import LocalEnvironment
 
@@ -39,7 +39,7 @@ def test_permission_only_true_for_all_denied_lines():
         "rg: /srv/locked: Permission denied (os error 13)\n"
         "rg: /srv/other: Permission denied (os error 13)\n"
     )
-    assert _is_permission_only_error(diagnostics) is True
+    assert _is_recoverable_path_only_error(diagnostics) is True
 
 
 def test_permission_only_false_when_any_other_diagnostic():
@@ -47,11 +47,11 @@ def test_permission_only_false_when_any_other_diagnostic():
         "rg: /srv/locked: Permission denied (os error 13)\n"
         "rg: error parsing glob '[': unclosed character class\n"
     )
-    assert _is_permission_only_error(diagnostics) is False
+    assert _is_recoverable_path_only_error(diagnostics) is False
 
 
 def test_permission_only_false_for_empty_diagnostics():
-    assert _is_permission_only_error("") is False
+    assert _is_recoverable_path_only_error("") is False
 
 
 def test_extract_paths_handles_both_rg_shapes_and_dedups():
@@ -72,12 +72,12 @@ GREP_EACCES = (
 
 
 def test_permission_only_true_for_grep_denied_lines():
-    assert _is_permission_only_error(GREP_EACCES) is True
+    assert _is_recoverable_path_only_error(GREP_EACCES) is True
 
 
 def test_permission_only_false_for_grep_other_diagnostic():
     diagnostics = GREP_EACCES + "grep: /srv/gone: No such file or directory\n"
-    assert _is_permission_only_error(diagnostics) is False
+    assert _is_recoverable_path_only_error(diagnostics) is False
 
 
 def test_extract_paths_handles_grep_shape():
@@ -163,6 +163,19 @@ EACCES_DIR_SORTED = (
     "Permission denied (os error 13)\n"
 )
 
+WINDOWS_ACCESS_DENIED_DIR = (
+    "rg: C:/Users/test/AppData\\Local\\ElevatedDiagnostics: "
+    "Access is denied. (os error 5)\n"
+)
+WINDOWS_ACCESS_DENIED_DIR_SORTED = (
+    "rg: C:/Users/test/AppData\\Local\\ElevatedDiagnostics: "
+    "IO error for operation on C:/Users/test/AppData\\Local\\ElevatedDiagnostics: "
+    "Access is denied. (os error 5)\n"
+)
+WINDOWS_RESERVED_NUL = (
+    "rg: C:/Users/test\\nul: Incorrect function. (os error 1)\n"
+)
+
 
 # --- file discovery (rg lane) ----------------------------------------------------
 
@@ -191,6 +204,59 @@ def test_file_search_modified_uses_io_error_diagnostic_shape():
     assert result.error is None
     assert result.files == ["/repo/partial.py"]
     assert "/srv/locked" in (result.warning or "")
+
+
+@pytest.mark.parametrize("order", ["discovery", "modified"])
+def test_file_search_with_windows_access_denied_returns_partial_results(order):
+    diagnostic = WINDOWS_ACCESS_DENIED_DIR_SORTED if order == "modified" else WINDOWS_ACCESS_DENIED_DIR
+    env = RecordingEnvironment(rg_output=diagnostic + "C:/repo/partial.py\n", rg_code=2)
+
+    result = ShellFileOperations(env).search(
+        "*.py", path="C:/repo", target="files", order=order)
+
+    assert result.error is None
+    assert result.files == ["C:/repo/partial.py"]
+    assert "C:/Users/test/AppData\\Local\\ElevatedDiagnostics" in (result.warning or "")
+
+
+@pytest.mark.parametrize("name", ["nul", "CON.txt", "com1.log", "Lpt9"])
+def test_file_search_skips_windows_reserved_device_diagnostic(name):
+    diagnostic = f"rg: C:/repo/{name}: Incorrect function. (os error 1)\n"
+    env = RecordingEnvironment(rg_output=diagnostic + "C:/repo/partial.py\n", rg_code=2)
+
+    result = ShellFileOperations(env).search("*.py", path="C:/repo", target="files")
+
+    assert result.error is None
+    assert result.files == ["C:/repo/partial.py"]
+    assert f"C:/repo/{name}" in (result.warning or "")
+
+
+def test_file_search_reserved_device_io_error_shape_returns_partial_results():
+    diagnostic = (
+        "rg: C:/repo/nul: IO error for operation on C:/repo/nul: "
+        "Incorrect function. (os error 1)\n"
+    )
+    env = RecordingEnvironment(rg_output=diagnostic + "C:/repo/partial.py\n", rg_code=2)
+
+    result = ShellFileOperations(env).search(
+        "*.py", path="C:/repo", target="files", order="modified")
+
+    assert result.error is None
+    assert result.files == ["C:/repo/partial.py"]
+    assert "C:/repo/nul" in (result.warning or "")
+
+
+def test_file_search_nonreserved_incorrect_function_still_fails_closed():
+    env = RecordingEnvironment(
+        rg_output="rg: C:/repo/ordinary.txt: Incorrect function. (os error 1)\n",
+        rg_code=2,
+    )
+
+    result = ShellFileOperations(env).search("*.py", path="C:/repo", target="files")
+
+    assert result.error is not None
+    assert result.files == []
+    assert "Incorrect function" in result.error
 
 
 @pytest.mark.parametrize("order", ["discovery", "modified"])
@@ -261,6 +327,19 @@ def test_content_search_with_unreadable_dir_returns_partial_matches():
         ("/repo/a.py", 3, "needle")]
     assert "unreadable path" in (result.warning or "")
     assert "/srv/locked" in (result.warning or "")
+
+
+def test_content_search_skips_windows_reserved_device_diagnostic():
+    output = WINDOWS_RESERVED_NUL + "C:/repo/a.py:3:needle\n"
+    env = RecordingEnvironment(rg_output=output, rg_code=2)
+
+    result = ShellFileOperations(env).search(
+        "needle", path="C:/repo", target="content")
+
+    assert result.error is None
+    assert [(m.path, m.line_number, m.content) for m in result.matches] == [
+        ("C:/repo/a.py", 3, "needle")]
+    assert "C:/Users/test\\nul" in (result.warning or "")
 
 
 def test_content_search_fully_unreadable_degrades_to_actionable_empty():

@@ -144,29 +144,50 @@ def _split_tool_diagnostics(output: str) -> tuple[str, str]:
     return '\n'.join(diagnostics), '\n'.join(payload)
 
 
-# One unreadable-path diagnostic, in every shape the search lanes produce:
-#   rg:   ``rg: <path>: Permission denied (os error 13)``
-#   rg modified-sort walk: ``rg: <path>: IO error for operation on <path>: Permission denied (os error 13)``
-#   grep: ``grep: <path>: Permission denied`` (no ``(os error N)`` suffix)
-# The ``(os error N)`` suffix is ripgrep's Rust io::Error spelling, so it is optional.
-_PERMISSION_DENIED_RE = re.compile(
+# One unreadable-path diagnostic, in every recoverable shape the search lanes produce:
+#   rg/grep: ``<path>: Permission denied`` (optional ripgrep ``(os error N)``)
+#   Windows rg: ``<path>: Access is denied. (os error 5)``
+#   Windows rg, reserved DOS device only: ``<path>: Incorrect function. (os error 1)``
+# Any rg form may insert ``IO error for operation on <path>:`` during a sorted walk.
+_UNREADABLE_PATH_RE = re.compile(
     r"^(?:(?:rg|grep): )?(?P<path>.+?): "
-    r"(?:IO error for operation on .+?: )?Permission denied(?: \(os error \d+\))?$")
+    r"(?:IO error for operation on .+?: )?"
+    r"(?P<reason>Permission denied(?: \(os error \d+\))?|"
+    r"Access is denied\. \(os error 5\)|Incorrect function\. \(os error 1\))$")
+_WINDOWS_RESERVED_DEVICE_RE = re.compile(
+    r"^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$", re.IGNORECASE)
 
 
-def _is_permission_only_error(diagnostics: str) -> bool:
-    """True when every diagnostic line reports an unreadable path (rg or grep).
+def _is_windows_reserved_device_path(path: str) -> bool:
+    """True for DOS device basenames, including names with an extension."""
+    basename = re.split(r"[\\/]", path.rstrip("\\/"))[-1].rstrip(" .")
+    stem = basename.split(".", 1)[0].rstrip(" ")
+    return bool(_WINDOWS_RESERVED_DEVICE_RE.fullmatch(stem))
+
+
+def _match_unreadable_path_diagnostic(line: str):
+    """Match one safely recoverable per-path diagnostic, else ``None``."""
+    match = _UNREADABLE_PATH_RE.match(line)
+    if not match:
+        return None
+    if match.group("reason").startswith("Incorrect function"):
+        return match if _is_windows_reserved_device_path(match.group("path")) else None
+    return match
+
+
+def _is_recoverable_path_only_error(diagnostics: str) -> bool:
+    """True when every diagnostic line reports a recoverable unreadable path.
     That is a partial-success condition — the tool still emits results for the
     readable remainder — not a broken invocation like a bad glob or regex."""
     lines = [line.strip() for line in diagnostics.splitlines() if line.strip()]
-    return bool(lines) and all(_PERMISSION_DENIED_RE.match(line) for line in lines)
+    return bool(lines) and all(_match_unreadable_path_diagnostic(line) for line in lines)
 
 
 def _extract_unreadable_paths(diagnostics: str) -> list[str]:
     """Paths reported unreadable by rg or grep, deduplicated in first-seen order."""
     paths: list[str] = []
     for line in diagnostics.splitlines():
-        match = _PERMISSION_DENIED_RE.match(line.strip())
+        match = _match_unreadable_path_diagnostic(line.strip())
         if not match:
             continue
         path = match.group("path").strip()
@@ -182,10 +203,10 @@ def _compact_unreadable_paths(paths: list[str], keep: int = 3) -> str:
 
 
 def _skipped_unreadable_warning(paths: list[str]) -> str:
-    return ("Skipped " + str(len(paths)) + " unreadable path(s) with restricted "
-            "permissions: " + _compact_unreadable_paths(paths)
-            + ". Results are partial; fix permissions or search the path directly "
-            "to include it.")
+    return ("Skipped " + str(len(paths)) + " unreadable path(s): "
+            + _compact_unreadable_paths(paths)
+            + ". Results are partial; fix permissions or remove inaccessible/"
+            "reserved-name entries to include them.")
 
 
 def _prepend_skipped_paths_warning(diagnostics: str, existing: Optional[str]) -> Optional[str]:
@@ -197,10 +218,10 @@ def _prepend_skipped_paths_warning(diagnostics: str, existing: Optional[str]) ->
     return warning if not existing else f"{warning} {existing}"
 
 
-_PERMISSION_SEARCH_HINT = (
-    "Every reported path was skipped for restricted permissions, so the searchable "
-    "scope itself is unreadable: fix permissions (e.g. chown the path back to the "
-    "service user) or search a readable subtree.")
+_UNREADABLE_SEARCH_HINT = (
+    "Every reported path was skipped because it could not be read, so the searchable "
+    "scope itself is unreadable: fix permissions, remove invalid/reserved-name entries, "
+    "or search a readable subtree.")
 
 
 def _parse_search_context_line(line: str) -> tuple[str, int, str] | None:
@@ -265,15 +286,15 @@ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
     diagnostics, payload = _split_tool_diagnostics(stdout)
     if result.exit_code == 2 and not payload.strip():
         error_msg = diagnostics.strip() or result.stdout.strip() or "Search error"
-        if _is_permission_only_error(error_msg):
+        if _is_recoverable_path_only_error(error_msg):
             # Pure unreadable-path failure: rg read nothing but the invocation was
             # sound. Degrade to an explicit empty result instead of failing — the
             # model can still act on the named paths.
             warning = _prepend_skipped_paths_warning(error_msg, warning)
             if not warning:
-                warning = _PERMISSION_SEARCH_HINT
-            elif _PERMISSION_SEARCH_HINT not in warning:
-                warning = f"{warning} {_PERMISSION_SEARCH_HINT}"
+                warning = _UNREADABLE_SEARCH_HINT
+            elif _UNREADABLE_SEARCH_HINT not in warning:
+                warning = f"{warning} {_UNREADABLE_SEARCH_HINT}"
             return SearchResult(total_count=0, warning=warning)
         return SearchResult(error=f"Search failed: {error_msg}", total_count=0)
     warning = _prepend_skipped_paths_warning(diagnostics, warning)
@@ -1046,8 +1067,8 @@ class SearchMixin:
         # the exit code: exit 2 = traversal hit unreadable paths (degrade below),
         # exit 124 = timed out while ALSO skipping them (warning rides along).
         skipped = _extract_unreadable_paths(diagnostics) \
-            if _is_permission_only_error(diagnostics) else []
-        permission_only = result.exit_code == 2 and bool(skipped)
+            if _is_recoverable_path_only_error(diagnostics) else []
+        recoverable_paths_only = result.exit_code == 2 and bool(skipped)
         warning = _skipped_unreadable_warning(skipped) if skipped else None
         if scoped_common:
             all_files = [
@@ -1055,7 +1076,7 @@ class SearchMixin:
                 for f in all_files]
         bounded_sigpipe = result.exit_code == 141 and len(all_files) >= fetch_limit
         if (result.exit_code not in {0, 1, 124} and not bounded_sigpipe
-                and not permission_only):
+                and not recoverable_paths_only):
             detail = diagnostics.strip() or "no diagnostics"
             if order == "modified":
                 # ripgrep 14+ was already verified by the capability gate, so this
@@ -1082,9 +1103,9 @@ class SearchMixin:
                 # the merged view keeps the newest-first contract globally.
                 all_files = merged_entries
                 limit_reason = limit_reason or directory_limit_reason
-        if permission_only and not all_files:
+        if recoverable_paths_only and not all_files:
             return SearchResult(files=[], total_count=0,
-                                warning=f"{warning} {_PERMISSION_SEARCH_HINT}")
+                                warning=f"{warning} {_UNREADABLE_SEARCH_HINT}")
         return SearchResult(
             files=all_files[offset:offset + limit], total_count=len(all_files),
             truncated=len(all_files) > offset + limit or bool(limit_reason),
