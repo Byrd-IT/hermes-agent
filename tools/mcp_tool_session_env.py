@@ -111,6 +111,16 @@ def is_variant_key(key) -> bool:
     return isinstance(key, tuple) and MARK in key[0]
 
 
+def _base_config(base_key):
+    """The base server's config: its live connection's, else a not-yet-connected lazy server's
+    (so the first pinned call builds a variant instead of waking the shared connection)."""
+    server = _core._servers.get(base_key)
+    config = getattr(server, "_config", None)
+    if config is None:
+        config = _core._lazy_server_configs.get(base_key)
+    return config
+
+
 def variant_key(base_key):
     """The variant key a call from the bound session must use for *base_key*, else None (not
     opted in, no bound client env, or the client sent none of the declared names)."""
@@ -118,8 +128,7 @@ def variant_key(base_key):
     env = bound_client_env()
     if not env or is_variant_key(base_key):
         return None
-    server = _core._servers.get(base_key)
-    names = declared_names(getattr(server, "_config", None))
+    names = declared_names(_base_config(base_key))
     values = {n: env[n] for n in names if isinstance(env.get(n), str) and env[n] != ""}
     if not values:
         return None
@@ -202,11 +211,11 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
             return server
         with _guard:
             pending = _pending.get(key)
-        base = _core._servers.get(pending[0]) if pending else None
-        if base is None:
+        base_config = _base_config(pending[0]) if pending else None
+        if base_config is None:
             return server
         _close(_evict(time.monotonic()))
-        config = _render(base._config, pending[1])
+        config = _render(base_config, pending[1])
         # The server never sees the values in a log: only the declared names and the digest.
         logger.info("MCP server '%s': starting a per-session connection (session_env %s, id %s)",
                     server_name, ",".join(sorted(pending[1])), key[0].rsplit(MARK, 1)[-1])
