@@ -125,11 +125,11 @@ def _close(keys) -> None:
             if server is not None:
                 try:
                     await server.shutdown()
-                except Exception:  # noqa: BLE001 -- best-effort close
+                except Exception:
                     logger.debug("MCP session-env variant shutdown failed", exc_info=True)
     try:
         _loop._run_on_mcp_loop(_shutdown, timeout=20)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.debug("MCP session-env variant close could not reach the loop", exc_info=True)
 
 
@@ -167,7 +167,7 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
                 if claimed:
                     try:
                         await claimed[0].shutdown()
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         pass
                 raise
             finally:
