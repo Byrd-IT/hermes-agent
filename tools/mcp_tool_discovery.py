@@ -19,6 +19,7 @@ from tools import mcp_tool_lifecycle as _lifecycle
 from tools import mcp_tool_loop as _loop
 from tools import mcp_tool_registration as _registration
 from tools.mcp_tool_schema import MCP_TOOL_NAME_PREFIX
+from tools import mcp_tool_session_env as _session_env
 from tools.mcp_tool_scope import _key_name, _key_scope, _key_visible_in_scope, _resolve_server_key, _server_key
 
 logger = logging.getLogger("tools.mcp_tool")
@@ -314,6 +315,10 @@ def _get_connected_server_for_call(server_name: str) -> Optional[_core.MCPServer
         key = _resolve_server_key(server_name)
         server = _core._servers.get(key)
         is_lazy = key in _core._lazy_server_configs
+    if _session_env.is_variant_key(key):
+        if server is None or server.session is None:
+            server = _session_env.ensure_connected(server_name, key)
+        return server
     if is_lazy and (server is None or server.session is None):
         _ensure_lazy_server_connected(server_name)
     elif server is not None and server.session is None and server._is_recycled_stdio():
