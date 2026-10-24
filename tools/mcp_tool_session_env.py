@@ -83,6 +83,7 @@ def _ensure_reaper() -> None:
         if _reaper is not None and _reaper.is_alive():
             return
         _reaper_stop.clear()
+        # health: allow HX012 -- the reaper must NOT inherit a request's bound client env or profile scope
         _reaper = threading.Thread(target=_reaper_loop, args=(_reaper_stop,),
                                    name="mcp-session-env-reaper", daemon=True)
         _reaper.start()
@@ -221,19 +222,19 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
                 from tools import mcp_tool_config as _config
                 with _config.session_env_override(pending[1]):
                     return await _core_wait(_connect_server(server_name, config), config)
-            except BaseException:
+            except BaseException:  # health: allow BLE001 -- cleanup boundary, always re-raises
                 if claimed:
                     try:
                         await claimed[0].shutdown()
-                    except Exception:
-                        pass
+                    except Exception:  # health: allow BLE001 -- best-effort cleanup, logged with traceback
+                        logger.debug("MCP session-env variant cleanup after a failed connect failed", exc_info=True)
                 raise
             finally:
                 _core._connect_server_claim.reset(token)
         try:
             server = _loop._run_on_mcp_loop(
                 _go, timeout=float(config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT)) + 30.0)
-        except BaseException as exc:
+        except BaseException as exc:  # health: allow BLE001 -- a failed variant connect must not break the call; logged
             logger.warning("MCP server '%s': per-session connection failed (%s)", server_name, type(exc).__name__)
             with _guard:
                 _pending.pop(key, None)
