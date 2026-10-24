@@ -168,6 +168,9 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None, names: Optional[set] = 
     actually stops the loop."""
     from tools.mcp_tool_scope import _key_name
     wildcard = scope is None and names is None
+    if wildcard:
+        from tools import mcp_tool_session_env as _session_env
+        _session_env.reset()
     with _core._lock:
         selected = [key for key in _core._servers if wildcard or _core._server_scope_keys.get(key) == scope]
         if names is not None:

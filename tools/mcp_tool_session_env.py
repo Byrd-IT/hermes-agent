@@ -5,7 +5,8 @@ the turn owns one shared connection per profile server, spawned once from the *g
 environment. A server whose launch env is chosen per run (e.g. ``env: {PIN: ${RUN_PIN}}``) would
 therefore never see the client's value. ``mcp_servers.<name>.session_env: [RUN_PIN, ...]`` opts a
 server in: the named, non-secret variables travel as the session's ``client_env`` (see
-``agent.session_client_env``), and a turn that carries any of them calls its OWN connection,
+``agent.session_client_env``; they are therefore merged into the terminal's
+``client_env_passthrough`` allowlist, so a declared name also reaches terminal tools), and a turn that carries any of them calls its OWN connection,
 spawned from the server's templates re-rendered with those values and keyed by their digest.
 The shared connection is untouched, other runs never see this one, and its breaker, trust and
 hint ledgers are its own. Variant connections register no tools (the profile's overlay already
@@ -33,6 +34,58 @@ _pending: dict = {}      # variant key -> (base key, {name: value}); values stay
 _last_used: dict = {}    # variant key -> monotonic time
 _connect_locks: dict = {}
 _guard = threading.Lock()
+_REAP_INTERVAL_SEC = 60.0
+_reaper_stop = threading.Event()
+_reaper: Optional[threading.Thread] = None
+
+
+def reset() -> None:
+    """Forget all variant bookkeeping and stop the reaper (``shutdown_mcp_servers`` wildcard)."""
+    global _reaper
+    _reaper_stop.set()
+    with _guard:
+        _pending.clear()
+        _last_used.clear()
+        _connect_locks.clear()
+        _reaper = None
+    for k in [k for k in _core._tool_read_only_hints if is_variant_key(k)]:
+        _core._tool_read_only_hints.pop(k, None)
+
+
+def reap_idle(now: Optional[float] = None) -> int:
+    """Close variant connections idle past the TTL and forget bookkeeping of keys that never
+    connected (or were evicted) and have not been used for the TTL. Returns the closed count."""
+    now = time.monotonic() if now is None else now
+    with _guard:
+        idle = [k for k, t in _last_used.items() if now - t > _IDLE_TTL_SEC]
+    live = [k for k in idle if k in _core._servers]
+    with _guard:
+        for k in idle:
+            if k not in live:
+                _pending.pop(k, None)
+                _last_used.pop(k, None)
+                _connect_locks.pop(k, None)
+    _close(live)
+    return len(live)
+
+
+def _reaper_loop(stop: threading.Event) -> None:
+    while not stop.wait(_REAP_INTERVAL_SEC):
+        try:
+            reap_idle()
+        except Exception:
+            logger.debug("MCP session-env idle reaper pass failed", exc_info=True)
+
+
+def _ensure_reaper() -> None:
+    global _reaper
+    with _guard:
+        if _reaper is not None and _reaper.is_alive():
+            return
+        _reaper_stop.clear()
+        _reaper = threading.Thread(target=_reaper_loop, args=(_reaper_stop,),
+                                   name="mcp-session-env-reaper", daemon=True)
+        _reaper.start()
 
 
 def declared_names(config) -> tuple:
@@ -118,6 +171,7 @@ def _close(keys) -> None:
             _pending.pop(k, None)
             _last_used.pop(k, None)
             _connect_locks.pop(k, None)
+        _core._tool_read_only_hints.pop(k, None)
     from tools import mcp_tool_loop as _loop
 
     async def _shutdown():
@@ -162,7 +216,11 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
             token = _core._connect_server_claim.set(lambda s: (setattr(s, "_session_variant", True),
                                                                claimed.append(s)))
             try:
-                return await _core_wait(_connect_server(server_name, config), config)
+                # _connect_server re-renders the config: keep the override on for that pass too, so a
+                # mixed template (``${A}-${B}``) keeps the session's value.
+                from tools import mcp_tool_config as _config
+                with _config.session_env_override(pending[1]):
+                    return await _core_wait(_connect_server(server_name, config), config)
             except BaseException:
                 if claimed:
                     try:
@@ -177,10 +235,18 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
                 _go, timeout=float(config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT)) + 30.0)
         except BaseException as exc:
             logger.warning("MCP server '%s': per-session connection failed (%s)", server_name, type(exc).__name__)
+            with _guard:
+                _pending.pop(key, None)
+                _last_used.pop(key, None)
             return None
         with _core._lock:
             _core._servers[key] = server
             _core._server_scope_keys[key] = key[0]
+            # readOnlyHint is a property of the server's tools; the variant serves the same ones.
+            hints = _core._tool_read_only_hints.get(pending[0])
+            if hints:
+                _core._tool_read_only_hints[key] = dict(hints)
+        _ensure_reaper()
         return server
 
 
