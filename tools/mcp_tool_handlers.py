@@ -851,11 +851,13 @@ def _make_check_fn(server_name: str):
     stale connection lingers. With no declaration registered the check is the connection check
     alone. Returns a plain bool: the registry caches ``bool(fn())``.
     """
-    from tools.mcp_tool_scope import _resolve_server_key
+    from tools.mcp_tool_scope import _resolve_shared_key
 
     def _connected() -> bool:
         with _core._lock:
-            key = _resolve_server_key(server_name)
+            # Availability is a property of the shared connection, never of a session_env variant
+            # (not yet connected on a session's first turn, and the answer is cached per profile).
+            key = _resolve_shared_key(server_name)
             server = _core._servers.get(key)
             return ((server is not None and (server.session is not None or server._is_recycled_stdio()))
                     or key in _core._lazy_server_configs)
