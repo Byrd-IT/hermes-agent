@@ -433,6 +433,8 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     """Register a connected server's tools plus utilities (initial discovery and list_changed
     refresh); returns the names. Toolset aliases derive from the live registry, not
     ``toolsets.TOOLSETS``; lossy normalization collisions (``read-file``/``read_file``) fail closed."""
+    if getattr(server, "_session_variant", False):
+        return []  # a per-session connection (session_env) serves the tools the profile already registered
     should_register = _make_tool_filter(name, config)
     key = _server_key_for_task(server)
     _record_tool_trust_metadata(name, config, server._tools, key)
