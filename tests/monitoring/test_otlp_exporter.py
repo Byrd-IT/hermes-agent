@@ -80,6 +80,23 @@ def test_trace_resource_includes_configured_deployment_environment():
     assert attrs["service.name"] == "hermes-gateway"
 
 
+def test_trace_resource_passes_through_custom_profile_label():
+    """Regression for t_0fc1cfb7: resource_attributes.profile was silently dropped by a
+    strict key allowlist even though `hermes config set` accepted and persisted it."""
+    attrs = OE._resource_attributes({
+        "monitoring": {
+            "install_id": "private-install-id",
+            "gateway_health_export": {
+                "resource_attributes": {"profile": "task-manager"},
+            },
+        },
+    })
+
+    assert attrs["profile"] == "task-manager"
+    # reserved keys stay pinned to the runtime values regardless of operator config
+    assert attrs["service.name"] == "hermes-gateway"
+
+
 
 
 def test_streamer_receives_events_and_respects_filter(monkeypatch):
