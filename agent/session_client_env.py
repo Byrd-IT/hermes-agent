@@ -42,7 +42,10 @@ def configured_names(config) -> frozenset:
     """The profile's extra tool names (``terminal.client_env_passthrough``)."""
     terminal = config.get('terminal') if isinstance(config, dict) else None
     raw = terminal.get(CONFIG_KEY) if isinstance(terminal, dict) else None
-    return frozenset(name.strip() for name in raw if isinstance(name, str) and name.strip()) if isinstance(raw, list) else frozenset()
+    named = frozenset(name.strip() for name in raw if isinstance(name, str) and name.strip()) if isinstance(raw, list) else frozenset()
+    # ``mcp_servers.<name>.session_env``: the variables a server wants per session (still filtered by ``_travels``).
+    from tools.mcp_tool_session_env import declared_names_in_config
+    return named | declared_names_in_config(config)
 
 
 def _travels(name: str, secret=None) -> bool:
