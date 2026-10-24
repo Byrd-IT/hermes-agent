@@ -51,7 +51,18 @@ def _key_visible_in_scope(key: ServerKey, scope: Optional[str]) -> bool:
 def _resolve_server_key(name: str, scope: Optional[str] = None, *, current: bool = True) -> ServerKey:
     """The connection key a call to *name* from *scope* must use: the scope's own connection
     (live, connecting or lazily registered) when it has one, else a shared connection it
-    adopted, else its own (not yet existing) key so bookkeeping lands under this scope."""
+    adopted, else its own (not yet existing) key so bookkeeping lands under this scope.
+    A call from a session whose client sent a declared ``session_env`` value uses that
+    session's own variant of the connection (``tools.mcp_tool_session_env``)."""
+    explicit = scope is not None or not current
+    key = _resolve_shared_key(name, scope, current=current)
+    if explicit:
+        return key
+    from tools.mcp_tool_session_env import variant_key
+    return variant_key(key) or key
+
+
+def _resolve_shared_key(name: str, scope: Optional[str] = None, *, current: bool = True) -> ServerKey:
     if scope is None and current:
         scope = _core._mcp_registry_scope()
     own = _server_key(name, scope, current=False)

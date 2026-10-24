@@ -3,6 +3,8 @@ interpolation, hidden-whitespace and suspicious-entry filtering, the filtered
 subprocess env, command resolution, the cached-npx binary shortcut and the shared stderr log."""
 
 import codecs
+import contextlib
+import contextvars
 import hashlib
 import json
 import logging
@@ -179,6 +181,21 @@ def _workspace_basename() -> str:
 _CONTEXT_VAR_RESOLVERS = {
     "userHome": lambda: os.path.expanduser("~"), "workspaceFolder": lambda: _workspace_folder(),
     "workspaceFolderBasename": _workspace_basename, "pathSeparator": lambda: os.sep, "/": lambda: os.sep}
+
+
+# Values a per-session MCP connection renders ``${VAR}`` refs with before the secret scope
+# (``mcp_servers.<name>.session_env``, tools.mcp_tool_session_env); None outside that render.
+_SESSION_ENV_OVERRIDE: "contextvars.ContextVar[Optional[dict]]" = contextvars.ContextVar(
+    "mcp_session_env_override", default=None)
+
+
+@contextlib.contextmanager
+def session_env_override(values: dict):
+    token = _SESSION_ENV_OVERRIDE.set(dict(values))
+    try:
+        yield
+    finally:
+        _SESSION_ENV_OVERRIDE.reset(token)
 
 
 class _RenderedStr(str):
@@ -567,7 +584,9 @@ def _interpolate_env_vars(value):
             resolver = _CONTEXT_VAR_RESOLVERS.get(m.group(1).strip())
             if resolver is not None:
                 return resolver()
-            resolved = _get_secret(_env_ref_name(m.group(1)), None)
+            ref = _env_ref_name(m.group(1))
+            override = _SESSION_ENV_OVERRIDE.get()
+            resolved = (override or {}).get(ref) or _get_secret(ref, None)
             if not resolved:
                 missed.append(m.group(0))
             return resolved or m.group(0)
