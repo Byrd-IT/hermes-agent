@@ -111,10 +111,31 @@ def test_mixed_template_keeps_override_on_connect(tmp_path):
     """F5: ``${A}-${B}`` with B unset renders with A's override in every pass."""
     from tools.mcp_tool_lifecycle import shutdown_mcp_servers
     try:
-        with patch.dict(os.environ, {**_clean_env(), "TEST_OTHER": "o"}, clear=True):
+        with patch.dict(os.environ, _clean_env(), clear=True):  # TEST_OTHER stays unset
             tool = _setup(tmp_path, "${TEST_RUN_PIN}-${TEST_OTHER}")
-            assert "pin=slug-a-o" in _call(tool, {"TEST_RUN_PIN": "slug-a"})
+            assert "pin=slug-a-${TEST_OTHER}" in _call(tool, {"TEST_RUN_PIN": "slug-a"})
     finally:
+        shutdown_mcp_servers()
+
+
+def test_lazy_server_first_pinned_call_gets_a_variant_not_the_shared_connect(tmp_path):
+    """N1: a lazy session_env server that never connected still resolves to a variant."""
+    from agent.session_client_env import client_env_scope
+    from tools import mcp_tool_session_env as se
+    from tools.mcp_tool_common import _core
+    from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+    from tools.mcp_tool_scope import _resolve_server_key
+    try:
+        with patch.dict(os.environ, _clean_env(), clear=True):
+            _core._lazy_server_configs["pinsrv"] = {
+                "command": sys.executable, "args": [], "env": {"PIN": "${TEST_RUN_PIN}"},
+                "session_env": ["TEST_RUN_PIN"], "lazy": True}
+            assert "pinsrv" not in _core._servers
+            assert _resolve_server_key("pinsrv") == "pinsrv"
+            with client_env_scope({"TEST_RUN_PIN": "slug-a"}):
+                assert se.is_variant_key(_resolve_server_key("pinsrv"))
+    finally:
+        _core._lazy_server_configs.pop("pinsrv", None)
         shutdown_mcp_servers()
 
 
