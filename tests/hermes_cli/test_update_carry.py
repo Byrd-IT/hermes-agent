@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from hermes_cli.update_carry import (
     verify_accounted,
     _reject,
 )
+from hermes_cli import update_carry
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -151,3 +153,43 @@ def test_plan_and_worktree_replay_leaves_source_untouched(tmp_path: Path):
     assert any(row["applied"] == "conflict" for row in applied["results"])
     with pytest.raises(CarryError):
         apply_in_worktree(repo, plan, repo / "nested", "nope")
+
+
+def test_worktree_bytes_matching_upstream_are_dropped(tmp_path: Path):
+    repo = _init(tmp_path)
+    _commit(repo, "clean.txt", "local\n", "local edit")
+    _git(repo, "branch", "up", "HEAD~1")
+    _git(repo, "checkout", "up")
+    _commit(repo, "clean.txt", "upstream\n", "upstream edit")
+    _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    _git(repo, "checkout", "main")
+    (repo / "clean.txt").write_text("upstream\n", encoding="utf-8-sig")
+    plan = plan_repo(repo, upstream="origin/main")
+    item = next(row for row in plan["items"] if row["identity"] == "worktree:clean.txt")
+    assert item["action"] == "drop"
+    assert item["reason"] == "merged-upstream"
+
+
+def test_stash_bytes_matching_upstream_are_dropped(tmp_path: Path):
+    repo = _init(tmp_path)
+    (repo / "clean.txt").write_text("stashed\n", encoding="utf-8-sig")
+    _git(repo, "stash", "push", "-m", "park", "--", "clean.txt")
+    _git(repo, "checkout", "-B", "advance")
+    _commit(repo, "clean.txt", "stashed\n", "upstream has it")
+    _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    _git(repo, "checkout", "main")
+    plan = plan_repo(repo, upstream="origin/main", stashes=("stash@{0}",))
+    item = next(row for row in plan["items"] if str(row["identity"]).startswith("stash:"))
+    assert item["action"] == "drop"
+    assert item["reason"] == "merged-upstream"
+    assert "stash@{0}" in _git(repo, "stash", "list")
+
+
+def test_log_filter_redacts_userinfo(caplog):
+    with caplog.at_level(logging.ERROR):
+        try:
+            raise CarryError("https://user:pass@example.test/x")
+        except CarryError:
+            update_carry.logger.exception("carry failed")
+    assert "user:pass" not in caplog.text
+    assert "[REDACTED]" in caplog.text
