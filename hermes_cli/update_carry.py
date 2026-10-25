@@ -762,16 +762,41 @@ def free_branch(repo: Path, name: str, fingerprint: str, *, git_bin: str = "git"
     return candidate
 
 
-def free_dest(requested: Path, fingerprint: str) -> Path:
-    """A worktree path that does not already exist. The previous path is left in place."""
-    if not requested.exists():
+def _registered_worktrees(repo: Path | None, *, git_bin: str = "git") -> set[str]:
+    """Paths git still has registered as worktrees, including missing ones."""
+    if repo is None:
+        return set()
+    proc = _git(repo, ["worktree", "list", "--porcelain"], git_bin=git_bin)
+    if proc.returncode != 0:
+        return set()
+    found = set()
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith("worktree "):
+            found.add(str(Path(line[len("worktree "):]).resolve()))
+    return found
+
+
+def free_dest(
+    requested: Path, fingerprint: str, repo: Path | None = None, *, git_bin: str = "git",
+) -> Path:
+    """A worktree path that is neither on disk nor registered with git.
+
+    The previous path is left in place. A registered-but-deleted worktree
+    counts as taken, because ``git worktree add`` refuses it.
+    """
+    taken = _registered_worktrees(repo, git_bin=git_bin)
+
+    def used(path: Path) -> bool:
+        return path.exists() or str(path.resolve()) in taken
+
+    if not used(requested):
         return requested
     alt = requested.parent / f"{requested.name}-{fingerprint[:12]}"
-    if not alt.exists():
+    if not used(alt):
         return alt
     stem = f"{requested.name}-{fingerprint[:20]}"
     candidate, n = requested.parent / stem, 1
-    while candidate.exists():
+    while used(candidate):
         n += 1
         candidate = requested.parent / f"{stem}-{n}"
     return candidate
@@ -954,7 +979,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.branch or f"carry-reapply/{plan['upstream_sha'][:12]}/{fp[:12]}",
                     fp,
                 )
-                dest = free_dest(Path(args.worktree), fp)
+                dest = free_dest(Path(args.worktree), fp, repo)
                 applied = apply_in_worktree(repo, plan, dest, branch)
                 report["integration"] = applied
                 report["buckets"] = summarize(plan, applied["results"])
