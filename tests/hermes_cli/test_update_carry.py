@@ -295,3 +295,22 @@ def test_apply_pr_state_merged_open_and_lookup_failed():
     assert failed["action"] == "reapply"
     assert "pr_lookup_failed" in failed["flags"]
     assert "no_upstream_pr" not in failed["flags"]
+
+
+def test_free_dest_and_branch_never_return_an_existing_name(tmp_path: Path):
+    fp = "f" * 64
+    base = tmp_path / "wt"
+    base.mkdir()
+    (tmp_path / f"wt-{fp[:12]}").mkdir()
+    (tmp_path / f"wt-{fp[:20]}").mkdir()
+    (tmp_path / f"wt-{fp[:20]}-2").mkdir()
+    got = update_carry.free_dest(base, fp)
+    assert not got.exists()
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@e.x",
+                    "commit", "-q", "--allow-empty", "-m", "i"], check=True)
+    for name in ("b", f"b-{fp[:12]}", f"b-{fp[:20]}"):
+        subprocess.run(["git", "-C", str(repo), "branch", name], check=True)
+    assert not update_carry._ref_exists(repo, update_carry.free_branch(repo, "b", fp))
