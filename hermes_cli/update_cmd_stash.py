@@ -479,6 +479,8 @@ def _apply_stash(git_cmd: list[str], cwd: Path, stash_ref: str, checkout_move=No
     print("Working tree reset to clean state.")
     print(f"Restore your changes later with: git stash apply {stash_ref}")
     _record_stash_disposition("parked", stash_ref, "restore hit conflicts")
+    from hermes_cli.update_carry import reapply_parked_stash
+    reapply_parked_stash(git_cmd, cwd, stash_ref)
     return None  # code update succeeded; cmd_update continues (deps, skills, gateway)
 
 
