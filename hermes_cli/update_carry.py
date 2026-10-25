@@ -754,7 +754,12 @@ def free_branch(repo: Path, name: str, fingerprint: str, *, git_bin: str = "git"
     alt = f"{name}-{fingerprint[:12]}"
     if not _ref_exists(repo, alt, git_bin=git_bin):
         return alt
-    return f"{name}-{fingerprint[:20]}"
+    stem = f"{name}-{fingerprint[:20]}"
+    candidate, n = stem, 1
+    while _ref_exists(repo, candidate, git_bin=git_bin):
+        n += 1
+        candidate = f"{stem}-{n}"
+    return candidate
 
 
 def free_dest(requested: Path, fingerprint: str) -> Path:
@@ -764,7 +769,12 @@ def free_dest(requested: Path, fingerprint: str) -> Path:
     alt = requested.parent / f"{requested.name}-{fingerprint[:12]}"
     if not alt.exists():
         return alt
-    return requested.parent / f"{requested.name}-{fingerprint[:20]}"
+    stem = f"{requested.name}-{fingerprint[:20]}"
+    candidate, n = requested.parent / stem, 1
+    while candidate.exists():
+        n += 1
+        candidate = requested.parent / f"{stem}-{n}"
+    return candidate
 
 
 def _public(item: dict) -> dict:
