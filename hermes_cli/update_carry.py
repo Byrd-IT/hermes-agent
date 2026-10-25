@@ -31,6 +31,22 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+
+class _RedactFilter(logging.Filter):
+    """Scrub credential shapes from log records, including tracebacks."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = redact(record.getMessage())
+        record.args = ()
+        if record.exc_info:
+            import traceback
+            record.exc_text = redact("".join(traceback.format_exception(*record.exc_info)))
+            record.exc_info = None
+        return True
+
+
+logger.addFilter(_RedactFilter())
+
 _MODES = ("off", "dry-run", "apply")
 _BANNED_HEAD = {"reset", "clean", "push", "rebase", "checkout", "switch"}
 _BACKUP_NAMES = re.compile(r"(^|/)[^/]+\.(bak|orig|rej)(-|$)")
@@ -200,6 +216,16 @@ def _blob(repo: Path, upstream: str, path: str, *, git_bin: str) -> bytes | None
     return proc.stdout
 
 
+def _matches_upstream(
+    repo: Path, upstream: str, path: str, current: bytes | None, *, git_bin: str,
+) -> bool:
+    """True when ``current`` is already the upstream blob. Missing files are not a match."""
+    if current is None:
+        return False
+    blob = _blob(repo, upstream, path, git_bin=git_bin)
+    return blob is not None and blob == current
+
+
 def _file_apply_check(repo: Path, patch: str, paths: list[str], upstream: str, *, git_bin: str) -> str:
     if not patch.strip():
         return "empty"
@@ -274,6 +300,9 @@ def _worktree_items(repo: Path, upstream: str, *, git_bin: str) -> list[dict]:
         diff = _git(repo, ["diff", "HEAD", "--", path], git_bin=git_bin).stdout
         if not diff.strip():
             diff = _git(repo, ["diff", "--cached", "--", path], git_bin=git_bin).stdout
+        file_path = repo / path
+        current = file_path.read_bytes() if file_path.is_file() else None
+        equivalent = _matches_upstream(repo, upstream, path, current, git_bin=git_bin)
         item = {
             "kind": "uncommitted",
             "identity": f"worktree:{path}",
@@ -282,8 +311,10 @@ def _worktree_items(repo: Path, upstream: str, *, git_bin: str) -> list[dict]:
             "files": [path],
             "patch": diff,
             "patch_id": _patch_id(diff, git_bin=git_bin),
-            "patch_equivalent": False,
-            "apply_check": _file_apply_check(repo, diff, [path], upstream, git_bin=git_bin),
+            "patch_equivalent": equivalent,
+            "apply_check": "clean" if equivalent else _file_apply_check(
+                repo, diff, [path], upstream, git_bin=git_bin,
+            ),
         }
         item.update(decide(item))
         items.append(item)
@@ -298,10 +329,18 @@ def _stash_items(repo: Path, stash_ref: str, upstream: str, *, git_bin: str) -> 
     for path in [line for line in names.stdout.splitlines() if line]:
         diff_proc = _git(repo, ["diff", f"{stash_ref}^1", stash_ref, "--", path], git_bin=git_bin)
         diff = diff_proc.stdout if diff_proc.returncode == 0 else ""
-        apply_check = (
-            _file_apply_check(repo, diff, [path], upstream, git_bin=git_bin)
-            if diff_proc.returncode == 0 else "unknown"
+        shown = subprocess.run(
+            [git_bin, "show", f"{stash_ref}:{path}"],
+            cwd=repo, capture_output=True, check=False, timeout=120,
         )
+        current = shown.stdout if shown.returncode == 0 else None
+        equivalent = _matches_upstream(repo, upstream, path, current, git_bin=git_bin)
+        if equivalent:
+            apply_check = "clean"
+        elif diff_proc.returncode == 0:
+            apply_check = _file_apply_check(repo, diff, [path], upstream, git_bin=git_bin)
+        else:
+            apply_check = "unknown"
         item = {
             "kind": "stash",
             "identity": f"stash:{stash_ref}:{path}",
@@ -311,7 +350,7 @@ def _stash_items(repo: Path, stash_ref: str, upstream: str, *, git_bin: str) -> 
             "files": [path],
             "patch": diff,
             "patch_id": _patch_id(diff, git_bin=git_bin),
-            "patch_equivalent": False,
+            "patch_equivalent": equivalent,
             "apply_check": apply_check,
         }
         item.update(decide(item))
