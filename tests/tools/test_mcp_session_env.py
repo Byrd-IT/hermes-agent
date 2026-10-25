@@ -139,7 +139,7 @@ def test_lazy_server_first_pinned_call_gets_a_variant_not_the_shared_connect(tmp
         shutdown_mcp_servers()
 
 
-def test_variant_inherits_read_only_hints_and_pruned_on_close(tmp_path):
+def test_closing_variant_forgets_all_bookkeeping(tmp_path):
     """F4: closing forgets all variant bookkeeping (hints are read from the shared key)."""
     from agent.session_client_env import client_env_scope
     from tools import mcp_tool_session_env as se
@@ -259,5 +259,58 @@ def test_scoped_shutdown_closes_that_scopes_variants(tmp_path):
             assert not [k for k in _core._servers if se.is_variant_key(k)]
             assert not se._pending and not se._last_used and not se._connect_locks
             assert base in _core._servers  # the shared connection is not touched here
+    finally:
+        shutdown_mcp_servers()
+
+
+def test_url_server_ignores_session_env():
+    from agent.session_client_env import client_env_scope
+    from tools import mcp_tool_session_env as se
+    from tools.mcp_tool_common import _core
+    from tools.mcp_tool_scope import _resolve_server_key
+    try:
+        _core._lazy_server_configs["httpsrv"] = {"url": "https://${TEST_RUN_PIN}.example/mcp",
+                                                  "session_env": ["TEST_RUN_PIN"], "lazy": True}
+        with client_env_scope({"TEST_RUN_PIN": "evil"}):
+            assert not se.is_variant_key(_resolve_server_key("httpsrv"))
+    finally:
+        _core._lazy_server_configs.pop("httpsrv", None)
+
+
+def test_dropped_variant_session_is_replaced_without_orphaning_the_old_task(tmp_path):
+    from agent.session_client_env import client_env_scope
+    from tools import mcp_tool_session_env as se
+    from tools.mcp_tool_common import _core
+    from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+    try:
+        with patch.dict(os.environ, _clean_env(), clear=True):
+            tool = _setup(tmp_path)
+            first = _call(tool, {"TEST_RUN_PIN": "slug-a"})
+            (vkey,) = [k for k in _core._servers if se.is_variant_key(k)]
+            old = _core._servers[vkey]
+            old.session = None  # as after a recycle / transport drop
+            second = _call(tool, {"TEST_RUN_PIN": "slug-a"})
+            new = _core._servers[vkey]
+            assert new is not old and new.session is not None
+            assert old.session is None and (old._task is None or old._task.done())
+            assert "pin=slug-a" in first and "pin=slug-a" in second
+            assert len([k for k in _core._servers if se.is_variant_key(k)]) == 1
+    finally:
+        shutdown_mcp_servers()
+
+
+def test_closed_variant_clears_its_breaker_ledgers(tmp_path):
+    from tools import mcp_tool_session_env as se
+    from tools.mcp_tool_common import _core
+    from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+    try:
+        with patch.dict(os.environ, _clean_env(), clear=True):
+            tool = _setup(tmp_path)
+            base = next(k for k in _core._servers if not se.is_variant_key(k))
+            _call(tool, {"TEST_RUN_PIN": "slug-a"})
+            (vkey,) = [k for k in _core._servers if se.is_variant_key(k)]
+            _core._server_error_counts[vkey] = 3
+            se.close_for_bases([base])
+            assert vkey not in _core._server_error_counts
     finally:
         shutdown_mcp_servers()
