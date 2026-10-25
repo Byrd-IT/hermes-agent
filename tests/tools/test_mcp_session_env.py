@@ -314,3 +314,20 @@ def test_closed_variant_clears_its_breaker_ledgers(tmp_path):
             assert vkey not in _core._server_error_counts
     finally:
         shutdown_mcp_servers()
+
+
+def test_variant_handshake_does_not_close_the_shared_breaker(tmp_path):
+    from tools import mcp_tool_session_env as se
+    from tools.mcp_tool_common import _core
+    from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+    try:
+        with patch.dict(os.environ, _clean_env(), clear=True):
+            tool = _setup(tmp_path)
+            base = next(k for k in _core._servers if not se.is_variant_key(k))
+            _core._server_error_counts[base] = 5
+            _core._server_breaker_opened_at[base] = time.monotonic()
+            _call(tool, {"TEST_RUN_PIN": "slug-a"})
+            assert any(se.is_variant_key(k) for k in _core._servers)
+            assert _core._server_error_counts.get(base) == 5 and base in _core._server_breaker_opened_at
+    finally:
+        shutdown_mcp_servers()
