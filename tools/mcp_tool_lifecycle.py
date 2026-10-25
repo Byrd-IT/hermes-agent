@@ -167,14 +167,17 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None, names: Optional[set] = 
     profile under a total budget divides it, or N profiles × 15s starve the wildcard pass that
     actually stops the loop."""
     from tools.mcp_tool_scope import _key_name
+    from tools import mcp_tool_session_env as _session_env
     wildcard = scope is None and names is None
     if wildcard:
-        from tools import mcp_tool_session_env as _session_env
         _session_env.reset()
     with _core._lock:
         selected = [key for key in _core._servers if wildcard or _core._server_scope_keys.get(key) == scope]
         if names is not None:
             selected = [key for key in selected if _key_name(key) in names]
+    if not wildcard:
+        _session_env.close_for_bases(selected)
+    with _core._lock:
         servers_snapshot = [_core._servers[key] for key in selected]
         if names is not None:
             selected_status = set(selected)
