@@ -12,7 +12,11 @@ does not repeat that move and never runs ``reset --hard``, ``stash drop``, or
 
 The command defaults to a dry run. ``updates.carry_reapply`` selects the
 update-hook mode: ``dry-run`` (default when unset), ``apply``, or ``off``.
-Apply during an update cherry-picks onto the tree the updater already reset.
+``apply`` during an update cherry-picks onto the tree the updater already
+reset. That is not a worktree integration. Callers that must not write the
+source checkout leave the hook at ``dry-run`` and use ``--apply --worktree``
+(a directory outside the source). A repeat with a changed carried set uses a
+new branch and a free worktree path. The previous branch is kept.
 A standalone apply writes only a worktree outside the source checkout.
 """
 
@@ -178,6 +182,98 @@ def _is_backup(path: str) -> bool:
     return bool(_BACKUP_NAMES.search(path))
 
 
+def _status_entries(repo: Path, *, git_bin: str) -> list[tuple[str, str]]:
+    """Porcelain v1 ``-z`` records as ``(xy, path)``. Paths are not quoted."""
+    proc = _git(repo, ["status", "--porcelain=v1", "-z", "-uall"], git_bin=git_bin)
+    if proc.returncode != 0:
+        return []
+    parts = proc.stdout.split("\0")
+    entries: list[tuple[str, str]] = []
+    index = 0
+    while index < len(parts):
+        raw = parts[index]
+        index += 1
+        if len(raw) < 4:
+            continue
+        xy, path = raw[:2], raw[3:]
+        if "R" in xy or "C" in xy:
+            if index < len(parts) and parts[index]:
+                path = parts[index]
+                index += 1
+        if path:
+            entries.append((xy, path))
+    return entries
+
+
+def _diff_token(prefix: str, path: str) -> str:
+    token = f"{prefix}{path}"
+    if any(char in path for char in ' \t"\\'):
+        escaped = token.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return token
+
+
+def _normalize_diff(diff: str, path: str) -> str:
+    """Rewrite a no-index diff so ``git apply`` uses ``path``."""
+    if not diff.strip() or "Binary files" in diff:
+        return ""
+    lines = []
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            lines.append(f"diff --git {_diff_token('a/', path)} {_diff_token('b/', path)}\n")
+        elif line.startswith("--- /dev/null"):
+            lines.append(line if line.endswith("\n") else line + "\n")
+        elif line.startswith("--- "):
+            lines.append(f"--- {_diff_token('a/', path)}\n")
+        elif line.startswith("+++ /dev/null"):
+            lines.append(line if line.endswith("\n") else line + "\n")
+        elif line.startswith("+++ "):
+            lines.append(f"+++ {_diff_token('b/', path)}\n")
+        else:
+            lines.append(line if line.endswith("\n") else line + "\n")
+    return "".join(lines)
+
+
+def _bytes_diff(path: str, current: bytes | None, baseline: bytes | None, *, git_bin: str) -> str:
+    """Diff ``current`` against ``baseline`` (or /dev/null) without touching an index."""
+    if current is None:
+        return ""
+    if b"\0" in current or (baseline is not None and b"\0" in baseline):
+        return ""
+    temp = Path(tempfile.mkdtemp(prefix="carry-diff-"))
+    try:
+        right = temp / "right"
+        right.write_bytes(current)
+        if baseline is None:
+            argv = [git_bin, "diff", "--no-index", "--", "/dev/null", str(right)]
+        else:
+            left = temp / "left"
+            left.write_bytes(baseline)
+            argv = [git_bin, "diff", "--no-index", "--", str(left), str(right)]
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, check=False, timeout=120,
+        )
+        if proc.returncode not in (0, 1):
+            return ""
+        return _normalize_diff(proc.stdout or "", path)
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
+
+
+def _addition_patch(path: str, current: bytes | None, *, git_bin: str) -> str:
+    """A new-file patch, including an empty file (that is still a carried add)."""
+    patch = _bytes_diff(path, current, None, git_bin=git_bin)
+    if patch.strip() or current is None:
+        return patch
+    return (
+        f"diff --git {_diff_token('a/', path)} {_diff_token('b/', path)}\n"
+        "new file mode 100644\n"
+        "index 0000000..e69de29\n"
+        "--- /dev/null\n"
+        f"+++ {_diff_token('b/', path)}\n"
+    )
+
+
 def _cherry_marks(repo: Path, upstream: str, tip: str, *, git_bin: str) -> dict[str, str]:
     proc = _git(repo, ["cherry", upstream, tip], git_bin=git_bin)
     marks: dict[str, str] = {}
@@ -284,25 +380,71 @@ def _classify_commit(repo, sha, upstream, marks, *, git_bin: str) -> dict:
     return item
 
 
+def _untracked_file_item(
+    repo: Path, upstream: str, path: str, *, identity: str, kind: str,
+    current: bytes | None, git_bin: str, extra: dict | None = None,
+) -> dict:
+    """Classify a file git diff does not see (worktree ``??`` or stash^3)."""
+    equivalent = _matches_upstream(repo, upstream, path, current, git_bin=git_bin)
+    baseline = None if equivalent else _blob(repo, upstream, path, git_bin=git_bin)
+    if equivalent:
+        patch = ""
+        apply_check = "clean"
+    elif current is None:
+        patch = ""
+        apply_check = "unknown"
+    elif baseline is None:
+        patch = _addition_patch(path, current, git_bin=git_bin)
+        apply_check = (
+            _file_apply_check(repo, patch, [path], upstream, git_bin=git_bin)
+            if patch.strip() else "unknown"
+        )
+    else:
+        patch = _bytes_diff(path, current, baseline, git_bin=git_bin)
+        apply_check = (
+            _file_apply_check(repo, patch, [path], upstream, git_bin=git_bin)
+            if patch.strip() else "unknown"
+        )
+    item = {
+        "kind": kind,
+        "identity": identity,
+        "sha": "",
+        "title": path,
+        "files": [path],
+        "patch": patch,
+        "patch_id": _patch_id(patch, git_bin=git_bin),
+        "patch_equivalent": equivalent,
+        "apply_check": apply_check,
+    }
+    if extra:
+        item.update(extra)
+    item.update(decide(item))
+    return item
+
+
 def _worktree_items(repo: Path, upstream: str, *, git_bin: str) -> list[dict]:
-    status = _git(repo, ["status", "--porcelain=v1", "-uall"], git_bin=git_bin)
     items = []
-    if status.returncode != 0:
-        return items
-    for line in status.stdout.splitlines():
-        if len(line) < 4:
-            continue
-        path = line[3:]
-        if " -> " in path:
-            path = path.split(" -> ", 1)[1]
+    for xy, path in _status_entries(repo, git_bin=git_bin):
         if _is_backup(path):
+            continue
+        file_path = repo / path
+        current = file_path.read_bytes() if file_path.is_file() else None
+        if xy == "??":
+            items.append(_untracked_file_item(
+                repo, upstream, path, identity=f"worktree:{path}", kind="uncommitted",
+                current=current, git_bin=git_bin,
+            ))
             continue
         diff = _git(repo, ["diff", "HEAD", "--", path], git_bin=git_bin).stdout
         if not diff.strip():
             diff = _git(repo, ["diff", "--cached", "--", path], git_bin=git_bin).stdout
-        file_path = repo / path
-        current = file_path.read_bytes() if file_path.is_file() else None
         equivalent = _matches_upstream(repo, upstream, path, current, git_bin=git_bin)
+        if not diff.strip() and not equivalent:
+            items.append(_untracked_file_item(
+                repo, upstream, path, identity=f"worktree:{path}", kind="uncommitted",
+                current=current, git_bin=git_bin,
+            ))
+            continue
         item = {
             "kind": "uncommitted",
             "identity": f"worktree:{path}",
@@ -325,7 +467,9 @@ def _stash_items(repo: Path, stash_ref: str, upstream: str, *, git_bin: str) -> 
     names = _git(repo, ["stash", "show", "--name-only", stash_ref], git_bin=git_bin)
     items = []
     if names.returncode != 0:
-        return items
+        return _stash_untracked_items(
+            repo, stash_ref, upstream, git_bin=git_bin, seen=set(),
+        )
     for path in [line for line in names.stdout.splitlines() if line]:
         diff_proc = _git(repo, ["diff", f"{stash_ref}^1", stash_ref, "--", path], git_bin=git_bin)
         diff = diff_proc.stdout if diff_proc.returncode == 0 else ""
@@ -355,7 +499,41 @@ def _stash_items(repo: Path, stash_ref: str, upstream: str, *, git_bin: str) -> 
         }
         item.update(decide(item))
         items.append(item)
+    items.extend(_stash_untracked_items(
+        repo, stash_ref, upstream, git_bin=git_bin,
+        seen={row["files"][0] for row in items if row.get("files")},
+    ))
     return items
+
+
+def _stash_untracked_items(
+    repo: Path, stash_ref: str, upstream: str, *, git_bin: str, seen: set[str],
+) -> list[dict]:
+    """Files saved by ``stash push --include-untracked`` live on ``stash^3``."""
+    probe = _git(repo, ["rev-parse", "--verify", "--quiet", f"{stash_ref}^3"], git_bin=git_bin)
+    if probe.returncode != 0 or not (probe.stdout or "").strip():
+        return []
+    listed = _git(repo, ["ls-tree", "-r", "--name-only", "-z", f"{stash_ref}^3"], git_bin=git_bin)
+    if listed.returncode != 0:
+        return []
+    extra = []
+    for path in [name for name in listed.stdout.split("\0") if name]:
+        if path in seen or _is_backup(path):
+            continue
+        shown = subprocess.run(
+            [git_bin, "show", f"{stash_ref}^3:{path}"],
+            cwd=repo, capture_output=True, check=False, timeout=120,
+        )
+        current = shown.stdout if shown.returncode == 0 else None
+        extra.append(_untracked_file_item(
+            repo, upstream, path,
+            identity=f"stash:{stash_ref}:untracked:{path}",
+            kind="stash",
+            current=current,
+            git_bin=git_bin,
+            extra={"stash_ref": stash_ref},
+        ))
+    return extra
 
 
 def _dedupe(items: list[dict]) -> list[dict]:
@@ -510,6 +688,83 @@ def fingerprint(plan: dict) -> str:
         for item in plan.get("items") or []
     ]
     return hashlib.sha256(json.dumps(rows).encode("utf-8")).hexdigest()
+
+
+_AUTOSTASH_PREFIX = "hermes-update-autostash-"
+
+
+def autostash_refs(repo: Path, *, git_bin: str = "git") -> list[str]:
+    """Stash refs whose message is an update autostash, not whatever is ``stash@{0}``."""
+    proc = _git(repo, ["stash", "list", "--format=%gd%x09%gs"], git_bin=git_bin)
+    if proc.returncode != 0:
+        return []
+    refs = []
+    for line in proc.stdout.splitlines():
+        ref, _, subject = line.partition("\t")
+        if ref.startswith("stash@{") and _AUTOSTASH_PREFIX in subject:
+            refs.append(ref)
+    return refs
+
+
+def apply_pr_state(item: dict, pr: dict | None) -> dict:
+    """Re-run ``decide`` with a pull-request lookup. Does not touch git."""
+    row = {key: value for key, value in item.items() if key not in {"action", "reason", "flags"}}
+    lookup = "" if not pr else str(pr.get("lookup") or "")
+    number = None if not pr else pr.get("number")
+    if pr and lookup == "failed":
+        row["pr_lookup"] = "failed"
+        row.pop("upstream_pr", None)
+        row.pop("pr_match", None)
+    elif pr and number and lookup != "none":
+        row["pr_lookup"] = "ok"
+        row["upstream_pr"] = {
+            "state": str(pr.get("state") or ""),
+            "number": number,
+            "url": pr.get("url") or "",
+        }
+        row["pr_match"] = str(pr.get("match") or "")
+    else:
+        row.pop("upstream_pr", None)
+        row.pop("pr_match", None)
+        row.pop("pr_lookup", None)
+    row.update(decide(row))
+    return row
+
+
+def annotate_plan(plan: dict, prs_by_identity: dict[str, dict]) -> dict:
+    items = []
+    for item in plan.get("items") or []:
+        pr = prs_by_identity.get(item.get("identity") or "")
+        items.append(apply_pr_state(item, pr) if pr is not None else item)
+    out = dict(plan)
+    out["items"] = _dedupe(items)
+    return out
+
+
+def _ref_exists(repo: Path, name: str, *, git_bin: str = "git") -> bool:
+    return _git(
+        repo, ["show-ref", "--verify", "--quiet", f"refs/heads/{name}"], git_bin=git_bin,
+    ).returncode == 0
+
+
+def free_branch(repo: Path, name: str, fingerprint: str, *, git_bin: str = "git") -> str:
+    """A branch name that does not already exist. Never deletes the old one."""
+    if not _ref_exists(repo, name, git_bin=git_bin):
+        return name
+    alt = f"{name}-{fingerprint[:12]}"
+    if not _ref_exists(repo, alt, git_bin=git_bin):
+        return alt
+    return f"{name}-{fingerprint[:20]}"
+
+
+def free_dest(requested: Path, fingerprint: str) -> Path:
+    """A worktree path that does not already exist. The previous path is left in place."""
+    if not requested.exists():
+        return requested
+    alt = requested.parent / f"{requested.name}-{fingerprint[:12]}"
+    if not alt.exists():
+        return alt
+    return requested.parent / f"{requested.name}-{fingerprint[:20]}"
 
 
 def _public(item: dict) -> dict:
@@ -684,8 +939,13 @@ def main(argv: list[str] | None = None) -> int:
             elif not args.worktree:
                 raise CarryError("apply requires --worktree (outside the source checkout) or --in-place")
             else:
-                branch = args.branch or "carry-reapply"
-                applied = apply_in_worktree(repo, plan, Path(args.worktree), branch)
+                branch = free_branch(
+                    repo,
+                    args.branch or f"carry-reapply/{plan['upstream_sha'][:12]}/{fp[:12]}",
+                    fp,
+                )
+                dest = free_dest(Path(args.worktree), fp)
+                applied = apply_in_worktree(repo, plan, dest, branch)
                 report["integration"] = applied
                 report["buckets"] = summarize(plan, applied["results"])
                 if args.state_dir:
@@ -695,6 +955,7 @@ def main(argv: list[str] | None = None) -> int:
                         "fingerprint": fp,
                         "upstream_sha": plan["upstream_sha"],
                         "worktree": applied["worktree"],
+                        "branch": applied["branch"],
                         "head": applied["head"],
                     }), encoding="utf-8")
         text = format_report({"buckets": report["buckets"]}, quiet=args.quiet)
