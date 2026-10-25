@@ -130,7 +130,7 @@ def _reject(args: list[str]) -> None:
 def _git(cwd: Path, args: list[str], *, git_bin: str = "git") -> subprocess.CompletedProcess:
     _reject(args)
     return subprocess.run(
-        [git_bin, *args], cwd=cwd, capture_output=True, text=True, check=False,
+        [git_bin, *args], cwd=cwd, capture_output=True, text=True, check=False, timeout=120,
     )
 
 
@@ -146,6 +146,7 @@ def _patch_id(diff: str, *, git_bin: str = "git") -> str:
         return ""
     proc = subprocess.run(
         [git_bin, "patch-id", "--stable"], input=diff, capture_output=True, text=True, check=False,
+        timeout=120,
     )
     parts = (proc.stdout or "").split()
     return parts[0] if parts else ""
@@ -192,6 +193,7 @@ def _commit_apply_check(repo: Path, sha: str, upstream: str, *, git_bin: str) ->
 def _blob(repo: Path, upstream: str, path: str, *, git_bin: str) -> bytes | None:
     proc = subprocess.run(
         [git_bin, "show", f"{upstream}:{path}"], cwd=repo, capture_output=True, check=False,
+        timeout=120,
     )
     if proc.returncode != 0:
         return None
@@ -211,7 +213,7 @@ def _file_apply_check(repo: Path, patch: str, paths: list[str], upstream: str, *
                 dest.write_bytes(blob)
         proc = subprocess.run(
             [git_bin, "apply", "--check", "--unsafe-paths", "-"],
-            cwd=temp, input=patch, capture_output=True, text=True, check=False,
+            cwd=temp, input=patch, capture_output=True, text=True, check=False, timeout=120,
         )
         return "clean" if proc.returncode == 0 else "conflict"
     finally:
@@ -403,13 +405,13 @@ def _apply_patch(dest: Path, patch: str, *, git_bin: str) -> str:
         return "drop"
     check = subprocess.run(
         [git_bin, "apply", "--check", "-"], cwd=dest, input=patch,
-        capture_output=True, text=True, check=False,
+        capture_output=True, text=True, check=False, timeout=120,
     )
     if check.returncode != 0:
         return "conflict"
     applied = subprocess.run(
         [git_bin, "apply", "-"], cwd=dest, input=patch,
-        capture_output=True, text=True, check=False,
+        capture_output=True, text=True, check=False, timeout=120,
     )
     return "reapply" if applied.returncode == 0 else "conflict"
 
