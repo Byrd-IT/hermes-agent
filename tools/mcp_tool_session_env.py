@@ -16,7 +16,9 @@ idle (``_IDLE_TTL_SEC``) or past ``_MAX_VARIANTS`` (least recently used first).
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import os
 import logging
 import threading
 import time
@@ -34,6 +36,7 @@ _pending: dict = {}      # variant key -> (base key, {name: value}); values stay
 _last_used: dict = {}    # variant key -> monotonic time
 _connect_locks: dict = {}
 _guard = threading.Lock()
+_LOG_SALT = os.urandom(16)  # per-process: a logged id cannot be brute-forced offline
 _REAP_INTERVAL_SEC = 60.0
 _reaper_stop = threading.Event()
 _reaper: Optional[threading.Thread] = None
@@ -50,6 +53,23 @@ def reset() -> None:
         _reaper = None
     for k in [k for k in _core._tool_read_only_hints if is_variant_key(k)]:
         _core._tool_read_only_hints.pop(k, None)
+
+
+def close_for_bases(base_keys) -> int:
+    """Close every live variant whose base connection is in *base_keys* (scoped shutdown, config
+    reload or eviction of the base). Returns the closed count."""
+    bases = set(base_keys)
+    if not bases:
+        return 0
+    with _guard:
+        doomed = [k for k, (b, _) in _pending.items() if b in bases]
+    _close([k for k in doomed if k in _core._servers])
+    with _guard:
+        for k in doomed:
+            _pending.pop(k, None)
+            _last_used.pop(k, None)
+            _connect_locks.pop(k, None)
+    return len(doomed)
 
 
 def reap_idle(now: Optional[float] = None) -> int:
@@ -132,7 +152,10 @@ def variant_key(base_key):
     values = {n: env[n] for n in names if isinstance(env.get(n), str) and env[n] != ""}
     if not values:
         return None
-    digest = hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()[:16]
+    # The base config's identity is part of the digest: editing the server's command/args/env makes
+    # the next call use a fresh variant instead of the one still running the old config.
+    ident = json.dumps([values, _plain(_base_config(base_key))], sort_keys=True, default=str)
+    digest = hashlib.sha256(ident.encode()).hexdigest()[:16]
     scope, name = (base_key if isinstance(base_key, tuple) else (None, base_key))
     key = (f"{scope or ''}{MARK}{digest}", name)
     with _guard:
@@ -218,7 +241,7 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
         config = _render(base_config, pending[1])
         # The server never sees the values in a log: only the declared names and the digest.
         logger.info("MCP server '%s': starting a per-session connection (session_env %s, id %s)",
-                    server_name, ",".join(sorted(pending[1])), key[0].rsplit(MARK, 1)[-1])
+                    server_name, ",".join(sorted(pending[1])), hmac.new(_LOG_SALT, key[0].encode(), "sha256").hexdigest()[:8])
         _loop._ensure_mcp_loop()
 
         async def _go():
@@ -248,14 +271,11 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
             with _guard:
                 _pending.pop(key, None)
                 _last_used.pop(key, None)
+                _connect_locks.pop(key, None)
             return None
         with _core._lock:
             _core._servers[key] = server
             _core._server_scope_keys[key] = key[0]
-            # readOnlyHint is a property of the server's tools; the variant serves the same ones.
-            hints = _core._tool_read_only_hints.get(pending[0])
-            if hints:
-                _core._tool_read_only_hints[key] = dict(hints)
         _ensure_reaper()
         return server
 

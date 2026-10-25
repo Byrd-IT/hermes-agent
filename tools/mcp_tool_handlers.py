@@ -53,8 +53,10 @@ def _tool_is_read_only(server_name: str, tool_name: str) -> bool:
     """True only when discovery captured ``readOnlyHint=True`` for the tool. Missing or malformed
     metadata fails safe to False (treated as write-capable). readOnlyHint is a property of the
     connection's tools, so it lives under the connection key."""
-    from tools.mcp_tool_scope import _resolve_server_key
-    return _core._tool_read_only_hints.get(_resolve_server_key(server_name), {}).get(tool_name) is True
+    from tools.mcp_tool_scope import _resolve_shared_key
+    # Always the shared connection's hints: a session_env variant may not be connected yet on the
+    # session's first call, and it serves the same tools.
+    return _core._tool_read_only_hints.get(_resolve_shared_key(server_name), {}).get(tool_name) is True
 
 
 def _trust_approval_key(server_name: str, tool_name: str) -> str:
