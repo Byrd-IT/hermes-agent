@@ -26,7 +26,8 @@ def test_shared_pid_is_not_orphaned_until_last_claim_drops():
         with patch("hermes_cli.process_identity.register_child", create=True), \
              patch("tools.mcp_tool_transport._leader_start_time", return_value=None), \
              patch("tools.mcp_tool_transport.os.getpgid", return_value=pid), \
-             patch("gateway.status._pid_exists", return_value=True):
+             patch("gateway.status._pid_exists", return_value=True), \
+             patch("tools.mcp_tool._update_death_supervisor"):
             a._track_spawned_children({pid})
             b._track_spawned_children({pid})
             a._release_spawned_children({pid})
@@ -91,7 +92,7 @@ def test_run_stdio_serializes_snapshot_windows():
             both.set()
         try:  # unlocked siblings both enter and see each other; locked ones time out alone
             await asyncio.wait_for(both.wait(), 0.3)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
         yield object(), object()
 
