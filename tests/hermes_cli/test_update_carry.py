@@ -329,3 +329,18 @@ def test_free_dest_treats_a_registered_but_deleted_worktree_as_taken(tmp_path: P
     got = update_carry.free_dest(wt, "e" * 64, repo)
     assert got != wt
     subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "-b", "w2", str(got)], check=True)
+
+
+def test_worktree_replay_fails_loudly_when_the_commit_is_rejected(tmp_path: Path):
+    repo = _init(tmp_path)
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    hook = hooks / "pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+    _git(repo, "config", "core.hooksPath", str(hooks))
+    (repo / "clean.txt").write_text("dirty\n", encoding="utf-8-sig")
+    plan = plan_repo(repo, upstream="origin/main")
+    dest = tmp_path / "wt"
+    with pytest.raises(CarryError, match="git commit"):
+        apply_in_worktree(repo, plan, dest, "carry/test")
