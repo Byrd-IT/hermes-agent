@@ -808,6 +808,7 @@ def restart_mcp_servers_with_new_inputs(names: set[str]) -> list[str]:
 def _forget_lazy_server(key) -> None:
     """Drop a schema-cache (lazy) registration whose config entry is gone: its cached tools would
     otherwise stay callable and spawn the server on first use."""
+    _session_env.close_for_bases([key])
     with _core._lock:
         _core._lazy_server_configs.pop(key, None)
         _core._lazy_server_fingerprints.pop(key, None)
