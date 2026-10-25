@@ -263,7 +263,10 @@ class MCPServerTransportMixin:
         await self._discover_tools()
         self._ready.set()
         self._ever_connected = True
-        _core._reset_server_error(self.name)
+        # A session_env variant runs on the MCP loop without its session's context: a name-based
+        # reset would clear the SHARED connection's breaker. Its own ledgers are cleared on connect.
+        if not getattr(self, "_session_variant", False):
+            _core._reset_server_error(self.name)
         # Session is live again: clear any breaker state from a prior outage so the first call after
         # recovery isn't gated on a stale consecutive-failure count (#16788).
         # A completed handshake alone is NOT proof of health: a flapping transport can handshake fine and
