@@ -35,6 +35,8 @@ _MAX_VARIANTS = 16
 _pending: dict = {}      # variant key -> (base key, {name: value}); values stay in memory only
 _last_used: dict = {}    # variant key -> monotonic time
 _connect_locks: dict = {}
+_retry_after: dict = {}  # variant key -> monotonic deadline after a failed connect (no respawn storm)
+_CONNECT_RETRY_COOLDOWN_SEC = 30.0
 _guard = threading.Lock()
 _LOG_SALT = os.urandom(16)  # per-process: a logged id cannot be brute-forced offline
 _REAP_INTERVAL_SEC = 60.0
@@ -50,6 +52,7 @@ def reset() -> None:
         _pending.clear()
         _last_used.clear()
         _connect_locks.clear()
+        _retry_after.clear()
         _reaper = None
     for k in [k for k in _core._tool_read_only_hints if is_variant_key(k)]:
         _core._tool_read_only_hints.pop(k, None)
@@ -63,6 +66,7 @@ def reset() -> None:
 
 def _forget_ledgers(key) -> None:
     """Drop the breaker/error ledgers of a variant key (a re-created variant starts clean)."""
+    _retry_after.pop(key, None)
     for name in ("_server_error_counts", "_server_breaker_opened_at", "_server_errors_all_application",
                  "_server_connect_errors"):
         ledger = getattr(_core, name, None)
@@ -92,6 +96,8 @@ def reap_idle(now: Optional[float] = None) -> int:
     connected (or were evicted) and have not been used for the TTL. Returns the closed count."""
     now = time.monotonic() if now is None else now
     with _guard:
+        for k in [k for k, t in _retry_after.items() if now >= t]:
+            _retry_after.pop(k, None)
         idle = [k for k, t in _last_used.items() if now - t > _IDLE_TTL_SEC]
     live = [k for k in idle if k in _core._servers]
     with _guard:
@@ -252,6 +258,10 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
         if server is not None and server.session is not None:
             return server
         with _guard:
+            retry_at = _retry_after.get(key)
+        if retry_at is not None and time.monotonic() < retry_at:
+            return server  # a recent connect failed: do not spawn another process yet
+        with _guard:
             pending = _pending.get(key)
         base_config = _base_config(pending[0]) if pending else None
         if base_config is None:
@@ -299,6 +309,8 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
                 _last_used.pop(key, None)
                 _connect_locks.pop(key, None)
             _forget_ledgers(key)
+            with _guard:
+                _retry_after[key] = time.monotonic() + _CONNECT_RETRY_COOLDOWN_SEC
             return None
         _forget_ledgers(key)  # a fresh handshake starts the variant's own breaker clean
         with _core._lock:

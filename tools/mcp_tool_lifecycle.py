@@ -166,7 +166,7 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None, names: Optional[set] = 
     the wait for the close to land on the MCP loop — a caller running one pass per served
     profile under a total budget divides it, or N profiles × 15s starve the wildcard pass that
     actually stops the loop."""
-    from tools.mcp_tool_scope import _key_name
+    from tools.mcp_tool_scope import _key_name, _key_scope
     from tools import mcp_tool_session_env as _session_env
     wildcard = scope is None and names is None
     if wildcard:
@@ -176,7 +176,12 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None, names: Optional[set] = 
         if names is not None:
             selected = [key for key in selected if _key_name(key) in names]
     if not wildcard:
-        _session_env.close_for_bases(selected)
+        # A lazy base that never connected has no _servers entry but may own live variants.
+        with _core._lock:
+            lazy = [key for key in _core._lazy_server_configs
+                    if _core._server_scope_keys.get(key, _key_scope(key)) == scope
+                    and (names is None or _key_name(key) in names)]
+        _session_env.close_for_bases(list(selected) + lazy)
     with _core._lock:
         servers_snapshot = [_core._servers[key] for key in selected]
         if names is not None:
