@@ -2244,8 +2244,10 @@ updates:
 
   # After an update parks local commits or a conflicted autostash, classify them.
   # dry-run prints the plan and changes nothing further. apply replays clean
-  # changes onto the tree the updater already reset, and leaves conflicts out.
-  # off skips the plan. Unset is dry-run.
+  # changes onto the tree the updater already reset. That writes that tree; it
+  # is not a worktree integration branch. Leave this at dry-run when that tree
+  # must stay untouched, and use `python -m hermes_cli.update_carry --apply
+  # --worktree <outside>` instead. off skips the plan. Unset is dry-run.
   carry_reapply: "dry-run"
 
 
