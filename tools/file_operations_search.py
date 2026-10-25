@@ -218,6 +218,157 @@ def _prepend_skipped_paths_warning(diagnostics: str, existing: Optional[str]) ->
     return warning if not existing else f"{warning} {existing}"
 
 
+# A non-zero exit with partial stdout and a line we do not recognise is still a
+# partial result — but regex/usage failures must not be papered over as one.
+_FATAL_SEARCH_DIAGNOSTIC_RE = re.compile(
+    r"regex parse error|error parsing|unrecognized flag|unrecognized option|\bUnmatched\b",
+    re.IGNORECASE,
+)
+_UNKNOWN_LINE_LIMIT = 4
+_UNKNOWN_CHAR_LIMIT = 280
+_USERINFO_RE = re.compile(r"(https?://)[^\s/@:]+:[^\s/@]+@")
+_BEARER_RE = re.compile(r"(?i)(Authorization:\s*Bearer\s+)\S+")
+_HEADER_KEY_RE = re.compile(r"(?i)(X-Api-Key:\s*)\S+")
+_ASSIGN_RE = re.compile(r"(?i)((?:api_key|token|password|secret)=)[^\s&;,\"']+")
+_PREFIX_TOKEN_RE = re.compile(
+    r"(?:ghp_|gho_|ghu_|ghs_|github_pat_|sk-|xox[baprs]-|AKIA)[A-Za-z0-9_\-]{8,}")
+
+
+def _redact_diagnostic_text(text: str) -> str:
+    """Drop credential shapes before a diagnostic is shown. Whole values, no suffix."""
+    if not text:
+        return text
+    text = _USERINFO_RE.sub(r"\1", text)
+    text = _BEARER_RE.sub(r"\1[REDACTED]", text)
+    text = _HEADER_KEY_RE.sub(r"\1[REDACTED]", text)
+    text = _ASSIGN_RE.sub(r"\1[REDACTED]", text)
+    return _PREFIX_TOKEN_RE.sub("[REDACTED]", text)
+
+
+def _diagnostic_lines(diagnostics: str) -> list[str]:
+    return [line.strip() for line in diagnostics.splitlines() if line.strip()]
+
+
+def _is_fatal_search_diagnostic(diagnostics: str) -> bool:
+    return any(_FATAL_SEARCH_DIAGNOSTIC_RE.search(line) for line in _diagnostic_lines(diagnostics))
+
+
+def _unknown_diagnostic_lines(diagnostics: str) -> list[str]:
+    """Non-blank lines that are not a known unreadable-path form, redacted and deduped."""
+    seen: list[str] = []
+    for line in _diagnostic_lines(diagnostics):
+        if _match_unreadable_path_diagnostic(line):
+            continue
+        redacted = _redact_diagnostic_text(line)
+        if redacted and redacted not in seen:
+            seen.append(redacted)
+    return seen
+
+
+def _bounded_unknown_diagnostics(lines: list[str]) -> str:
+    """Join diagnostic lines, capping count and length, and note how many were dropped."""
+    shown: list[str] = []
+    used = 0
+    for line in lines:
+        if len(shown) >= _UNKNOWN_LINE_LIMIT or used >= _UNKNOWN_CHAR_LIMIT:
+            break
+        room = _UNKNOWN_CHAR_LIMIT - used
+        piece = line if len(line) <= room else line[: max(0, room - 3)].rstrip() + "..."
+        if not piece or piece == "...":
+            break
+        shown.append(piece)
+        used += len(piece) + 2
+    extra = len(lines) - len(shown)
+    text = "; ".join(shown)
+    if extra > 0:
+        text += f" (+{extra} more)"
+    return text
+
+
+def _unknown_diagnostics_warning(lines: list[str]) -> str:
+    return (
+        "Search returned partial results. Unrecognized diagnostic(s): "
+        + _bounded_unknown_diagnostics(lines)
+    )
+
+
+def _join_warnings(*parts: Optional[str]) -> Optional[str]:
+    text = ""
+    for part in parts:
+        if not part or part in text:
+            continue
+        text = part if not text else f"{text} {part}"
+    return text or None
+
+
+def _file_search_invocation_error(order: str, detail: str) -> SearchResult:
+    if order == "modified":
+        return SearchResult(error=(
+            "Exact modification-time order search failed (ripgrep 14+ "
+            "required for --sortr=modified; the installed rg passed the "
+            f"version check, so this is an invocation failure: {detail}). "
+            "Use order='discovery'."))
+    return SearchResult(error=f"File search failed while running ripgrep: {detail}")
+
+
+def _file_search_rg_disposition(
+    exit_code: int,
+    diagnostics: str,
+    has_files: bool,
+    order: str,
+    *,
+    bounded_sigpipe: bool,
+) -> tuple[Optional[SearchResult], Optional[str], bool]:
+    """Fail closed, or return a warning and whether the exit was path-only.
+
+    Unknown non-fatal lines with partial stdout degrade to a warning. Regex,
+    usage, and an error exit with no files stay errors.
+    """
+    fatal = _is_fatal_search_diagnostic(diagnostics)
+    unknown = [] if fatal else _unknown_diagnostic_lines(diagnostics)
+    skipped = [] if fatal else _extract_unreadable_paths(diagnostics)
+    warning = _skipped_unreadable_warning(skipped) if skipped else None
+    if unknown and has_files:
+        warning = _join_warnings(warning, _unknown_diagnostics_warning(unknown))
+    detail = _redact_diagnostic_text(diagnostics.strip() or "no diagnostics")
+    if fatal:
+        return _file_search_invocation_error(order, detail), None, False
+    recoverable_only = exit_code == 2 and bool(skipped) and not unknown
+    unknown_partial = exit_code == 2 and bool(unknown) and has_files
+    explained = exit_code in {0, 1, 124} or bounded_sigpipe or recoverable_only or unknown_partial
+    if not explained:
+        return _file_search_invocation_error(order, detail), None, False
+    return None, warning, recoverable_only
+
+
+def _content_search_diagnostics(
+    exit_code: int,
+    diagnostics: str,
+    has_payload: bool,
+    existing: Optional[str],
+) -> tuple[Optional[SearchResult], Optional[str]]:
+    """Content-search twin: hard-fail regex/usage and empty unknown exits."""
+    if _is_fatal_search_diagnostic(diagnostics):
+        detail = _redact_diagnostic_text(diagnostics.strip() or "Search error")
+        return SearchResult(error=f"Search failed: {detail}", total_count=0), None
+    if exit_code == 2 and not has_payload:
+        if _is_recoverable_path_only_error(diagnostics):
+            warning = _prepend_skipped_paths_warning(diagnostics, existing)
+            if not warning:
+                warning = _UNREADABLE_SEARCH_HINT
+            elif _UNREADABLE_SEARCH_HINT not in warning:
+                warning = f"{warning} {_UNREADABLE_SEARCH_HINT}"
+            return SearchResult(total_count=0, warning=warning), None
+        detail = _redact_diagnostic_text(diagnostics.strip() or "Search error")
+        return SearchResult(error=f"Search failed: {detail}", total_count=0), None
+    warning = _prepend_skipped_paths_warning(diagnostics, existing)
+    if has_payload and exit_code not in (0, None):
+        unknown = _unknown_diagnostic_lines(diagnostics)
+        if unknown:
+            warning = _join_warnings(warning, _unknown_diagnostics_warning(unknown))
+    return None, warning
+
+
 _UNREADABLE_SEARCH_HINT = (
     "Every reported path was skipped because it could not be read, so the searchable "
     "scope itself is unreadable: fix permissions, remove invalid/reserved-name entries, "
@@ -280,24 +431,16 @@ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
                          context: int, warning: Optional[str] = None) -> SearchResult:
     """Parse rg/grep ``| head`` output into a SearchResult (shared by both engines).
     Exit codes: 0=matches, 1=none, 2=error — but both tools return 2 on PARTIAL
-    errors (one unreadable file), so an error is surfaced only when exit==2 AND no
-    usable payload remains. ``warning`` is attached to files_only/content results."""
+    errors (one unreadable file, or an unrecognised diagnostic beside real
+    matches). An error is surfaced when the diagnostics are a regex/usage
+    failure, or exit==2 and no usable payload remains. ``warning`` is attached
+    to files_only/content/count results."""
     stdout, limit_reason = _search_stdout_and_limit(result)
     diagnostics, payload = _split_tool_diagnostics(stdout)
-    if result.exit_code == 2 and not payload.strip():
-        error_msg = diagnostics.strip() or result.stdout.strip() or "Search error"
-        if _is_recoverable_path_only_error(error_msg):
-            # Pure unreadable-path failure: rg read nothing but the invocation was
-            # sound. Degrade to an explicit empty result instead of failing — the
-            # model can still act on the named paths.
-            warning = _prepend_skipped_paths_warning(error_msg, warning)
-            if not warning:
-                warning = _UNREADABLE_SEARCH_HINT
-            elif _UNREADABLE_SEARCH_HINT not in warning:
-                warning = f"{warning} {_UNREADABLE_SEARCH_HINT}"
-            return SearchResult(total_count=0, warning=warning)
-        return SearchResult(error=f"Search failed: {error_msg}", total_count=0)
-    warning = _prepend_skipped_paths_warning(diagnostics, warning)
+    early, warning = _content_search_diagnostics(
+        result.exit_code, diagnostics, bool(payload.strip()), warning)
+    if early is not None:
+        return early
     lines = [ln for ln in payload.strip().split('\n') if ln]
     if output_mode == "files_only":
         return SearchResult(
@@ -314,7 +457,7 @@ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
                     pass
         return SearchResult(
             counts=counts, total_count=sum(counts.values()),
-            truncated=bool(limit_reason), limit_reason=limit_reason)
+            truncated=bool(limit_reason), limit_reason=limit_reason, warning=warning)
     matches = []
     for line in lines:
         if line == "--":
@@ -1066,28 +1209,18 @@ class SearchMixin:
         # Permission-denied diagnostics are partial-success signals independent of
         # the exit code: exit 2 = traversal hit unreadable paths (degrade below),
         # exit 124 = timed out while ALSO skipping them (warning rides along).
-        skipped = _extract_unreadable_paths(diagnostics) \
-            if _is_recoverable_path_only_error(diagnostics) else []
-        recoverable_paths_only = result.exit_code == 2 and bool(skipped)
-        warning = _skipped_unreadable_warning(skipped) if skipped else None
+        # An unrecognised line with partial stdout is the same contract: keep the
+        # files and surface the line. Regex/usage and an empty error exit do not.
         if scoped_common:
             all_files = [
                 f if posixpath.isabs(f) else posixpath.normpath(posixpath.join(scoped_common, f))
                 for f in all_files]
         bounded_sigpipe = result.exit_code == 141 and len(all_files) >= fetch_limit
-        if (result.exit_code not in {0, 1, 124} and not bounded_sigpipe
-                and not recoverable_paths_only):
-            detail = diagnostics.strip() or "no diagnostics"
-            if order == "modified":
-                # ripgrep 14+ was already verified by the capability gate, so this
-                # failure is an invocation/traversal error, not a version problem.
-                return SearchResult(error=(
-                    "Exact modification-time order search failed (ripgrep 14+ "
-                    "required for --sortr=modified; the installed rg passed the "
-                    f"version check, so this is an invocation failure: {detail}). "
-                    "Use order='discovery'."))
-            return SearchResult(error=(
-                f"File search failed while running ripgrep: {detail}"))
+        early, warning, recoverable_paths_only = _file_search_rg_disposition(
+            result.exit_code, diagnostics, bool(all_files), order,
+            bounded_sigpipe=bounded_sigpipe)
+        if early is not None:
+            return early
         # rg --files lists files only; supplement with matching directories so
         # empty directories stay discoverable (#54347). Skip the extra traversal
         # when rg already timed out — partial file results must not be presented
