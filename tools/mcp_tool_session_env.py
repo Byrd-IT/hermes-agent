@@ -8,8 +8,8 @@ server in: the named, non-secret variables travel as the session's ``client_env`
 ``agent.session_client_env``; they are therefore merged into the terminal's
 ``client_env_passthrough`` allowlist, so a declared name also reaches terminal tools), and a turn that carries any of them calls its OWN connection,
 spawned from the server's templates re-rendered with those values and keyed by their digest.
-The shared connection is untouched, other runs never see this one, and its breaker, trust and
-hint ledgers are its own. Variant connections register no tools (the profile's overlay already
+The shared connection is untouched, other runs never see this one, and its circuit breaker is its own
+(trust policy and read-only hints stay the profile server's). Variant connections register no tools (the profile's overlay already
 has them), live in ``_servers`` under a ``(<scope>#env:<digest>, name)`` key and are closed when
 idle (``_IDLE_TTL_SEC``) or past ``_MAX_VARIANTS`` (least recently used first).
 """
@@ -53,6 +53,21 @@ def reset() -> None:
         _reaper = None
     for k in [k for k in _core._tool_read_only_hints if is_variant_key(k)]:
         _core._tool_read_only_hints.pop(k, None)
+    for name in ("_server_error_counts", "_server_breaker_opened_at", "_server_errors_all_application",
+                 "_server_connect_errors"):
+        ledger = getattr(_core, name, None)
+        if isinstance(ledger, dict):
+            for k in [k for k in ledger if is_variant_key(k)]:
+                ledger.pop(k, None)
+
+
+def _forget_ledgers(key) -> None:
+    """Drop the breaker/error ledgers of a variant key (a re-created variant starts clean)."""
+    for name in ("_server_error_counts", "_server_breaker_opened_at", "_server_errors_all_application",
+                 "_server_connect_errors"):
+        ledger = getattr(_core, name, None)
+        if isinstance(ledger, dict):
+            ledger.pop(key, None)
 
 
 def close_for_bases(base_keys) -> int:
@@ -148,7 +163,10 @@ def variant_key(base_key):
     env = bound_client_env()
     if not env or is_variant_key(base_key):
         return None
-    names = declared_names(_base_config(base_key))
+    base = _base_config(base_key)
+    if isinstance(base, dict) and base.get("url"):
+        return None  # stdio only: a client value must never choose the host that receives the profile's headers
+    names = declared_names(base)
     values = {n: env[n] for n in names if isinstance(env.get(n), str) and env[n] != ""}
     if not values:
         return None
@@ -205,6 +223,7 @@ def _close(keys) -> None:
             _last_used.pop(k, None)
             _connect_locks.pop(k, None)
         _core._tool_read_only_hints.pop(k, None)
+        _forget_ledgers(k)
     from tools import mcp_tool_loop as _loop
 
     async def _shutdown():
@@ -244,7 +263,14 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
                     server_name, ",".join(sorted(pending[1])), hmac.new(_LOG_SALT, key[0].encode(), "sha256").hexdigest()[:8])
         _loop._ensure_mcp_loop()
 
+        stale = server  # a variant whose session dropped (recycle, backoff): replaced, never orphaned
+
         async def _go():
+            if stale is not None:
+                try:
+                    await stale.shutdown()
+                except Exception:  # health: allow BLE001 -- best-effort; the replacement still connects
+                    logger.debug("MCP session-env stale variant shutdown failed", exc_info=True)
             claimed: list = []
             token = _core._connect_server_claim.set(lambda s: (setattr(s, "_session_variant", True),
                                                                claimed.append(s)))
@@ -272,6 +298,7 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
                 _pending.pop(key, None)
                 _last_used.pop(key, None)
                 _connect_locks.pop(key, None)
+            _forget_ledgers(key)
             return None
         with _core._lock:
             _core._servers[key] = server
