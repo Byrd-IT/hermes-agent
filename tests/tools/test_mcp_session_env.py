@@ -345,3 +345,47 @@ def test_variant_handshake_does_not_close_the_shared_breaker(tmp_path):
             assert _core._server_error_counts.get(base) == 5 and base in _core._server_breaker_opened_at
     finally:
         shutdown_mcp_servers()
+
+
+def test_scoped_shutdown_closes_variants_of_a_lazy_base_that_never_connected(tmp_path):
+    from tools import mcp_tool_session_env as se
+    from tools.mcp_tool_common import _core
+    from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+    try:
+        with patch.dict(os.environ, _clean_env(), clear=True):
+            tool = _setup(tmp_path)
+            base = next(k for k in _core._servers if not se.is_variant_key(k))
+            _call(tool, {"TEST_RUN_PIN": "slug-a"})
+            assert any(se.is_variant_key(k) for k in _core._servers)
+            # The shared connection is gone (never connected / parked); only its lazy config is left.
+            _core._lazy_server_configs[base] = {"command": sys.executable, "args": [], "session_env": ["TEST_RUN_PIN"],
+                                                "lazy": True}
+            _core._servers.pop(base)
+            shutdown_mcp_servers(names={"pinsrv"})
+            assert not [k for k in _core._servers if se.is_variant_key(k)]
+    finally:
+        _core._lazy_server_configs.pop("pinsrv", None)
+        shutdown_mcp_servers()
+
+
+def test_failed_variant_connect_is_not_respawned_inside_the_cooldown(tmp_path):
+    from tools import mcp_tool_session_env as se
+    from tools.mcp_tool_common import _core
+    from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+    attempts = []
+
+    async def _boom(name, config):
+        attempts.append(name)
+        raise RuntimeError("cannot start")
+    try:
+        with patch.dict(os.environ, _clean_env(), clear=True):
+            tool = _setup(tmp_path)
+            with patch("tools.mcp_tool_discovery._connect_server", _boom):
+                for _ in range(4):
+                    _call(tool, {"TEST_RUN_PIN": "slug-a"})
+                assert len(attempts) == 1
+                assert se._retry_after  # cooldown recorded for the failed key
+                vkey = next(iter(se._retry_after))
+                assert _core._server_error_counts.get(vkey, 0) >= 3 and vkey in _core._server_breaker_opened_at
+    finally:
+        shutdown_mcp_servers()
