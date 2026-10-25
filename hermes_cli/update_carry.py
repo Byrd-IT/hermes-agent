@@ -667,11 +667,14 @@ def apply_in_worktree(
             results.append({**_public(row), "applied": applied})
         dirty = _git(dest, ["status", "--porcelain"], git_bin=git_bin).stdout
         if dirty.strip():
-            _git(dest, ["add", "-A"], git_bin=git_bin)
-            _git(dest, [
+            _ok(_git(dest, ["add", "-A"], git_bin=git_bin), "git add")
+            _ok(_git(dest, [
                 "-c", "user.name=carry-reapply", "-c", "user.email=carry-reapply@localhost",
                 "commit", "-m", "carry-reapply: replay uncommitted edits",
-            ], git_bin=git_bin)
+            ], git_bin=git_bin), "git commit")
+            leftover = _git(dest, ["status", "--porcelain"], git_bin=git_bin).stdout
+            if leftover.strip():
+                raise CarryError("replayed edits are not in the integration head")
     except Exception:
         logger.exception("carry-reapply worktree replay failed")
         raise
