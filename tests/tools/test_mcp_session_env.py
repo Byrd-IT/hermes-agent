@@ -329,5 +329,19 @@ def test_variant_handshake_does_not_close_the_shared_breaker(tmp_path):
             _call(tool, {"TEST_RUN_PIN": "slug-a"})
             assert any(se.is_variant_key(k) for k in _core._servers)
             assert _core._server_error_counts.get(base) == 5 and base in _core._server_breaker_opened_at
+            # A variant that re-serves (reconnect) runs on the MCP loop with NO session_env override,
+            # where a name-based reset would resolve to the SHARED key. Drive that path directly.
+            variant = next(v for k, v in _core._servers.items() if se.is_variant_key(k))
+            assert getattr(variant, "_session_variant", False)
+            from unittest.mock import AsyncMock, MagicMock
+
+            async def _reserve():
+                variant._negotiate_session = AsyncMock(return_value=MagicMock())
+                variant._discover_tools = AsyncMock()
+                variant._wait_for_lifecycle_event = AsyncMock(return_value="shutdown")
+                await variant._serve_session(MagicMock(), 5.0)
+            from tools.mcp_tool_loop import _run_on_mcp_loop
+            _run_on_mcp_loop(_reserve, timeout=20)
+            assert _core._server_error_counts.get(base) == 5 and base in _core._server_breaker_opened_at
     finally:
         shutdown_mcp_servers()
