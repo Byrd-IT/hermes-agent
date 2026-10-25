@@ -11,6 +11,8 @@ import pytest
 from hermes_cli.update_carry import (
     CarryError,
     apply_in_worktree,
+    apply_pr_state,
+    autostash_refs,
     carry_mode,
     decide,
     plan_repo,
@@ -193,3 +195,103 @@ def test_log_filter_redacts_userinfo(caplog):
             update_carry.logger.exception("carry failed")
     assert "user:pass" not in caplog.text
     assert "[REDACTED]" in caplog.text
+
+
+def test_untracked_new_file_is_reapplied(tmp_path: Path):
+    repo = _init(tmp_path)
+    (repo / "newfeature.py").write_text("print('carried')\n", encoding="utf-8")
+    plan = plan_repo(repo, upstream="origin/main")
+    item = next(row for row in plan["items"] if row["identity"] == "worktree:newfeature.py")
+    assert item["action"] == "reapply"
+    assert item["reason"] != "empty"
+    dest = tmp_path / "integration"
+    apply_in_worktree(repo, plan, dest, "carry-new")
+    assert (dest / "newfeature.py").read_text(encoding="utf-8") == "print('carried')\n"
+
+
+def test_untracked_path_with_space_is_not_empty(tmp_path: Path):
+    repo = _init(tmp_path)
+    (repo / "my file.txt").write_text("spaced\n", encoding="utf-8")
+    plan = plan_repo(repo, upstream="origin/main")
+    item = next(row for row in plan["items"] if "my file.txt" in row["identity"])
+    assert '"' not in item["identity"]
+    assert item["action"] == "reapply"
+    assert item["reason"] != "empty"
+
+
+def test_stash_untracked_file_is_carried(tmp_path: Path):
+    repo = _init(tmp_path)
+    (repo / "clean.txt").write_text("edit\n", encoding="utf-8")
+    (repo / "brandnew.py").write_text("x=1\n", encoding="utf-8")
+    _git(repo, "stash", "push", "-u", "-m", "hermes-update-autostash-x")
+    plan = plan_repo(repo, upstream="origin/main", stashes=("stash@{0}",))
+    item = next(row for row in plan["items"] if "brandnew.py" in row["identity"])
+    assert item["action"] == "reapply"
+    dest = tmp_path / "integration"
+    apply_in_worktree(repo, plan, dest, "carry-stash-new")
+    assert (dest / "brandnew.py").read_text(encoding="utf-8") == "x=1\n"
+    assert "stash@{0}" in _git(repo, "stash", "list")
+
+
+def test_autostash_refs_ignore_position(tmp_path: Path):
+    repo = _init(tmp_path)
+    (repo / "clean.txt").write_text("auto\n", encoding="utf-8")
+    _git(repo, "stash", "push", "-m", "hermes-update-autostash-x")
+    (repo / "extra.txt").write_text("newer\n", encoding="utf-8")
+    _git(repo, "stash", "push", "-m", "manual-note")
+    refs = autostash_refs(repo)
+    assert refs == ["stash@{1}"]
+    assert "manual-note" not in " ".join(refs)
+
+
+def test_apply_state_dir_survives_a_changed_carried_set(tmp_path: Path, capsys):
+    repo = _init(tmp_path)
+    (repo / "clean.txt").write_text("edit1\n", encoding="utf-8")
+    source_head = _git(repo, "rev-parse", "HEAD")
+    argv = [
+        "--repo", str(repo), "--upstream", "origin/main", "--apply",
+        "--worktree", str(tmp_path / "wt"), "--state-dir", str(tmp_path / "state"),
+        "--quiet",
+    ]
+    assert update_carry.main(argv) == 0
+    assert update_carry.main(argv) == 0
+    assert "unchanged" in capsys.readouterr().out
+    (repo / "clean.txt").write_text("edit2\n", encoding="utf-8")
+    rc = update_carry.main(argv)
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "already exists" not in captured.err
+    found = [
+        path for path in tmp_path.iterdir()
+        if path.is_dir() and (path / "clean.txt").is_file()
+        and (path / "clean.txt").read_text(encoding="utf-8") == "edit2\n"
+    ]
+    assert found
+    assert _git(repo, "rev-parse", "HEAD") == source_head
+    branches = _git(repo, "branch")
+    assert "carry-reapply" in branches
+
+
+def test_apply_pr_state_merged_open_and_lookup_failed():
+    base = {
+        "patch_equivalent": False, "apply_check": "clean", "identity": "abc",
+        "files": ["a.txt"], "sha": "abc",
+    }
+    dropped = apply_pr_state(base, {
+        "lookup": "ok", "state": "MERGED", "number": 9, "match": "sha",
+    })
+    assert dropped["action"] == "drop"
+    assert dropped["reason"] == "merged-upstream"
+    assert "no_upstream_pr" not in dropped["flags"]
+
+    opened = apply_pr_state(base, {
+        "lookup": "ok", "state": "OPEN", "number": 3, "match": "file",
+    })
+    assert opened["action"] == "reapply"
+    assert opened["reason"] == "still-open"
+    assert "no_upstream_pr" not in opened["flags"]
+
+    failed = apply_pr_state(base, {"lookup": "failed"})
+    assert failed["action"] == "reapply"
+    assert "pr_lookup_failed" in failed["flags"]
+    assert "no_upstream_pr" not in failed["flags"]
