@@ -218,10 +218,18 @@ def _prepend_skipped_paths_warning(diagnostics: str, existing: Optional[str]) ->
     return warning if not existing else f"{warning} {existing}"
 
 
-# A non-zero exit with partial stdout and a line we do not recognise is still a
-# partial result — but regex/usage failures must not be papered over as one.
+# Invocation-level failures only. A nested ignore file warns with
+# ``rg: <path>/.gitignore: line N: error parsing glob ...`` and keeps walking;
+# that is not this form (no ``<path>: line N:`` prefix). A known unreadable-path
+# line is never fatal either — its path can contain these words.
 _FATAL_SEARCH_DIAGNOSTIC_RE = re.compile(
-    r"regex parse error|error parsing|unrecognized flag|unrecognized option|\bUnmatched\b",
+    r"^(?:"
+    r"rg:\s+regex parse error\b|"
+    r"rg:\s+error parsing flag\b|"
+    r"rg:\s+error parsing glob\b|"
+    r"(?:(?:rg|grep):\s+)?unrecognized (?:flag|option)\b|"
+    r"grep:\s+Unmatched\b"
+    r")",
     re.IGNORECASE,
 )
 _UNKNOWN_LINE_LIMIT = 4
@@ -249,8 +257,46 @@ def _diagnostic_lines(diagnostics: str) -> list[str]:
     return [line.strip() for line in diagnostics.splitlines() if line.strip()]
 
 
-def _is_fatal_search_diagnostic(diagnostics: str) -> bool:
-    return any(_FATAL_SEARCH_DIAGNOSTIC_RE.search(line) for line in _diagnostic_lines(diagnostics))
+def _split_file_search_output(stdout: str) -> tuple[str, list[str]]:
+    """Separate file paths from rg/grep diagnostics, including continuations.
+
+    ``rg --files`` paths may contain spaces, so the content-mode shape matcher
+    cannot be used. A line that begins with ``rg: `` or ``grep: `` is a
+    diagnostic; an indented line that follows one is its continuation, not a path.
+    """
+    diagnostics: list[str] = []
+    files: list[str] = []
+    in_diagnostic = False
+    for line in stdout.splitlines():
+        if not line:
+            continue
+        if line.lstrip().startswith(("rg: ", "grep: ")):
+            diagnostics.append(line)
+            in_diagnostic = True
+            continue
+        if in_diagnostic and line[:1].isspace():
+            diagnostics.append(line)
+            continue
+        in_diagnostic = False
+        files.append(line)
+    return "\n".join(diagnostics), files
+
+
+def _is_fatal_search_diagnostic(diagnostics: str, *, exit_code: int | None = None) -> bool:
+    """True for an invocation-level regex or usage failure.
+
+    Exit 0 already succeeded; a diagnostic on that run is at most a warning.
+    A line the unreadable-path matcher recognises is a skipped path, even when
+    the path text contains a fatal keyword.
+    """
+    if exit_code == 0:
+        return False
+    for line in _diagnostic_lines(diagnostics):
+        if _match_unreadable_path_diagnostic(line):
+            continue
+        if _FATAL_SEARCH_DIAGNOSTIC_RE.search(line):
+            return True
+    return False
 
 
 def _unknown_diagnostic_lines(diagnostics: str) -> list[str]:
@@ -324,7 +370,7 @@ def _file_search_rg_disposition(
     Unknown non-fatal lines with partial stdout degrade to a warning. Regex,
     usage, and an error exit with no files stay errors.
     """
-    fatal = _is_fatal_search_diagnostic(diagnostics)
+    fatal = _is_fatal_search_diagnostic(diagnostics, exit_code=exit_code)
     unknown = [] if fatal else _unknown_diagnostic_lines(diagnostics)
     skipped = [] if fatal else _extract_unreadable_paths(diagnostics)
     warning = _skipped_unreadable_warning(skipped) if skipped else None
@@ -348,7 +394,7 @@ def _content_search_diagnostics(
     existing: Optional[str],
 ) -> tuple[Optional[SearchResult], Optional[str]]:
     """Content-search twin: hard-fail regex/usage and empty unknown exits."""
-    if _is_fatal_search_diagnostic(diagnostics):
+    if _is_fatal_search_diagnostic(diagnostics, exit_code=exit_code):
         detail = _redact_diagnostic_text(diagnostics.strip() or "Search error")
         return SearchResult(error=f"Search failed: {detail}", total_count=0), None
     if exit_code == 2 and not has_payload:
@@ -362,10 +408,11 @@ def _content_search_diagnostics(
         detail = _redact_diagnostic_text(diagnostics.strip() or "Search error")
         return SearchResult(error=f"Search failed: {detail}", total_count=0), None
     warning = _prepend_skipped_paths_warning(diagnostics, existing)
-    if has_payload and exit_code not in (0, None):
-        unknown = _unknown_diagnostic_lines(diagnostics)
-        if unknown:
-            warning = _join_warnings(warning, _unknown_diagnostics_warning(unknown))
+    unknown = _unknown_diagnostic_lines(diagnostics)
+    # Exit 0 succeeded; still surface a non-fatal line instead of dropping it.
+    # A non-zero exit only carries that warning when there is a real payload.
+    if unknown and (exit_code == 0 or (has_payload and exit_code not in (0, None))):
+        warning = _join_warnings(warning, _unknown_diagnostics_warning(unknown))
     return None, warning
 
 
@@ -1197,15 +1244,9 @@ class SearchMixin:
         stdout, limit_reason = _search_stdout_and_limit(result)
         # Files-mode transport mixes stderr into stdout, but file paths may contain
         # spaces — the content-mode shape matcher (_SEARCH_OUTPUT_RE) would drop
-        # them as "diagnostics". rg/grep diagnostic lines always begin with
-        # "rg: "/"grep: " (continuation lines only matter on the fail-closed path),
-        # so classify by that prefix instead.
-        stdout_lines = stdout.splitlines()
-        diagnostics = "\n".join(
-            line for line in stdout_lines if line.lstrip().startswith(("rg: ", "grep: ")))
-        all_files = [
-            line for line in stdout_lines
-            if line and not line.lstrip().startswith(("rg: ", "grep: "))]
+        # them as "diagnostics". rg/grep diagnostic lines begin with "rg: "/"grep: ";
+        # an indented line after one is a continuation, not a path.
+        diagnostics, all_files = _split_file_search_output(stdout)
         # Permission-denied diagnostics are partial-success signals independent of
         # the exit code: exit 2 = traversal hit unreadable paths (degrade below),
         # exit 124 = timed out while ALSO skipping them (warning rides along).

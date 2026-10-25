@@ -212,3 +212,155 @@ def test_unknown_diagnostic_warning_is_bounded_and_deduplicated():
     assert len(bounded) < 400
     assert "(+" in bounded and "more" in bounded
     assert bounded.count("something went wrong") <= 5
+
+
+# A bad pattern inside a nested ignore file is a non-fatal warning. The line
+# carries ``error parsing glob`` but is prefixed by ``<path>: line N:``.
+# rg 15 exits 0; rg 14 exits 2 and still prints the matches.
+IGNORE_FILE_GLOB = (
+    "rg: /repo/sub/.gitignore: line 1: error parsing glob 'a{b': "
+    "unclosed character class; missing ']'\n"
+)
+
+
+@pytest.mark.parametrize("code", [0, 2])
+def test_file_search_ignore_file_glob_warning_keeps_partial_results(code):
+    env = RecordingEnvironment(rg_output=IGNORE_FILE_GLOB + PARTIAL_FILE, rg_code=code)
+
+    result = ShellFileOperations(env).search("*.py", path="/repo", target="files")
+
+    assert result.error is None
+    assert result.files == ["/repo/partial.py"]
+    assert "error parsing glob" in (result.warning or "")
+
+
+@pytest.mark.parametrize("code", [0, 2])
+def test_content_search_ignore_file_glob_warning_keeps_partial_results(code):
+    env = RecordingEnvironment(rg_output=IGNORE_FILE_GLOB + PARTIAL_MATCH, rg_code=code)
+
+    result = ShellFileOperations(env).search("needle", path="/repo", target="content")
+
+    assert result.error is None
+    assert [(m.path, m.line_number, m.content) for m in result.matches] == [
+        ("/repo/a.py", 3, "needle")]
+    assert "error parsing glob" in (result.warning or "")
+
+
+@pytest.mark.parametrize("path_name", ["error parsing", "Unmatched"])
+def test_file_search_permission_denied_path_with_fatal_keyword_recovers(path_name):
+    output = f"rg: /repo/{path_name}: Permission denied (os error 13)\n" + PARTIAL_FILE
+    env = RecordingEnvironment(rg_output=output, rg_code=2)
+
+    result = ShellFileOperations(env).search("*.py", path="/repo", target="files")
+
+    assert result.error is None
+    assert result.files == ["/repo/partial.py"]
+    assert path_name in (result.warning or "")
+
+
+@pytest.mark.parametrize("path_name", ["error parsing", "Unmatched"])
+def test_content_search_permission_denied_path_with_fatal_keyword_recovers(path_name):
+    output = f"rg: /repo/{path_name}: Permission denied (os error 13)\n" + PARTIAL_MATCH
+    env = RecordingEnvironment(rg_output=output, rg_code=2)
+
+    result = ShellFileOperations(env).search("needle", path="/repo", target="content")
+
+    assert result.error is None
+    assert [(m.path, m.line_number, m.content) for m in result.matches] == [
+        ("/repo/a.py", 3, "needle")]
+    assert path_name in (result.warning or "")
+
+
+def test_permission_denied_line_shaped_like_glob_error_is_not_fatal():
+    # The path itself is the invocation-level token. The unreadable-path
+    # matcher must win, or anchoring the fatal regex is not enough.
+    output = "rg: error parsing glob: Permission denied (os error 13)\n" + PARTIAL_FILE
+    env = RecordingEnvironment(rg_output=output, rg_code=2)
+
+    result = ShellFileOperations(env).search("*.py", path="/repo", target="files")
+
+    assert result.error is None
+    assert result.files == ["/repo/partial.py"]
+
+
+def test_file_search_multiline_unknown_error_with_no_real_files_is_an_error():
+    env = RecordingEnvironment(
+        rg_output="rg: some new failure:\n    continuation detail\n",
+        rg_code=2,
+    )
+
+    result = ShellFileOperations(env).search("*.py", path="/repo", target="files")
+
+    assert result.error is not None
+    assert result.files == []
+    assert "some new failure" in result.error
+    assert "continuation detail" not in result.files
+
+
+def test_file_search_continuation_line_is_not_counted_as_a_file():
+    output = "rg: some new failure:\n    continuation detail\n" + PARTIAL_FILE
+    env = RecordingEnvironment(rg_output=output, rg_code=2)
+
+    result = ShellFileOperations(env).search("*.py", path="/repo", target="files")
+
+    assert result.error is None
+    assert result.files == ["/repo/partial.py"]
+    assert "continuation detail" in (result.warning or "")
+
+
+@pytest.mark.parametrize("target,pattern,payload", [
+    ("files", "*.py", PARTIAL_FILE),
+    ("content", "needle", PARTIAL_MATCH),
+])
+def test_pathless_glob_error_still_fails_with_partial_stdout(target, pattern, payload):
+    env = RecordingEnvironment(
+        rg_output="rg: error parsing glob '[': unclosed character class\n" + payload,
+        rg_code=2,
+    )
+
+    result = ShellFileOperations(env).search(pattern, path="/repo", target=target)
+
+    assert result.error is not None
+    assert not result.files
+    assert not result.matches
+    assert result.warning is None
+
+
+def test_file_search_continuation_redacts_credentials_before_display():
+    bearer = "sk-" + ("n" * 12) + "ABCDEF"
+    password = "SynthPw" + "secret99" + "ABCDEF"
+    token = "ghp_" + ("q" * 20) + "ABCDEF"
+    header_key = "SYNTHhdr" + "key0123456789" + "ABCDEF"
+    query_key = "AKSYNTH" + "q0123456789" + "ABCDEF"
+    blob = (
+        "Authorization: Bearer " + bearer
+        + " https://synthuser:" + password + "@probe.example.invalid/api"
+        + " X-Api-Key: " + header_key
+        + " ?api_key=" + query_key
+        + " token=" + token
+    )
+    output = "rg: some new failure:\n    continuation " + blob + "\n" + PARTIAL_FILE
+    result = ShellFileOperations(
+        RecordingEnvironment(rg_output=output, rg_code=2)
+    ).search("*.py", path="/repo", target="files")
+
+    shown = (result.warning or "") + (result.error or "")
+    for secret in (bearer, password, token, header_key, query_key):
+        assert secret not in shown
+        assert secret[:8] not in shown
+        assert secret[-6:] not in shown
+    assert "[REDACTED]" in shown
+    assert result.error is None
+    assert result.files == ["/repo/partial.py"]
+
+
+def test_exit_zero_does_not_fail_closed_on_a_fatal_looking_line():
+    env = RecordingEnvironment(
+        rg_output="rg: regex parse error:\n" + PARTIAL_FILE,
+        rg_code=0,
+    )
+
+    result = ShellFileOperations(env).search("*.py", path="/repo", target="files")
+
+    assert result.error is None
+    assert result.files == ["/repo/partial.py"]
