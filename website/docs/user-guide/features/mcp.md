@@ -496,6 +496,7 @@ Hermes reads MCP config from `~/.hermes/config.yaml` under `mcp_servers`.
 | `client_cert` | string \| list | Client certificate for mTLS — a combined PEM path, or `[cert, key]` / `[cert, key, password]` |
 | `client_key` | string | Client private-key PEM path (when separate from `client_cert`) |
 | `identity_header` | mapping | Optional per-user identity header for HTTP/SSE servers — `{name, value_from: static\|profile, value}` |
+| `session_env` | list | Names of non-secret variables the *client* of a run may supply for this stdio server's launch `env` (for example `env: {PIN: ${RUN_PIN}}` with `session_env: [RUN_PIN]`). A run that sends one of them gets its own connection, spawned with that value; the shared connection and other runs never see it. See [Per-session launch env](#per-session-launch-env-session_env) |
 | `timeout` | number | Tool call timeout |
 | `connect_timeout` | number | Initial connection timeout (also bounds the MCP `initialize` handshake) |
 | `lazy` | bool | If `true`, register the server's tools from the schema cache at startup and only start/connect it on the first tool call (default `false`). Needs one prior live connect to fill the cache. |
@@ -541,6 +542,14 @@ mcp_servers:
     headers:
       Authorization: "Bearer ***"
 ```
+
+### Per-session launch env (`session_env`)
+
+Use `session_env` when a stdio server's launch environment is chosen per run rather than per profile. When a shell client (such as `hermes chat` one-shot) talks to a gateway, the gateway owns the MCP connections and starts them from its own environment, so a value only the client knows would never arrive. List the variable names under `session_env` and the client sends them with the turn.
+
+- Each distinct set of values gets its own connection, started from the server's `env`/`args` templates re-rendered with those values. Its circuit breaker, trust and hint state are separate from the shared connection's. It registers no tools of its own.
+- Idle per-session connections are closed after 15 minutes; at most 16 are kept (least recently used closed first). Shutting down or reloading the server closes its per-session connections too.
+- Security: only the names you declare are sent, and names that look like secrets (tokens, keys, passwords) are filtered out on both the client and the gateway. Declared names are added to `terminal.client_env_passthrough`, so the values also reach terminal-tool subprocesses of that run. Clients that are not local send nothing. Do not use `session_env` for secrets.
 
 ## Built-in presets
 

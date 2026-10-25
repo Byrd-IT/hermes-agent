@@ -140,7 +140,7 @@ def test_lazy_server_first_pinned_call_gets_a_variant_not_the_shared_connect(tmp
 
 
 def test_variant_inherits_read_only_hints_and_pruned_on_close(tmp_path):
-    """F7 + F4: hints copied to the variant; closing forgets all variant bookkeeping."""
+    """F4: closing forgets all variant bookkeeping (hints are read from the shared key)."""
     from agent.session_client_env import client_env_scope
     from tools import mcp_tool_session_env as se
     from tools.mcp_tool_common import _core
@@ -152,7 +152,7 @@ def test_variant_inherits_read_only_hints_and_pruned_on_close(tmp_path):
             _core._tool_read_only_hints[base] = {"who": True}
             _call(tool, {"TEST_RUN_PIN": "slug-a"})
             (vkey,) = [k for k in _core._servers if se.is_variant_key(k)]
-            assert _core._tool_read_only_hints[vkey] == {"who": True}
+            assert vkey not in _core._tool_read_only_hints
             assert vkey in se._pending and vkey in se._last_used
         # a key that never connects is forgotten by the reaper once idle
         se._pending[("x#env:dead", "pinsrv")] = (base, {})
@@ -202,5 +202,62 @@ def test_variant_breaker_strikes_do_not_open_shared_breaker(tmp_path):
                 assert _check_circuit_breaker("pinsrv") is not None
             assert _check_circuit_breaker("pinsrv") is None
             assert "pin=UNSET" in __import__("tools.registry", fromlist=["registry"]).registry.dispatch(tool, {})
+    finally:
+        shutdown_mcp_servers()
+
+
+def test_read_only_hint_known_on_first_pinned_call_before_variant_connects(tmp_path):
+    """The trust gate runs before the variant connects: hints must come from the shared key."""
+    from agent.session_client_env import client_env_scope
+    from tools import mcp_tool_session_env as se
+    from tools.mcp_tool_common import _core
+    from tools.mcp_tool_handlers import _tool_is_read_only
+    from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+    try:
+        with patch.dict(os.environ, _clean_env(), clear=True):
+            _setup(tmp_path)
+            base = next(k for k in _core._servers if not se.is_variant_key(k))
+            _core._tool_read_only_hints[base] = {"who": True}
+            with client_env_scope({"TEST_RUN_PIN": "slug-a"}):
+                assert not [k for k in _core._servers if se.is_variant_key(k)]
+                assert _tool_is_read_only("pinsrv", "who") is True
+                assert _tool_is_read_only("pinsrv", "other") is False
+    finally:
+        shutdown_mcp_servers()
+
+
+def test_changed_base_config_gets_a_fresh_variant_key(tmp_path):
+    from agent.session_client_env import client_env_scope
+    from tools import mcp_tool_session_env as se
+    from tools.mcp_tool_common import _core
+    from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+    from tools.mcp_tool_scope import _resolve_server_key
+    try:
+        with patch.dict(os.environ, _clean_env(), clear=True):
+            _setup(tmp_path)
+            base = next(k for k in _core._servers if not se.is_variant_key(k))
+            with client_env_scope({"TEST_RUN_PIN": "slug-a"}):
+                k1 = _resolve_server_key("pinsrv")
+                _core._servers[base]._config = {**_core._servers[base]._config, "args": ["--changed"]}
+                k2 = _resolve_server_key("pinsrv")
+                assert se.is_variant_key(k1) and se.is_variant_key(k2) and k1 != k2
+    finally:
+        shutdown_mcp_servers()
+
+
+def test_scoped_shutdown_closes_that_scopes_variants(tmp_path):
+    from tools import mcp_tool_session_env as se
+    from tools.mcp_tool_common import _core
+    from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+    try:
+        with patch.dict(os.environ, _clean_env(), clear=True):
+            tool = _setup(tmp_path)
+            base = next(k for k in _core._servers if not se.is_variant_key(k))
+            _call(tool, {"TEST_RUN_PIN": "slug-a"})
+            assert [k for k in _core._servers if se.is_variant_key(k)]
+            assert se.close_for_bases([base]) == 1
+            assert not [k for k in _core._servers if se.is_variant_key(k)]
+            assert not se._pending and not se._last_used and not se._connect_locks
+            assert base in _core._servers  # the shared connection is not touched here
     finally:
         shutdown_mcp_servers()
