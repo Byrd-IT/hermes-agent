@@ -119,7 +119,7 @@ def describe_child_exit(pids) -> str:
         else:
             when, reason, signame = info
             parts.append(f"pid {pid} was sent {signame} by Hermes {now - when:.1f}s earlier ({reason})")
-    return "; ".join(parts) or "no child pid was tracked"
+    return "; ".join(parts) or "no child pid tracked"
 
 
 def _leader_start_time(pid: int) -> Optional[int]:
