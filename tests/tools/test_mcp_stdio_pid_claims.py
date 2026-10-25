@@ -80,12 +80,19 @@ def test_run_stdio_serializes_snapshot_windows():
 
     children: set = set()
     seen: dict = {}
+    entered: list = []
+    both = None
 
     @asynccontextmanager
     async def fake_stdio_client(params, errlog=None):
-        await asyncio.sleep(0)  # yield mid-window so an unlocked sibling would interleave
         children.add(params.args[0])  # "pid" == the one arg
-        await asyncio.sleep(0)
+        entered.append(1)
+        if len(entered) == 2:
+            both.set()
+        try:  # unlocked siblings both enter and see each other; locked ones time out alone
+            await asyncio.wait_for(both.wait(), 0.3)
+        except asyncio.TimeoutError:
+            pass
         yield object(), object()
 
     class _Srv(MCPServerTransportMixin):
@@ -128,6 +135,8 @@ def test_run_stdio_serializes_snapshot_windows():
             return None
 
     async def main():
+        nonlocal both
+        both = asyncio.Event()
         a, b = _Srv("a"), _Srv("b")
         cfg = lambda pid: {"command": "node", "args": [pid]}
         await asyncio.gather(a._run_stdio(cfg(101)), b._run_stdio(cfg(102)))
