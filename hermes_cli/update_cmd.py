@@ -917,6 +917,11 @@ def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha, *, target_r
         print(f"  Try manually: git fetch origin && git reset --hard origin/{branch}")
         _record_stop("checkout_move_failed")
         sys.exit(1)
+    # The reset above is the existing same-branch move. Replay is a separate
+    # step and never resets again; a planner failure must not fail the update.
+    from hermes_cli.update_carry import reapply_after_diverged_reset
+    reapply_after_diverged_reset(
+        git_cmd, _m().PROJECT_ROOT, pre_pull_sha=pre_pull_sha, upstream_ref=merge_ref)
 
 
 def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha, *, rollback_branch=None, _windows_gateway_resume=None) -> None:
