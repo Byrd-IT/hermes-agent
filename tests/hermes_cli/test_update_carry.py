@@ -314,3 +314,18 @@ def test_free_dest_and_branch_never_return_an_existing_name(tmp_path: Path):
     for name in ("b", f"b-{fp[:12]}", f"b-{fp[:20]}"):
         subprocess.run(["git", "-C", str(repo), "branch", name], check=True)
     assert not update_carry._ref_exists(repo, update_carry.free_branch(repo, "b", fp))
+
+
+def test_free_dest_treats_a_registered_but_deleted_worktree_as_taken(tmp_path: Path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@e.x",
+                    "commit", "-q", "--allow-empty", "-m", "i"], check=True)
+    wt = tmp_path / "wt"
+    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "-b", "w1", str(wt)], check=True)
+    import shutil
+    shutil.rmtree(wt)
+    got = update_carry.free_dest(wt, "e" * 64, repo)
+    assert got != wt
+    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "-b", "w2", str(got)], check=True)
