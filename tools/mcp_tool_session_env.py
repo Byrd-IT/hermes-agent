@@ -108,7 +108,7 @@ def _reaper_loop(stop: threading.Event) -> None:
     while not stop.wait(_REAP_INTERVAL_SEC):
         try:
             reap_idle()
-        except Exception:
+        except Exception:  # health: allow BLE001 -- reaper pass must not die; logged
             logger.debug("MCP session-env idle reaper pass failed", exc_info=True)
 
 
@@ -231,11 +231,11 @@ def _close(keys) -> None:
             if server is not None:
                 try:
                     await server.shutdown()
-                except Exception:
+                except Exception:  # health: allow BLE001 -- best-effort close, logged with traceback
                     logger.debug("MCP session-env variant shutdown failed", exc_info=True)
     try:
         _loop._run_on_mcp_loop(_shutdown, timeout=20)
-    except Exception:
+    except Exception:  # health: allow BLE001 -- best-effort close, logged
         logger.debug("MCP session-env variant close could not reach the loop", exc_info=True)
 
 
@@ -300,6 +300,7 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
                 _connect_locks.pop(key, None)
             _forget_ledgers(key)
             return None
+        _forget_ledgers(key)  # a fresh handshake starts the variant's own breaker clean
         with _core._lock:
             _core._servers[key] = server
             _core._server_scope_keys[key] = key[0]
