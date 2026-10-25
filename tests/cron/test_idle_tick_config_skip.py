@@ -22,7 +22,7 @@ def _run_idle_tick(**kwargs):
         calls["load_config"] += 1
         return {}
 
-    def _fake_sweep():
+    def _fake_sweep(*args, **kwargs):
         calls["sweep"] += 1
 
     with (

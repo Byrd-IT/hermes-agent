@@ -4226,7 +4226,7 @@ def _sweep_mcp_orphans() -> None:
     run AFTER jobs finish so live sessions are never touched."""
     try:
         from tools.mcp_tool_lifecycle import _kill_orphaned_mcp_children
-        _kill_orphaned_mcp_children()
+        _kill_orphaned_mcp_children(reason="cron post-tick orphan sweep")
     except Exception as _e:
         logger.debug("Post-tick MCP orphan cleanup failed: %s", _e)
 

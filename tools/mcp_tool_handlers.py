@@ -412,8 +412,11 @@ def _handle_stdio_child_exited_and_retry(server_name: str, exc: Exception, retry
     srv = _lookup_reconnectable_server(server_name)
     if srv is not None:
         action = "reconnecting without replay" if exc.in_flight else "respawning and retrying once"
-        logger.info("MCP server '%s': %s found the stdio subprocess dead (%s); %s.",
-                    server_name, op_description, exc, action)
+        # A mid-call death fails the user's call with an uncertain outcome: WARNING, with the cause
+        # (Hermes reap vs. the child's own exit) in the message, so it is visible at default levels.
+        (logger.warning if exc.in_flight else logger.info)(
+            "MCP server '%s': %s found the stdio subprocess dead (%s); %s.",
+            server_name, op_description, exc, action)
         if _mcp_loop_running():
             reconnected = _loop._signal_reconnect_and_wait(
                 server_name, srv, op_description=op_description, timeout=_core._STDIO_RESPAWN_WAIT_SEC)
@@ -502,6 +505,16 @@ async def _track_inflight_rpc(server: Any, server_name: str, op: str, *, retry_s
             inflight.discard(task)
 
 
+def _stdio_exit_detail(server: Any) -> str:
+    """Why the tracked stdio child is gone: a Hermes reap (signal + reason) or its own exit.
+    Best-effort for test doubles without a pid ledger."""
+    pids = getattr(server, "_stdio_child_pids", None)
+    if not isinstance(pids, (set, frozenset, list, tuple)) or not pids:
+        return "no child pid tracked"
+    from tools.mcp_tool_lifecycle import describe_child_exit
+    return describe_child_exit(pids)
+
+
 async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str, args: dict, progress_callback=None):
     """``session.call_tool`` that fails fast when the stdio child is/gets dead: pre-call (a dead
     child must not hold the slot for the full timeout) and mid-call (race against
@@ -533,7 +546,7 @@ async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str
         if watch_task in done and not rpc_task.done():
             rpc_task.cancel()
             raise _StdioChildExited(
-                f"MCP stdio subprocess for '{server_name}' exited mid-call",
+                f"MCP stdio subprocess for '{server_name}' exited mid-call ({_stdio_exit_detail(server)})",
                 in_flight=True,
             )
         try:
@@ -545,7 +558,8 @@ async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str
             _is_http = getattr(server, "_is_http", None)
             if callable(_is_http) and _is_http() is False and _is_session_expired_error(exc):
                 raise _StdioChildExited(
-                    f"MCP stdio subprocess for '{server_name}' closed its transport mid-call",
+                    f"MCP stdio subprocess for '{server_name}' closed its transport mid-call "
+                    f"({_stdio_exit_detail(server)})",
                     in_flight=True,
                 ) from exc
             raise
