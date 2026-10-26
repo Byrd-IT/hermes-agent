@@ -13,7 +13,7 @@ from utils import normalize_proxy_url
 from agent.proxy_bypass import is_loopback_host, should_bypass_proxy
 from agent import runtime_cwd as _runtime_cwd
 from tools.mcp_tool_errors import _MCP_HTTP_MAX_BODY_BYTES, NonMcpEndpointError, _apply_identity_header, _describe_http_failure, _handshake_answered_with_unsupported_version, _handshake_rejected_as_modern, _is_streamable_http_rejection, _make_http_rejection_recorder, _make_mcp_body_cap_transport, _make_redirect_header_stripper, _resolve_client_cert, _unwrap_exception_group
-from tools.mcp_tool_lifecycle import _filter_mcp_children, _leader_start_time, _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids, _stdio_pids, _stdio_starttimes
+from tools.mcp_tool_lifecycle import _leader_start_time, _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids, _stdio_pid_claims, _stdio_pids, _stdio_starttimes
 from tools.mcp_tool_common import _core
 from tools.mcp_tool_node_abi import node_abi_error
 from tools import mcp_tool_config as _config
@@ -324,6 +324,8 @@ class MCPServerTransportMixin:
             if start is not None:
                 new_starts[pid] = start
         with _core._lock:
+            for pid in new_pids:
+                _stdio_pid_claims[pid] = _stdio_pid_claims.get(pid, 0) + 1
             _stdio_pids.update(dict.fromkeys(new_pids, self.name))
             _stdio_pgids.update(new_pgids)
             _stdio_starttimes.update(new_starts)
@@ -350,6 +352,13 @@ class MCPServerTransportMixin:
         released_pgids: list = []
         with _core._lock:
             for pid in new_pids:
+                remaining = _stdio_pid_claims.get(pid, 1) - 1
+                if remaining > 0:
+                    # Another live transport still claims this pid: releasing it here would hand
+                    # that session's child to the orphan sweep and kill it mid-call.
+                    _stdio_pid_claims[pid] = remaining
+                    continue
+                _stdio_pid_claims.pop(pid, None)
                 _stdio_pids.pop(pid, None)
                 # Windows-safe pid probe; the child may be gone while descendants remain in its pgroup.
                 if _pid_exists(pid) or _pgroup_alive(_stdio_pgids.get(pid)):
@@ -397,8 +406,8 @@ class MCPServerTransportMixin:
             logger.debug("job-object self-attach failed before stdio spawn", exc_info=True)
         # Reap orphans of prior attempts first (else retries pile up zombie pairs); unscoped on purpose;
         # off-loop because the reaper blocks up to 2s.
-        await asyncio.to_thread(_lifecycle._kill_orphaned_mcp_children)
-        pids_before = _lifecycle._snapshot_child_pids()  # so the new child can be identified after spawn
+        await asyncio.to_thread(_lifecycle._kill_orphaned_mcp_children,
+                                reason=f"pre-spawn sweep before starting '{self.name}'")
         # Reap any orphaned subprocesses from prior failed connection attempts before spawning a new one.
         # Without this, each retry in the run() reconnect loop spawns a fresh process pair while the
         # previous failed pair lingers — leading to rapid zombie accumulation (see #57355, #57228). The
@@ -410,11 +419,22 @@ class MCPServerTransportMixin:
         # Subprocess stderr goes to ~/.hermes/logs/mcp-stderr.log so banners can't corrupt the TUI.
         _config._write_stderr_log_header(self.name)
         stderr = _config._StderrTee(_config._get_mcp_stderr_log())
+        # The new child is found as a before/after /proc delta, so concurrent spawns on this loop must
+        # not overlap that window: otherwise every server started at the same moment ledgers its
+        # siblings' children as its own and its later teardown orphans (and kills) them mid-call.
+        spawn_lock = _lifecycle._stdio_spawn_lock()
+        spawn_locked = False
         try:
+            await spawn_lock.acquire()
+            spawn_locked = True
+            pids_before = _lifecycle._snapshot_child_pids()  # so the new child can be identified after spawn
             async with _core.stdio_client(server_params, errlog=stderr.sink) as (read_stream, write_stream):
                 # New PIDs for force-kill cleanup, minus non-MCP children (slash_worker, LSP) racing
                 # into the window: they share the TUI's pgid — leaking them would killpg() the TUI.
-                new_pids = _filter_mcp_children(_lifecycle._snapshot_child_pids() - pids_before)
+                new_pids = _lifecycle._attribute_spawned_children(
+                    _lifecycle._snapshot_child_pids() - pids_before, command, args)
+                spawn_lock.release()
+                spawn_locked = False
                 if new_pids:
                     self._track_spawned_children(new_pids)
                 self._stdio_child_pids = set(new_pids)  # so in-flight calls fail fast when the child dies
@@ -424,12 +444,17 @@ class MCPServerTransportMixin:
                     connect_timeout = float(config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT))
                     return await self._serve_session(session, connect_timeout, mark_lifecycle=True)
         except Exception as exc:
+            if spawn_locked:  # don't hold siblings' spawns behind the stderr close below
+                spawn_lock.release()
+                spawn_locked = False
             # The SDK only sees "Connection closed"; the child's stderr says why (#124264).
             abi_error = node_abi_error(self.name, await asyncio.to_thread(stderr.close))
             if abi_error is not None:
                 raise abi_error from exc
             raise
         finally:  # clean exit, exceptions AND cancellation
+            if spawn_locked:  # the spawn itself failed or was cancelled inside the window
+                spawn_lock.release()
             stderr.close(timeout=0)
             if new_pids:
                 self._release_spawned_children(new_pids)
