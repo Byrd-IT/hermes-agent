@@ -250,3 +250,211 @@ def test_profile_routes_only_name_existing_profiles(client, homes):
     assert resp.status_code == 200, resp.text
     assert _delegation(work)["backends"]["profile_routes"] == {
         "profiles": [{"name": "default", "description": "The main one"}], "default": "default"}
+
+
+# --- nested route secrets (fallback_providers[].api_key, request_overrides headers) ---
+
+FB_KEY, FB2_KEY, HDR = "sk-synth-fallback-0001", "sk-synth-fallback-0002", "Bearer synth-header-token-0003"
+XKEY = "synth-xapikey-0004"
+RAW_NESTED = (FB_KEY, FB2_KEY, HDR, XKEY, "sk-synth-deep-0005", "synth-header-token")
+DOTS = "." * 3
+STAR = "*" * 3
+SHAPES = ["\u00abredacted:" + "abcd" + DOTS + "wxyz" + "\u00bb", "\u00abredacted-secret\u00bb", STAR, "abcd" + DOTS + "wxyz"]
+
+
+def _seed_nested(work) -> None:
+    cfg = yaml.safe_load((work / "config.yaml").read_text(encoding="utf-8"))
+    cfg["delegation"]["backends"]["model_map"]["options"][0].update({
+        "fallback_providers": [
+            {"provider": "openai", "model": "gpt-a", "api_key": FB_KEY},
+            {"provider": "groq", "model": "llama-b", "api_key": FB2_KEY,
+             "fallbacks": [{"provider": "x", "model": "y", "api_key": "sk-synth-deep-0005"}]},
+        ],
+        "request_overrides": {"extra_headers": {"Authorization": HDR, "X-Api-Key": XKEY, "X-Trace": "keep-me"},
+                              "extra_body": {"seed": 7, "max_tokens": 100}}})
+    (work / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+
+def _fast(work) -> dict:
+    return _delegation(work)["backends"]["model_map"]["options"][0]
+
+
+def _get_options(client) -> list:
+    return client.get("/api/delegation/routing?profile=work").json()["model_map"]["options"]
+
+
+def _put(client, options, default="deep"):
+    return client.put("/api/delegation/backends/model_map?profile=work", json={"options": options, "default": default})
+
+
+def _is_preview(value) -> bool:
+    from hermes_cli.web_routers._common import is_redacted_credential_preview
+    return is_redacted_credential_preview(value)
+
+
+def test_routing_masks_nested_route_secrets_but_keeps_plain_values(client, homes):
+    _, work = homes
+    _seed_nested(work)
+    resp = client.get("/api/delegation/routing?profile=work")
+    for raw in RAW_NESTED:
+        assert raw not in resp.text
+    fast = resp.json()["model_map"]["options"][0]
+    assert _is_preview(fast["fallback_providers"][0]["api_key"])
+    assert _is_preview(fast["fallback_providers"][1]["fallbacks"][0]["api_key"])
+    headers = fast["request_overrides"]["extra_headers"]
+    assert _is_preview(headers["Authorization"]) and _is_preview(headers["X-Api-Key"])
+    assert headers["X-Trace"] == "keep-me"
+    assert fast["request_overrides"]["extra_body"] == {"seed": 7, "max_tokens": 100}
+    assert fast["fallback_providers"][0]["provider"] == "openai"
+
+
+def test_saving_the_untouched_form_keeps_every_nested_secret(client, homes):
+    _, work = homes
+    _seed_nested(work)
+    stored = _fast(work)
+    resp = _put(client, _get_options(client))
+    assert resp.status_code == 200, resp.text
+    for raw in RAW_NESTED:
+        assert raw not in resp.text
+    assert _fast(work) == stored
+    assert "redacted" not in (work / "config.yaml").read_text(encoding="utf-8")
+
+
+def test_editing_one_nested_secret_leaves_its_siblings(client, homes):
+    _, work = homes
+    _seed_nested(work)
+    options = _get_options(client)
+    options[0]["fallback_providers"][0]["api_key"] = "sk-synth-new-0006"
+    options[0]["request_overrides"]["extra_headers"]["X-Api-Key"] = "synth-new-xapikey-0007"
+    assert _put(client, options).status_code == 200
+    fast = _fast(work)
+    assert fast["fallback_providers"][0]["api_key"] == "sk-synth-new-0006"
+    assert fast["fallback_providers"][1]["api_key"] == FB2_KEY
+    assert fast["fallback_providers"][1]["fallbacks"][0]["api_key"] == "sk-synth-deep-0005"
+    assert fast["request_overrides"]["extra_headers"] == {
+        "Authorization": HDR, "X-Api-Key": "synth-new-xapikey-0007", "X-Trace": "keep-me"}
+
+
+def test_renaming_a_route_keeps_its_nested_secrets(client, homes):
+    _, work = homes
+    _seed_nested(work)
+    options = _get_options(client)
+    options[0].update({"name": "speedy", "original_name": "fast"})
+    assert _put(client, options).status_code == 200
+    fast = _fast(work)
+    assert fast["name"] == "speedy"
+    assert fast["fallback_providers"][0]["api_key"] == FB_KEY
+    assert fast["request_overrides"]["extra_headers"]["Authorization"] == HDR
+
+
+def test_reordering_or_editing_fallbacks_never_moves_a_key_to_another_entry(client, homes):
+    _, work = homes
+    _seed_nested(work)
+    options = _get_options(client)
+    fallbacks = options[0]["fallback_providers"]
+    options[0]["fallback_providers"] = [fallbacks[1], {**fallbacks[0], "model": "gpt-other"}]
+    assert _put(client, options).status_code == 200
+    saved = _fast(work)["fallback_providers"]
+    assert saved[0]["api_key"] == FB2_KEY and saved[0]["provider"] == "groq"
+    # same provider, different model: no stored counterpart, so the preview is dropped, not kept
+    assert saved[1]["model"] == "gpt-other" and "api_key" not in saved[1]
+
+
+def test_editing_only_a_fallback_model_keeps_its_key_but_a_new_host_does_not(client, homes):
+    _, work = homes
+    _seed_nested(work)
+    options = _get_options(client)
+    fb = options[0]["fallback_providers"]
+    fb[0] = {**fb[0], "model": "gpt-renamed"}
+    fb[1] = {**fb[1], "base_url": "https://elsewhere.example/v1"}
+    assert _put(client, options).status_code == 200
+    saved = _fast(work)["fallback_providers"]
+    assert saved[0]["model"] == "gpt-renamed" and saved[0]["api_key"] == FB_KEY
+    assert saved[1]["base_url"] == "https://elsewhere.example/v1" and "api_key" not in saved[1]
+
+
+def test_a_new_same_provider_fallback_above_an_existing_one_never_takes_its_key(client, homes):
+    _, work = homes
+    _seed_nested(work)
+    options = _get_options(client)
+    fb = options[0]["fallback_providers"]
+    options[0]["fallback_providers"] = [{"provider": "openai", "model": "gpt-new"}, fb[0], fb[1]]
+    assert _put(client, options).status_code == 200
+    saved = _fast(work)["fallback_providers"]
+    assert "api_key" not in saved[0]
+    assert saved[1]["api_key"] == FB_KEY and saved[2]["api_key"] == FB2_KEY
+
+
+def test_an_empty_base_url_is_the_same_endpoint_as_a_missing_one(client, homes):
+    _, work = homes
+    _seed_nested(work)
+    options = _get_options(client)
+    options[0]["fallback_providers"][0]["base_url"] = ""
+    assert _put(client, options).status_code == 200
+    assert _fast(work)["fallback_providers"][0]["api_key"] == FB_KEY
+
+
+def test_a_container_emptied_by_a_dropped_preview_is_not_written(client, homes):
+    _, work = homes
+    mask = SHAPES[0]
+    new = {"name": "fresh", "description": "New", "provider": "openai", "model": "m",
+           "request_overrides": {"extra_headers": {"Authorization": mask}, "extra_body": {}}}
+    assert _put(client, [new], default="fresh").status_code == 200
+    overrides = _delegation(work)["backends"]["model_map"]["options"][0].get("request_overrides", {})
+    assert "extra_headers" not in overrides
+
+
+def test_header_style_secret_names_are_masked_but_env_var_names_are_not(client, homes):
+    _, work = homes
+    cfg = yaml.safe_load((work / "config.yaml").read_text(encoding="utf-8"))
+    cfg["delegation"]["backends"]["model_map"]["options"][0]["request_overrides"] = {
+        "extra_headers": {"X-Jwt": "syn-jwt-value-0001", "Bearer-Auth": "syn-bearer-value-0002",
+                          "api_key_env": "MY_ENV_NAME"}}
+    (work / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    resp = client.get("/api/delegation/routing?profile=work")
+    assert "syn-jwt-value-0001" not in resp.text and "syn-bearer-value-0002" not in resp.text
+    assert resp.json()["model_map"]["options"][0]["request_overrides"]["extra_headers"]["api_key_env"] == "MY_ENV_NAME"
+
+
+def test_removing_a_header_removes_it(client, homes):
+    _, work = homes
+    _seed_nested(work)
+    options = _get_options(client)
+    del options[0]["request_overrides"]["extra_headers"]["Authorization"]
+    assert _put(client, options).status_code == 200
+    headers = _fast(work)["request_overrides"]["extra_headers"]
+    assert "Authorization" not in headers and headers["X-Api-Key"] == XKEY
+
+
+@pytest.mark.parametrize("mask", SHAPES)
+def test_a_preview_with_no_stored_counterpart_is_never_persisted(client, homes, mask):
+    _, work = homes
+    new = {"name": "fresh", "description": "New", "provider": "openai", "model": "m",
+           "fallback_providers": [{"provider": "openai", "model": "gpt-a", "api_key": mask}],
+           "request_overrides": {"extra_headers": {"Authorization": mask, "X-Trace": "t"}}}
+    assert _put(client, [new], default="fresh").status_code == 200
+    saved = _delegation(work)["backends"]["model_map"]["options"][0]
+    assert saved["fallback_providers"] == [{"provider": "openai", "model": "gpt-a"}]
+    assert saved["request_overrides"] == {"extra_headers": {"X-Trace": "t"}}
+
+
+def test_a_stale_preview_never_overwrites_a_rotated_secret(client, homes):
+    _, work = homes
+    _seed_nested(work)
+    options = _get_options(client)
+    cfg = yaml.safe_load((work / "config.yaml").read_text(encoding="utf-8"))
+    cfg["delegation"]["backends"]["model_map"]["options"][0]["fallback_providers"][0]["api_key"] = "sk-synth-rotated-0008"
+    (work / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    assert _put(client, options).status_code == 200
+    assert _fast(work)["fallback_providers"][0]["api_key"] == "sk-synth-rotated-0008"
+
+
+def test_a_refused_save_never_echoes_a_nested_secret(client, homes):
+    _, work = homes
+    _seed_nested(work)
+    options = _get_options(client)
+    options[0]["model"] = ""
+    resp = _put(client, options)
+    assert resp.status_code == 400
+    for raw in RAW_NESTED:
+        assert raw not in resp.text

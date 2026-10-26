@@ -21,6 +21,7 @@ from hermes_cli.web_models import DelegationBackendSelect, DelegationModelMapUpd
 from hermes_cli.web_routers._common import (
     _profile_scope, config_write_scope, is_redacted_credential_preview, redacted_credential_preview,
 )
+from hermes_cli.web_routers.delegation_secrets import mask_nested, restore_nested
 
 router = APIRouter()
 _log = logging.getLogger(__name__)
@@ -31,6 +32,7 @@ save_config = late("save_config", "hermes_cli.config")
 DEFAULT_BACKEND = "default"
 MODEL_MAP = "model_map"
 PROFILE_ROUTES = "profile_routes"
+_NESTED_SECRET_FIELDS = ("fallback_providers", "request_overrides")
 _OPTION_TEXT_KEYS = ("name", "description", "provider", "model", "base_url", "api_mode")
 
 
@@ -70,7 +72,8 @@ def _registered_backends() -> list[dict[str, Any]]:
 
 
 def _redacted_options(options: Any) -> list[dict[str, Any]]:
-    """Model routes as stored, with an ``api_key`` reduced to a display-only preview."""
+    """Model routes as stored, with every credential (the route's ``api_key``, each fallback's ``api_key``, secret-named
+    ``request_overrides`` headers and body fields) reduced to a display-only preview."""
     if not isinstance(options, list):
         return []
     out = []
@@ -80,6 +83,9 @@ def _redacted_options(options: Any) -> list[dict[str, Any]]:
         row = dict(entry)
         if row.get("api_key"):
             row["api_key"] = redacted_credential_preview(row["api_key"])
+        for field in _NESTED_SECRET_FIELDS:
+            if field in row:
+                row[field] = mask_nested(row[field])
         out.append(row)
     return out
 
@@ -182,21 +188,24 @@ def _clean_model_option(index: int, entry: dict, stored: dict[str, dict],
         if parsed is None or (parsed and parsed not in STATIC_TIERS):
             raise _bad_request(f"{label}: unknown service tier {tier!r}. Use normal, fast or ultrafast.")
         row["service_tier"] = tier
+    # A route the renderer came from (a rename names it in original_name; once that save landed, it is stored
+    # under its new name).
+    source = stored.get(_text(entry, "original_name")) or stored.get(row["name"]) or {}
     if isinstance(entry.get("fallback_providers"), list):
-        row["fallback_providers"] = entry["fallback_providers"]
+        row["fallback_providers"] = restore_nested(entry["fallback_providers"], source.get("fallback_providers"))
     # Route fields the editor never touches (request_overrides, label, profile) round-trip as stored.
     validated = {*_OPTION_TEXT_KEYS, "api_key", "reasoning_effort", "service_tier", "fallback_providers"}
     for field in sorted(ROUTE_KEYS - validated):
         if entry.get(field) not in (None, "", [], {}):
             row[field] = entry[field]
+            if field in _NESTED_SECRET_FIELDS:
+                # The renderer only saw previews of the secrets in here: put the stored ones back.
+                row[field] = restore_nested(entry[field], source.get(field))
     # The backend's own keys (DelegationProvider.route_keys, e.g. a ``daybreak`` opt-in) are kept as sent; the
     # backend validates them. Presence decides, not the value: null is a value, absent = the editor turned it off.
     for field in declared:
         if field not in row and field not in ROUTE_KEYS and field in entry:
             row[field] = entry[field]
-    # A route the renderer came from (a rename names it in original_name; once that save landed, it is stored
-    # under its new name).
-    source = stored.get(_text(entry, "original_name")) or stored.get(row["name"]) or {}
     # Any other key the stored route carries (hand-written, or declared by a backend that is not loaded now)
     # survives an untouched round-trip, so a save never silently drops a setting; a key nobody stored is dropped.
     for field, value in source.items():
