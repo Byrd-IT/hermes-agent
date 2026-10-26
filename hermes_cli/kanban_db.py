@@ -104,12 +104,9 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 
 # --- Constants ---
 
+from hermes_cli import kanban_db_completion as _completion
+COMPLETION_STATES = _completion.COMPLETION_STATES
 VALID_INITIAL_STATUSES = {"running", "blocked"}
-# Delivery evidence is deliberately separate from lifecycle status.  A task may
-# be done as an implementation handoff without claiming that code is live; an
-# aggregate request opts into the verified gate explicitly.
-COMPLETION_STATES = {"written", "tested", "deployed", "verified"}
-
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
@@ -921,21 +918,6 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at INTEGER NOT NULL
 );
 
--- Bounded state for the detection-only Kanban watchdog.  One row per active
--- (task, condition); resolved rows are pruned by the watchdog after retention.
--- This prevents a periodic scan from producing a notification storm.
-CREATE TABLE IF NOT EXISTS kanban_watchdog_alerts (
-    task_id       TEXT NOT NULL,
-    kind          TEXT NOT NULL,
-    first_seen_at INTEGER NOT NULL,
-    last_seen_at  INTEGER NOT NULL,
-    notified_at   INTEGER NOT NULL,
-    resolved_at   INTEGER,
-    PRIMARY KEY (task_id, kind)
-);
-CREATE INDEX IF NOT EXISTS idx_kanban_watchdog_resolved
-    ON kanban_watchdog_alerts(resolved_at);
-
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
 -- and structured summary all live on the run, not the task. Multiple
@@ -1017,6 +999,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
+SCHEMA_SQL += _completion.WATCHDOG_ALERTS_DDL
 
 
 # --- ID generation ---
@@ -1224,19 +1207,16 @@ def create_task(
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
+    from hermes_cli.kanban_db_completion import normalize_verification_owner
 
     completion_contract = validate_contract(completion_contract)
-    verification_owner_id = str(verification_owner_id).strip() if verification_owner_id else None
     parents = tuple(p for p in parents if p)
+    verification_owner_id = normalize_verification_owner(conn, verification_owner_id, parents)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
-    if verification_owner_id and verification_owner_id not in parents:
-        owner = get_task(conn, verification_owner_id)
-        if owner is None:
-            raise ValueError(f"verification_owner_id does not exist: {verification_owner_id}")
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
     # A project-scoped board anchors every new task to its project's repo
@@ -1406,44 +1386,6 @@ def _missing_task_ids(conn: sqlite3.Connection, ids: Iterable[str]) -> list[str]
     rows = conn.execute(f"SELECT id FROM tasks WHERE id IN ({placeholders})", ids).fetchall()
     present = {r["id"] for r in rows}
     return [p for p in ids if p not in present]
-
-
-def _inherit_notify_subs(
-    conn: sqlite3.Connection, child_id: str, parents: Iterable[str], *,
-    created_at: Optional[int] = None,
-) -> None:
-    """Copy parents' notify subscriptions to a child, cursor caught up to the
-    child's current event so a late ``link_tasks`` never replays history.
-
-    Single owner of inheritance (create_task, link_tasks, decompose). It must
-    copy EVERY routing/delivery column: dropping ``chat_type`` made DM-originated
-    completions wake a fresh group session instead of the originating DM.
-
-    Omitting columns here silently degrades routing: a DM-originated child completion falls back to
-    chat_type='group' and wakes a fresh group-scoped session instead of the originating DM (issue #73030).
-    """
-    parent_ids = tuple(dict.fromkeys(p for p in parents if p))
-    if not parent_ids:
-        return
-    row = conn.execute(
-        "SELECT COALESCE(MAX(id), 0) AS cursor FROM task_events WHERE task_id = ?", (child_id,),
-    ).fetchone()
-    cursor = int(row["cursor"] if row is not None else 0)
-    placeholders = ",".join("?" * len(parent_ids))
-    conn.execute(
-        f"""
-        INSERT OR IGNORE INTO kanban_notify_subs
-            (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
-             chat_type, notifier_profile, delivery_mode, delivery_metadata,
-             created_at, last_event_id)
-        SELECT ?, platform, chat_id, thread_id, user_id, user_id_alt,
-               COALESCE(chat_type, 'dm'), notifier_profile,
-               COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
-          FROM kanban_notify_subs
-         WHERE task_id IN ({placeholders})
-        """,
-        (child_id, int(created_at if created_at is not None else time.time()), cursor, *parent_ids),
-    )
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
@@ -1877,39 +1819,6 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
 
 def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     return [Event.from_row(r) for r in _task_rows(conn, "task_events", task_id, "created_at ASC, id ASC")]
-
-
-def record_completion_state(
-    conn: sqlite3.Connection, task_id: str, state: str, evidence: dict,
-) -> bool:
-    """Record one explicit delivery label and its proof.
-
-    This is intentionally not a state machine that infers or fills predecessor
-    labels: callers must assert each label they mean.  The immutable event log
-    retains every assertion while ``tasks`` holds only the current label for
-    dashboard/list queries.  ``verified`` is accepted only with a textual proof
-    so an empty metadata object cannot masquerade as live observation.
-    """
-    normalized = str(state or "").strip().lower()
-    if normalized not in COMPLETION_STATES:
-        raise ValueError(f"completion state must be one of {sorted(COMPLETION_STATES)}")
-    if not isinstance(evidence, dict) or not evidence:
-        raise ValueError("completion state evidence must be a non-empty object")
-    proof = evidence.get("proof")
-    if not isinstance(proof, str) or not proof.strip():
-        raise ValueError("completion state evidence requires a non-empty 'proof' string")
-    with write_txn(conn):
-        cur = conn.execute(
-            "UPDATE tasks SET completion_state = ?, completion_evidence = ? WHERE id = ?",
-            (normalized, json.dumps(evidence, ensure_ascii=False), task_id),
-        )
-        if cur.rowcount != 1:
-            return False
-        _append_event(
-            conn, task_id, "completion_state_recorded",
-            {"state": normalized, "evidence": evidence},
-        )
-    return True
 
 
 def _insert_comment(
@@ -4293,6 +4202,8 @@ def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -
 
 
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
+from hermes_cli.kanban_db_completion import record_completion_state
+from hermes_cli.kanban_db_notify import _inherit_notify_subs
 from hermes_cli.kanban_db_boards import (
     _default_board_display_name,
     _dir_holds_board,
