@@ -25,7 +25,7 @@ A standalone run defaults to dry-run:
 
 ```bash
 python -m hermes_cli.update_carry --repo /path/to/checkout --upstream origin/main
-python -m hermes_cli.update_carry --apply --worktree /tmp/carry-out --branch carry-reapply
+python -m hermes_cli.update_carry --apply --worktree ~/carry-out --branch carry-reapply
 ```
 
 `--apply` without `--worktree` refuses to write the source checkout. `--in-place`
