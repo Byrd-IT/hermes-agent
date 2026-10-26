@@ -924,30 +924,22 @@ def _chown_to_hermes_uid(path) -> None:
 
 
 def _named_user_acl_mask(path) -> int | None:
-    """ACL mask bits (``0o7``) of directory *path* when its access ACL has named-user entries.
+    """ACL mask bits (``0o7``) of *path* when its POSIX access ACL has named-user entries.
 
-    Reads the ``system.posix_acl_access`` xattr in-process rather than shelling out to
-    ``getfacl``: this runs on every config load and scratch-dir creation, including inside
-    code under test that fakes ``subprocess``. ``None`` means no ACL, no named users, or the
-    platform/filesystem cannot say — the caller then applies its plain chmod.
+    Read in-process from the Linux ``system.posix_acl_access`` xattr rather than via
+    ``getfacl``: this runs on every config load, including under code that fakes
+    ``subprocess``. ``None`` = no ACL, no named users, or the platform cannot say.
     """
     try:
-        if path is None or not os.path.isdir(str(path)):
-            return None
-        raw = os.getxattr(str(path), "system.posix_acl_access")
-    except (OSError, AttributeError):  # ENODATA/ENOTSUP, or no getxattr off Linux
+        raw = os.getxattr(path, "system.posix_acl_access")
+    except (OSError, AttributeError):  # ENODATA / ENOTSUP, or no getxattr off Linux
         return None
-    # Linux xattr layout: u32 version (2), then (u16 tag, u16 perm, u32 id) little-endian.
+    # Layout: u32 version (2), then (u16 tag, u16 perm, u32 id) entries, little-endian.
     if len(raw) < 4 or (len(raw) - 4) % 8 or int.from_bytes(raw[:4], "little") != 2:
         return None
-    named_user, mask = False, None
-    for off in range(4, len(raw), 8):
-        tag = int.from_bytes(raw[off:off + 2], "little")
-        if tag == 0x02:  # ACL_USER
-            named_user = True
-        elif tag == 0x10:  # ACL_MASK
-            mask = int.from_bytes(raw[off + 2:off + 4], "little") & 0o7
-    return mask if named_user and mask is not None else None
+    perms = {int.from_bytes(raw[o:o + 2], "little"): int.from_bytes(raw[o + 2:o + 4], "little")
+             for o in range(4, len(raw), 8)}
+    return perms[0x10] & 0o7 if 0x02 in perms and 0x10 in perms else None  # ACL_USER, ACL_MASK
 
 
 def apply_secure_dir_policy(path, *, home: str | Path | None = None) -> None:
@@ -979,17 +971,12 @@ def apply_secure_dir_policy(path, *, home: str | Path | None = None) -> None:
         mode = int(explicit_mode or "700", 8)
     except ValueError:
         mode = 0o700
-    # A chmod on a directory with a POSIX ACL resets the ACL mask to the chmod's group
-    # bits, silently voiding any named-user grants (e.g. a web user traversing HERMES_HOME).
-    # When an ACL is present with named-user entries, skip the chmod if it would only narrow
-    # the mask; keep it when it would widen permissions beyond the operator's configured mode.
-    # (Byrd-IT patch; KB QvKRt6ABoiu35iVggyXX; re-applied by secure_dir_acl_guard.sh)
+    # On a directory with a POSIX ACL, chmod's group bits become the ACL mask, so a plain
+    # 0700 would silently void named-user grants (e.g. a web server user allowed to traverse
+    # the home). Keep the existing mask bits; owner/other bits still follow the policy.
     acl_mask = _named_user_acl_mask(path)
     if acl_mask is not None:
-        would_narrow = bool(acl_mask & ~(mode >> 3) & 0o7)
-        if would_narrow:
-            _chown_to_hermes_uid(path)
-            return  # preserve the operator's ACL grants; skip this chmod
+        mode |= acl_mask << 3
     try:
         os.chmod(path, mode)
     except (OSError, NotImplementedError):
