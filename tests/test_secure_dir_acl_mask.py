@@ -51,7 +51,7 @@ def test_named_user_acl_survives_secure_dir_policy(monkeypatch, tmp_path):
     for d in (acl_dir, plain_dir):
         os.chmod(d, 0o755)
     user = str(os.getuid())
-    probe = subprocess.run(["setfacl", "-m", f"u:{user}:r-x", str(acl_dir)], capture_output=True)
+    probe = subprocess.run(["setfacl", "-m", f"u:{user}:r-x", str(acl_dir)], check=False, capture_output=True)
     if probe.returncode != 0 or hc._named_user_acl_mask(acl_dir) is None:
         pytest.skip("filesystem does not support POSIX ACLs")
 
