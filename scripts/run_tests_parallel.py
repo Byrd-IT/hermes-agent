@@ -628,7 +628,7 @@ _flaky_lock = threading.Lock()
 # "check the per-file output above", which without this map points at
 # nothing. The guard prints these tails; the map holds only the most
 # recent attempt per file (the retry's output overwrites the first's).
-_NO_EVIDENCE_TAILS: Dict[Path, str] = {}
+_NO_EVIDENCE_TAILS: dict[Path, str] = {}
 _no_evidence_lock = threading.Lock()
 
 

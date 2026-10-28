@@ -1415,7 +1415,7 @@ class TestDetectSudoStdin:
 class TestSudoArgvAnchoring:
     """Sudo flag detection is anchored to sudo's OWN argv (card t_6a479602).
 
-    The earlier ``\bsudo\b[^;|&\n]*?\s+-[a-z]*[sa][a-z]*\b`` lazy bridge spanned
+    The earlier ``\bsudo\b[^;|&\n]*?\\s+-[a-z]*[sa][a-z]*\b`` lazy bridge spanned
     ACROSS the subcommand, so any later flag cluster containing s/a was
     misattributed to sudo: `sudo ls -la <path>` (plus cp -a, rsync -a, df -a,
     tar -xaf, ss -atp), including inside ssh-wrapped one-liners, hard-blocked
