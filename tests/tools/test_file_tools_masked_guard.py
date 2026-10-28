@@ -24,6 +24,10 @@ RAW_SECRET_TEXT = [
     'payload = "{\\"api_key\\": \\"sk-shortkey1\\"}"',
     "https://x.test/cb?sig=abcdef12345&code=zz9988",
     "https://deploy:hunter2@git.example/x",
+    "code=abc123&state=xyz",                                         # form body
+    "https://x.test/cb?state=1#code=abc12345",                       # fragment parameter
+    "see https://docs.example/x and postgres://app:hunter2@db/x",    # a URL earlier on the line
+    "//user:hunter2@host/x",                                         # network-path userinfo
 ]
 
 HAND_WRITTEN = [
