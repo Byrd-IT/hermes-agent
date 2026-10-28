@@ -316,9 +316,10 @@ def _validate_operations(operations: list[PatchOperation], file_ops: Any) -> lis
                         errors.append(f"{op.file_path}: addition-only hunk {ambiguous}")
                 continue
             search_pattern, replacement = '\n'.join(search_lines), '\n'.join(replace_lines)
-            # A lone first hunk with repeated source text has no ordering signal: fail closed. A
-            # multi-hunk patch establishes file order, so its first hunk may seek from zero.
-            if (hunk_index == 1 and len(op.hunks) == 1
+            # A lone UNHINTED first hunk with repeated source text has no ordering signal: fail closed. A
+            # hint selects its block (the window rule in _replace_hunk), and a multi-hunk patch
+            # establishes file order, so its first hunk may seek from zero.
+            if (hunk_index == 1 and len(op.hunks) == 1 and not hunk.context_hint
                     and _count_occurrences(simulated, search_pattern) > 1):
                 errors.append(
                     f"{op.file_path}: hunk 1 (no later ordering anchor) is ambiguous — "
