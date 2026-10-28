@@ -4,37 +4,61 @@ from unittest.mock import patch
 
 import pytest
 
+from agent.redact import redact_sensitive_text
 from tools.file_tools import _contains_masked_secret_marker, patch_tool
 
 S = "*" * 3     # what the redactor prints for a short secret
 VAULT = "\u00abredacted-vault-secret\u00bb"
 
-MASKED_SHAPES = [
+# Raw text the redactor masks. The guard is tested against the redactor's own output, so a shape the
+# redactor learns to produce but the guard misses shows up here instead of in a written file.
+RAW_SECRET_TEXT = [
+    "Authorization: Bearer shortsecret1",
+    "Authorization: Digest abc123def456",
+    "DB_PASS=hunter2",
+    "SMTP_PW=hunter2",
+    "API_KEY=abc12345",
+    "export OPENAI_API_KEY=abc12345",
+    "password: hunter2",
+    '{"api_key": "sk-shortkey1"}',
+    'payload = "{\\"api_key\\": \\"sk-shortkey1\\"}"',
+    "https://x.test/cb?sig=abcdef12345&code=zz9988",
+    "https://deploy:hunter2@git.example/x",
+]
+
+HAND_WRITTEN = [
     f"API_KEY={S}",
     f'"token": "{S}"',
     f"Authorization: ApiKey {S}",
-    f"Authorization: Bearer {S}",
-    f"password = {S}",
-    f"https://user:{S}@host/path",
-    f"export OPENAI_API_KEY={S}",
+    f"bot12345678:{S}",
+    f"hermes-session={S}",
     f"token = {VAULT}",
 ]
 
 ORDINARY_TEXT = [
     S,                                    # Markdown horizontal rule
+    f"  {S}  ",
     f"{S}bold italic{S}",                 # Markdown bold-italic
     f"char {S}table = NULL;",             # C pointer to pointer to pointer
     f"int {S}p, {S}q;",
     f"## Notes\n\n{S}\n\ntext",
     "multiply: a * b * c",
+    "a ** b and ****** and ****",         # other asterisk runs
     f"auth\n{S}",                         # a word at line end, then a Markdown rule
 ]
 
 
-@pytest.mark.parametrize("text", MASKED_SHAPES)
-def test_redactor_shapes_are_still_refused(text):
+@pytest.mark.parametrize("raw", RAW_SECRET_TEXT)
+def test_the_redactors_own_output_is_refused(raw):
+    masked = redact_sensitive_text(raw, force=True, redact_url_credentials=True)
+    assert S in masked, f"the redactor no longer masks {raw!r} with the short mask"
+    assert _contains_masked_secret_marker(masked)
+    assert _contains_masked_secret_marker("harmless", masked)
+
+
+@pytest.mark.parametrize("text", HAND_WRITTEN)
+def test_other_mask_shapes_are_refused(text):
     assert _contains_masked_secret_marker(text)
-    assert _contains_masked_secret_marker("harmless", text)
 
 
 @pytest.mark.parametrize("text", ORDINARY_TEXT)
