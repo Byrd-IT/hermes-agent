@@ -224,6 +224,15 @@ def _seek_hunk(content: str, search_lines: list[str], cursor: int) -> Optional[t
     return None
 
 
+def _from_next_line(content: str, cursor: int) -> str:
+    """``content`` from the first line that starts at or after ``cursor``: the tail of a line the
+    cursor sits inside is not a candidate line for ``_seek_hunk``, so it must not be counted."""
+    if cursor == 0 or content[cursor - 1] == '\n':
+        return content[cursor:]
+    newline = content.find('\n', cursor)
+    return "" if newline == -1 else content[newline + 1:]
+
+
 def _count_line_matches(content: str, search_lines: list[str]) -> int:
     """How many places ``search_lines`` matches, by the first of exact / rstrip / strip that matches."""
     content_lines = content.split('\n')
@@ -382,7 +391,7 @@ def _validate_operations(operations: list[PatchOperation], file_ops: Any) -> lis
             # applies successively; a lone broad hunk is rejected instead of silently editing the
             # next block.
             if (cursor and not hunk.context_hint and search_pattern not in repeated
-                    and _count_line_matches(simulated[cursor:], search_lines) > 1):
+                    and _count_line_matches(_from_next_line(simulated, cursor), search_lines) > 1):
                 errors.append(
                     f"{op.file_path}: hunk {hunk_index} (no hint) is ambiguous after the "
                     "previous hunk — include unique context lines in its search text")

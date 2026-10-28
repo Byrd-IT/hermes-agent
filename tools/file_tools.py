@@ -153,20 +153,32 @@ _V4A_MOVE_HEADER_RE = re.compile(r'^(\*\*\*\s*Move\s+File:\s*)(.+?)\s*->\s*(.+)$
 # The redactor returns three asterisks for short secrets and this exact marker for
 # vault-filled values. Those display-only replacements must never become file
 # content through a fuzzy patch whose source was a redacted tool result.
-# The vault marker is always refused. Three asterisks also mean a Markdown rule or bold-italic, or a
-# C pointer type, in ordinary source, so they are refused only where the redactor puts them: right
-# after a credential word (an env assignment, a JSON field, an Authorization header), after an auth
-# scheme (Bearer) or as URL userinfo (user:<asterisks>@host).
+# The vault marker is always refused. A run of exactly three asterisks is refused unless it is
+# plainly ordinary text: a Markdown rule (alone on its line), a bold-italic opener or closer, or a C
+# pointer type (touching a word character). The redactor has many mask shapes (env and JSON fields,
+# auth headers with any scheme, URL userinfo and query values, Telegram tokens, session links), so
+# listing them would miss some; every redactor shape sits next to punctuation or whitespace, never
+# inside a word, which is what the exemptions rely on.
 _VAULT_SECRET_MARKER = "\u00abredacted-vault-secret\u00bb"
-_MASKED_CREDENTIAL_RE = re.compile(
-    r"""(?ix)
-    (?: (?:key|token|secret|passw(?:or)?d|pwd|credential|auth|bearer|signature|cookie)\w*
-        ["']?(?:[ \t]*[:=][ \t]*|[ \t]+)(?:(?:apikey|bearer|basic|token)[ \t]+)?["']?
-      | \b(?:bearer|basic|apikey|token)[ \t]+
-      | ://[^\s/:@]*:
-    )
-    \*\*\*(?!\w)
-    """)
+_MASK_RUN_RE = re.compile(r"(?<!\*)\*{3}(?!\*)")
+
+
+def _is_word_char(ch: str) -> bool:
+    return ch.isalnum() or ch == "_"
+
+
+def _is_masked_credential_run(text: str, start: int, end: int) -> bool:
+    """Whether the three-asterisk run at ``text[start:end]`` looks like redactor output."""
+    if (start and _is_word_char(text[start - 1])) or (end < len(text) and _is_word_char(text[end])):
+        return False
+    line_start = text.rfind("\n", 0, start) + 1
+    line_end = text.find("\n", end)
+    line_end = len(text) if line_end == -1 else line_end
+    return bool(text[line_start:start].strip() or text[end:line_end].strip())
+
+
+def _has_masked_credential_run(text: str) -> bool:
+    return any(_is_masked_credential_run(text, m.start(), m.end()) for m in _MASK_RUN_RE.finditer(text))
 
 
 def _masked_secret_edit_error() -> str:
@@ -181,7 +193,7 @@ def _masked_secret_edit_error() -> str:
 def _contains_masked_secret_marker(*values: str | None) -> bool:
     """Whether patch text contains a display-only secret redaction marker."""
     return any(
-        isinstance(value, str) and (_VAULT_SECRET_MARKER in value or _MASKED_CREDENTIAL_RE.search(value))
+        isinstance(value, str) and (_VAULT_SECRET_MARKER in value or _has_masked_credential_run(value))
         for value in values
     )
 
