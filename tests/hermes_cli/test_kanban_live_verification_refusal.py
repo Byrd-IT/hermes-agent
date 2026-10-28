@@ -10,6 +10,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_pr_acceptance_store as acceptance_store
+from hermes_cli.kanban_live_verification import live_verification_refusal
 
 
 @pytest.fixture
@@ -28,18 +29,18 @@ def conn(tmp_path, monkeypatch):
 
 def test_refusal_reason_names_the_unmet_gate_and_the_escape_hatch(conn):
     tid = kb.create_task(conn, title="release", requires_live_verification=True)
-    reason = kb.live_verification_refusal(conn, tid)
+    reason = live_verification_refusal(conn, tid)
     assert "requires live verification" in reason and "kanban_record_completion_state" in reason
     assert "escape hatch" in reason and "unset" in reason
     kb.record_completion_state(conn, tid, "tested", {"proof": "42 passed"})
-    assert "completion_state is tested" in kb.live_verification_refusal(conn, tid)
+    assert "completion_state is tested" in live_verification_refusal(conn, tid)
     kb.record_completion_state(conn, tid, "verified", {"proof": "live endpoint returned 200"})
-    assert kb.live_verification_refusal(conn, tid) is None
+    assert live_verification_refusal(conn, tid) is None
 
 
 def test_no_reason_for_cards_without_the_gate(conn):
-    assert kb.live_verification_refusal(conn, kb.create_task(conn, title="plain")) is None
-    assert kb.live_verification_refusal(conn, "t_missing") is None
+    assert live_verification_refusal(conn, kb.create_task(conn, title="plain")) is None
+    assert live_verification_refusal(conn, "t_missing") is None
 
 
 def test_kanban_complete_error_shows_the_refusal_reason(conn):
