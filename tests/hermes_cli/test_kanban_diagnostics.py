@@ -86,7 +86,7 @@ def test_running_with_open_parents_fires_only_while_running():
     """A running card whose parent is not terminal is flagged; the same graph
     on a ready/todo card (the gate is holding it) and a done parent are not."""
     graph = {"parents": [{"id": "t_parent", "title": "p", "status": "todo"}], "children": []}
-    diags = kd.compute_task_diagnostics(_task(status="running", started_at=100), [], [], graph=graph)
+    diags = kd.compute_task_diagnostics(_task(status="running", started_at=int(time.time())), [], [], graph=graph)
     assert [d.kind for d in diags] == ["running_with_open_parents"]
     assert diags[0].data["open_parents"] == [{"id": "t_parent", "status": "todo"}]
     assert "hermes kanban unlink t_parent t_demo00" in diags[0].actions[0].payload["command"]
