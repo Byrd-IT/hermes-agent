@@ -104,8 +104,9 @@ def _signal_endpoint(endpoint: str, signal: str) -> str:
 
     Per the OTLP/HTTP exporter spec, a base endpoint (e.g. ``http://host:4318``) needs the
     per-signal path appended; an endpoint that already carries one of the three known signal
-    suffixes has that suffix swapped for the target one. Anything else (a custom path with no
-    recognized suffix) passes through unchanged rather than risk mangling an intentional route.
+    suffixes has that suffix swapped for the target one. Anything else, including a custom path with no
+    recognized suffix (``http://host/otlp``), gets ``/v1/<signal>`` appended to it (``/otlp/v1/traces``):
+    the spec's rule for a base endpoint. A route that must not get that suffix cannot be configured here.
     """
     target = f"/v1/{signal}"
     stripped = endpoint.rstrip("/")
