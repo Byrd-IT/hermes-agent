@@ -25,9 +25,9 @@ def reject_unresearched_tool_failure_card(title, body) -> None:
     if not (is_prefixed_failure or is_retitled_local_batching_failure):
         return
     researched = bool(
-        # After a colon any slug is an id; without one the token must carry a digit ("kb searched" is prose).
-        re.search(r"\bkb[ _-]?(?:id|entry|ref)?\s*(?:[:=]\s*[A-Za-z0-9_-]{8,}|"
-                  r"(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{8,})", b, re.IGNORECASE)
+        # An id label plus a colon takes any slug; otherwise the token must carry a digit (prose is not an id).
+        re.search(r"\bkb[ _-]?(?:(?:id|entry|ref)\s*[:=]\s*[A-Za-z0-9_-]{8,}|"
+                  r"(?:id|entry|ref)?\s*(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{8,})", b, re.IGNORECASE)
         or re.search(r"\b(?:search(?:ed)?(?:_kb)?|checked|looked)\b[^.\n]{0,100}"
                      r"\bkb\b[^.\n]{0,100}"
                      r"\b(?:no (?:hit|match|result|entry)|empty|nothing|none)\b", b, re.IGNORECASE)

@@ -81,3 +81,12 @@ def test_a_done_card_keeps_its_real_failure_reason(conn):
     kb.record_completion_state(conn, tid, "tested", {"proof": "re-tested"})
     out = json.loads(tools._handle_complete({"task_id": tid, "summary": "again"}))
     assert "requires live verification" not in out["error"]
+
+
+def test_an_archived_card_keeps_its_real_failure_reason(conn):
+    from tools import kanban_tools as tools
+    tid = kb.create_task(conn, title="release", requires_live_verification=True)
+    conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (tid,))
+    conn.commit()
+    out = json.loads(tools._handle_complete({"task_id": tid, "summary": "again"}))
+    assert "requires live verification" not in out["error"]
