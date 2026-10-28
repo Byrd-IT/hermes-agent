@@ -368,7 +368,7 @@ def _scratch_repo_workspace_warning(
     # The path is only echoed back to the card's own author. It is never stat()ed: card text is
     # author-controlled, and a filesystem probe of arbitrary paths (network mounts, other users'
     # trees) is not worth a courtesy warning.
-    found = re.search(r"(?<!\S)(/[^\s]+)", text)
+    found = re.search(r"(?<!\S)(/[\w.~/+-]+)", text)     # path characters only: a query string is never echoed
     repo_path = found.group(1).rstrip(".,;:!?)]}")[:200] if found else None
     repo_detail = f" {repo_path}" if repo_path else ""
     return (
