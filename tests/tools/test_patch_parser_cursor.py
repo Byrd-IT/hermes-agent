@@ -337,3 +337,26 @@ class TestHintedAndFallbackSelection:
         result, fo = self._apply(patch, original)
         assert result.success is True, result.error
         assert fo.files["m.py"] == "early = new\nlate = new\n"
+
+    def test_a_lone_hinted_hunk_with_duplicate_source_text_applies_inside_the_hint_window(self):
+        patch = (
+            "*** Begin Patch\n*** Update File: m.py\n"
+            "@@ def b(): @@\n-    return True\n+    return False\n"
+            "*** End Patch\n"
+        )
+        padding = "# filler line to keep the two functions far apart\n" * 40
+        original = "def a():\n    return True\n" + padding + "def b():\n    return True\n"
+        result, fo = self._apply(patch, original)
+        assert result.success is True, result.error
+        assert fo.files["m.py"] == original.replace("def b():\n    return True", "def b():\n    return False")
+
+    def test_a_lone_unhinted_hunk_with_duplicate_source_text_still_fails_closed(self):
+        patch = (
+            "*** Begin Patch\n*** Update File: m.py\n"
+            "@@\n-    return True\n+    return False\n"
+            "*** End Patch\n"
+        )
+        original = "def a():\n    return True\ndef b():\n    return True\n"
+        result, fo = self._apply(patch, original)
+        assert result.success is False
+        assert fo.files["m.py"] == original
