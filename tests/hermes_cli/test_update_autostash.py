@@ -11,15 +11,9 @@ from tests.hermes_cli.test_update_target_identity import git, update_tree
 from datetime import UTC
 
 
-@pytest.mark.parametrize('history,failure,keep', [
-    ('ordinary', None, False), ('ordinary', None, True),
-    ('ordinary', 'reset', False), ('ordinary', 'reset', True),
-    ('orphan', None, False), ('orphan', 'reset', False),
-    ('orphan', 'ref', False), ('orphan', 'head', False),
-])
-def test_update_preserves_local_work_and_rescues_orphan_before_reset(
-    update_tree, monkeypatch, capsys, history, failure, keep,
-):
+@pytest.mark.parametrize('history', ['ordinary', 'orphan'])
+def test_update_refuses_reset_when_main_has_local_commits(update_tree, monkeypatch, capsys, history):
+    """Local commits on the update branch must never be reset away (2026-10-18 loss of a fleet fix)."""
     t = update_tree
     git(t.clone, 'checkout', '-q', 'main')
     if history == 'orphan':
@@ -30,56 +24,67 @@ def test_update_preserves_local_work_and_rescues_orphan_before_reset(
     git(t.clone, 'add', 'local.txt')
     git(t.clone, '-c', 'commit.gpgsign=false', 'commit', '-qm', 'local history')
     before = git(t.clone, 'rev-parse', 'HEAD')
-    (t.clone / 'untracked.txt').write_text('local edit\n', encoding='utf-8')
-    t.args.channel, t.args.keep_stash = 'main', keep
+    t.args.channel, t.args.keep_stash = 'main', False
     monkeypatch.setattr(hermes_main, '_sync_with_upstream_if_needed', update_cmd._sync_with_upstream_if_needed)
     monkeypatch.setattr(update_cmd, '_UPDATE_CRITICAL_MODULES', ())
     original = subprocess.run
     resets = []
 
-    def fault(command, *args, **kwargs):
+    def spy(command, *args, **kwargs):
         if 'reset' in command and '--hard' in command:
-            refs = original(['git', 'for-each-ref', '--format=%(objectname)',
-                             'refs/hermes-update-backups/'], cwd=t.clone,
-                            check=True, capture_output=True, text=True).stdout.split()
-            assert refs == ([before] if failure not in {'ref', 'head'} else [])
             resets.append(command)
-        if ((failure == 'ref' and 'update-ref' in command and '-d' not in command)
-                or (failure == 'reset' and 'reset' in command and '--hard' in command)):
-            return subprocess.CompletedProcess(command, 128, stdout='', stderr='fixture I/O refusal')
         return original(command, *args, **kwargs)
 
-    monkeypatch.setattr(subprocess, 'run', fault)
-    if failure == 'head':
-        monkeypatch.setattr(update_cmd, '_capture_head_sha', lambda *_: None)
-    if failure == 'reset':
-        with pytest.raises(SystemExit) as error:
-            hermes_main.cmd_update(t.args)
-        assert error.value.code == 1
-        assert not t.requests
-        assert git(t.clone, 'rev-parse', 'HEAD') == before
-        assert not (t.clone / 'untracked.txt').exists()
-    else:
+    monkeypatch.setattr(subprocess, 'run', spy)
+    with pytest.raises(SystemExit) as error:
         hermes_main.cmd_update(t.args)
-        assert len(t.requests) == 1
-        assert git(t.clone, 'rev-parse', 'HEAD') == t.newer
-        assert (t.clone / 'untracked.txt').exists() is (not keep)
-    assert len(resets) == 1
-    stashes = git(t.clone, 'stash', 'list')
-    assert bool(stashes) is (keep or failure == 'reset')
-    if stashes:
-        assert git(t.clone, 'show', 'stash@{0}^3:untracked.txt') == 'local edit'
+    assert error.value.code == 1
+    assert not resets
+    assert not t.requests
+    assert git(t.clone, 'rev-parse', 'HEAD') == before
+    assert (t.clone / 'local.txt').read_text(encoding='utf-8') == 'committed\n'
     output = capsys.readouterr().out
-    if failure == 'ref':
-        assert 'backup write failed' in output and 'backed up current HEAD' not in output
-    if failure == 'reset':
-        assert 'preserved in stash' in output
-    if failure not in {'ref', 'head'}:
-        assert f'expires after {update_cmd._ORPHAN_RESCUE_REF_MAX_AGE_DAYS} days' in output
-        kind = 'orphan' if history == 'orphan' else 'diverged'
-        assert f'refs/hermes-update-backups/{kind}-main-' in output
-        if kind == 'diverged':
-            assert 'commit(s) not on origin/main leave the branch' in output
+    assert 'Refusing to reset main' in output and '1 local commit(s)' in output
+
+
+def test_diverged_main_with_local_commits_refuses_reset(monkeypatch, capsys):
+    """Unit shape of the incident: ff-only fails, but local commits are not a remote force-push."""
+    from types import SimpleNamespace
+    calls = []
+
+    def fake_git_run(_git_cmd, args, **_kwargs):
+        calls.append(args)
+        if args == ['branch', '--show-current']:
+            return SimpleNamespace(stdout='main\n', stderr='', returncode=0)
+        if args == ['rev-list', 'origin/main..HEAD', '--count']:
+            return SimpleNamespace(stdout='5\n', stderr='', returncode=0)
+        return SimpleNamespace(stdout='', stderr='', returncode=0)
+
+    monkeypatch.setattr(update_cmd, '_git_run', fake_git_run)
+    with pytest.raises(SystemExit, match='1'):
+        update_cmd._reconcile_diverged_checkout(['git'], 'main', 'abc123')
+    out = capsys.readouterr().out
+    assert 'Refusing to reset' in out and '5 local commit(s)' in out
+    assert ['reset', '--hard', 'origin/main'] not in calls
+
+
+def test_unverifiable_local_commit_count_refuses_reset(monkeypatch, capsys):
+    from types import SimpleNamespace
+    calls = []
+
+    def fake_git_run(_git_cmd, args, **_kwargs):
+        calls.append(args)
+        if args == ['branch', '--show-current']:
+            return SimpleNamespace(stdout='main\n', stderr='', returncode=0)
+        if args and args[0] == 'rev-list':
+            return SimpleNamespace(stdout='', stderr='boom', returncode=128)
+        return SimpleNamespace(stdout='', stderr='', returncode=0)
+
+    monkeypatch.setattr(update_cmd, '_git_run', fake_git_run)
+    with pytest.raises(SystemExit):
+        update_cmd._reconcile_diverged_checkout(['git'], 'main', 'abc123')
+    assert 'could not verify' in capsys.readouterr().out
+    assert not any(a[:1] == ['reset'] for a in calls)
 
 
 @pytest.mark.parametrize('mode', ['count', 'age', 'unparseable'])
