@@ -88,6 +88,24 @@ class FakeVoiceAdapter:
             handle.aborted = True
 
 
+class SlowFirstChunkStreamer(FakeStreamer):
+    """Blocks before the first chunk so abort lands while the provider call is still pending."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.started = threading.Event()
+        self.allow_first_chunk = threading.Event()
+        self.finished = threading.Event()
+
+    def stream(self, text: str):
+        self.started.set()
+        try:
+            self.allow_first_chunk.wait(timeout=5.0)
+            yield b"chunk-1-0"
+        finally:
+            self.finished.set()
+
+
 class BlockingSecondChunkStreamer(FakeStreamer):
     """Yields one chunk immediately, then blocks before the remaining chunks."""
 
