@@ -27,7 +27,7 @@ from tools.file_operations import (
 from tools.file_operations_common import DEFAULT_READ_LIMIT, count_conflict_blocks
 from tools import file_state
 from hermes_platform.host import facts
-from agent.redact import _is_secret_file_arg, redact_sensitive_text
+from agent.redact import _SENSITIVE_QUERY_PARAMS, _is_secret_file_arg, redact_sensitive_text
 from tools.file_tools_paths import (
     _expand_tilde, _path_resolution_warning, _resolve_base_dir, _resolve_entry_for_task,
     _resolve_path_for_task)
@@ -165,7 +165,10 @@ _MASK_RUN_RE = re.compile(r"(?<!\*)\*{3}(?!\*)")
 _CREDENTIAL_WORD_RE = re.compile(
     r"key|token|secret|pass|pwd|(?<![a-z])pw(?![a-z])|_pw\b|credential|auth|bearer|digest|basic|"
     r"signature|(?<![a-z])sig(?![a-z])|cookie|session|ticket|jwt", re.IGNORECASE)
-_QUERY_VALUE_RE = re.compile(r"[?&;][\w.%-]+=$")
+# A URL query / fragment / form-body value whose name the redactor treats as sensitive.
+_QUERY_VALUE_RE = re.compile(
+    r"(?:^|[?#&;])(?:" + "|".join(sorted(map(re.escape, _SENSITIVE_QUERY_PARAMS))) + r")=$", re.IGNORECASE)
+_URL_USERINFO_RE = re.compile(r"//[^/\s?#@]*$")     # after // with no path yet: user:<mask>@host
 _TELEGRAM_ID_RE = re.compile(r"\d{6,}:$")
 
 
@@ -183,10 +186,8 @@ def _is_masked_credential_run(text: str, start: int, end: int) -> bool:
     prefix = text[line_start:start]
     if not prefix.strip() and not text[end:line_end].strip():
         return False                                        # alone on its line: a Markdown rule
-    if "://" in prefix and "/" not in prefix.split("://", 1)[1]:
-        return True                                         # URL userinfo
     return bool(_CREDENTIAL_WORD_RE.search(prefix) or _QUERY_VALUE_RE.search(prefix)
-                or _TELEGRAM_ID_RE.search(prefix))
+                or _URL_USERINFO_RE.search(prefix) or _TELEGRAM_ID_RE.search(prefix))
 
 
 def _has_masked_credential_run(text: str) -> bool:
@@ -199,7 +200,8 @@ def _masked_secret_edit_error() -> str:
         "Refused to apply an edit containing a masked credential literal. "
         "Masked tool output is display-only and must not be written to files. "
         "Use the credential-vault or configuration path for secrets instead. If the file really "
-        "contains this literal, edit it with write_file or a terminal command."
+        "contains this literal (you read it from the file itself, not from tool output), edit it "
+        "with write_file or a terminal command."
     )
 
 
