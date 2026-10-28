@@ -45,3 +45,15 @@ def test_ordinary_cards_are_untouched(tmp_path, monkeypatch):
     with _connect(tmp_path, monkeypatch) as conn:
         assert kb.create_task(conn, title="Upgrade the tool registry", body="Plain work, mentions tools.")
         assert kb.create_task(conn, title="Fix the batch importer", body="batch jobs")
+
+
+@pytest.mark.parametrize("body", [
+    "kb searched, tool still fails.",
+    "Looked at the kb reference material, it timed out again.",
+    "memory reference documents say nothing; web_search timed out.",
+    "kb entries are large; this one failed.",
+])
+def test_prose_that_merely_mentions_kb_or_memory_is_not_research(tmp_path, monkeypatch, body):
+    with _connect(tmp_path, monkeypatch) as conn:
+        with pytest.raises(ValueError, match="no research cited"):
+            kb.create_task(conn, title="Tool failure: web_search timed out", body=body)
