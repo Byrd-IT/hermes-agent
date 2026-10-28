@@ -354,7 +354,8 @@ _REPO_WORK_HINT = re.compile(
 def _scratch_repo_workspace_warning(
     title: str, body: Optional[str], workspace_kind: Optional[str],
 ) -> Optional[str]:
-    """Return guidance when a scratch card asks for branch/commit work.
+    """Return guidance when a scratch card asks for branch/commit work (wording: branch off,
+    on a branch, commit to). No filesystem access.
 
     This is intentionally advisory: a creator may explicitly choose scratch,
     and the creation path must never silently promote that choice to worktree.
@@ -362,13 +363,13 @@ def _scratch_repo_workspace_warning(
     if workspace_kind != "scratch":
         return None
     text = f"{title}\n{body or ''}"
-    repo_path = next((
-        candidate.rstrip(".,;:!?)]}")
-        for candidate in re.findall(r"(?<!\S)(/[^\s]+)", text)
-        if Path(candidate.rstrip(".,;:!?)]}")).is_dir()
-    ), None)
-    if repo_path is None and not _REPO_WORK_HINT.search(text):
+    if not _REPO_WORK_HINT.search(text):
         return None
+    # The path is only echoed back to the card's own author. It is never stat()ed: card text is
+    # author-controlled, and a filesystem probe of arbitrary paths (network mounts, other users'
+    # trees) is not worth a courtesy warning.
+    found = re.search(r"(?<!\S)(/[^\s]+)", text)
+    repo_path = found.group(1).rstrip(".,;:!?)]}")[:200] if found else None
     repo_detail = f" {repo_path}" if repo_path else ""
     return (
         f"card references git repository{repo_detail} but workspace_kind=scratch — "
