@@ -83,6 +83,12 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
     re.IGNORECASE,
 )
+# An operator can explicitly retire an already-linked PR/repository path. Keep
+# this deliberately structured so casual discussion of abandoning work cannot
+# disable duplicate-PR protection.
+_RESPAWN_GUARD_PR_ABANDONED_RE = re.compile(
+    r"\bkanban:\s*pr-(?:abandoned|superseded)\b", re.IGNORECASE,
+)
 
 
 @dataclass
@@ -1653,9 +1659,27 @@ def check_respawn_guard(
                 conn, "task_events", task_id, max(pr_times),
                 "AND kind IN ('assigned', 'changes_requested', 'review_reopened')", cols=", kind, payload", strict=True)):
             return None
+        if _pr_retired_after(conn, task_id, max(pr_times), now):
+            return None
         return "active_pr"
 
     return None
+
+
+def _pr_retired_after(conn: sqlite3.Connection, task_id: str, pr_time: int, now: int) -> bool:
+    """True when an explicit ``kanban: pr-abandoned``/``pr-superseded`` comment follows the newest PR
+    comment. The marker retires only the PR that precedes it: a newer PR comment re-arms the guard.
+    Comment ids break a same-second tie."""
+    rows = sorted(
+        ((t, int(c["id"]), _kb._lossy_text(c["body"]) or "")
+         for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
+                                 cols=", id, body", unreadable=now)),
+        key=lambda row: (row[0], row[1]),
+    )
+    last_pr = max((i for i, row in enumerate(rows) if _RESPAWN_GUARD_PR_URL_RE.search(row[2])), default=None)
+    if last_pr is None or rows[last_pr][0] != pr_time:
+        return False
+    return any(_RESPAWN_GUARD_PR_ABANDONED_RE.search(row[2]) for row in rows[last_pr + 1:])
 
 
 _GUARD_TIME_COLS = {"task_runs": "ended_at", "task_events": "created_at", "task_comments": "created_at"}
