@@ -32,6 +32,8 @@ HAND_WRITTEN = [
     f"Authorization: ApiKey {S}",
     f"bot12345678:{S}",
     f"hermes-session={S}",
+    f"https://x.test/cb?sig={S}&code={S}",
+    f"https://{S}:{S}@git.example/x",
     f"token = {VAULT}",
 ]
 
@@ -44,6 +46,11 @@ ORDINARY_TEXT = [
     f"## Notes\n\n{S}\n\ntext",
     "multiply: a * b * c",
     "a ** b and ****** and ****",         # other asterisk runs
+    f'    return "{S}"',                  # source that builds a mask (agent/redact.py and others)
+    f'placeholder: str = "{S}"',
+    f'if "{S}" in value:',
+    f"line.replace(value, '{S}')",
+    f'DEFAULT_MASK = "{S}"',
     f"auth\n{S}",                         # a word at line end, then a Markdown rule
 ]
 
@@ -89,4 +96,11 @@ def test_v4a_hunk_with_a_markdown_rule_is_not_refused(mock_get):
             f"-old\n+{S}\n*** End Patch\n"
         ),
     )
+    mock_get.assert_called()
+
+
+@patch("tools.file_tools._get_file_ops")
+def test_editing_source_that_builds_a_mask_reaches_the_file_layer(mock_get):
+    patch_tool(mode="replace", path="/tmp/redact.py", old_string=f'    return "{S}"\n',
+               new_string=f'    return "{S}"  # short secrets\n')
     mock_get.assert_called()
