@@ -278,3 +278,62 @@ class TestSafeCursorHunkSelection:
         assert result.success is False
         assert fo.files["providers.py"] == original
         assert "hunk 2" in (result.error or "").lower()
+
+
+class TestHintedAndFallbackSelection:
+    """Opus review round 1: a hint must not be bypassed by the cursor, and the from-the-top fallback must
+    not pick the first of several copies."""
+
+    def _apply(self, patch, original):
+        ops, err = parse_v4a_patch(patch)
+        assert err is None
+        fo = _DictFileOps({"m.py": original})
+        return apply_v4a_operations(ops, fo), fo
+
+    def test_hinted_changed_hunk_does_not_edit_an_earlier_duplicate(self):
+        patch = (
+            "*** Begin Patch\n*** Update File: m.py\n"
+            "@@ first @@\n-first = old\n+first = new\n"
+            "@@ def b(): @@\n-    return True\n+    return False\n"
+            "*** End Patch\n"
+        )
+        original = "first = old\ndef a():\n    return True\ndef b():\n    return True\n"
+        result, fo = self._apply(patch, original)
+        assert result.success is False
+        assert fo.files["m.py"] == original
+
+    def test_fallback_over_several_earlier_copies_fails_closed(self):
+        patch = (
+            "*** Begin Patch\n*** Update File: m.py\n"
+            "@@ tail @@\n-tail = old\n+tail = new\n"
+            "@@\n-value = old\n+value = new\n"
+            "*** End Patch\n"
+        )
+        original = "value = old\nvalue = old\ntail = old\n"
+        result, fo = self._apply(patch, original)
+        assert result.success is False
+        assert fo.files["m.py"] == original
+
+    def test_fallback_over_a_single_earlier_copy_still_applies(self):
+        patch = (
+            "*** Begin Patch\n*** Update File: m.py\n"
+            "@@ tail @@\n-tail = old\n+tail = new\n"
+            "@@\n-value = old\n+value = new\n"
+            "*** End Patch\n"
+        )
+        original = "value = old\ntail = old\n"
+        result, fo = self._apply(patch, original)
+        assert result.success is True, result.error
+        assert fo.files["m.py"] == "value = new\ntail = new\n"
+
+    def test_hinted_hunk_with_a_unique_pattern_applies_wherever_it_is(self):
+        patch = (
+            "*** Begin Patch\n*** Update File: m.py\n"
+            "@@ late @@\n-late = old\n+late = new\n"
+            "@@ early @@\n-early = old\n+early = new\n"
+            "*** End Patch\n"
+        )
+        original = "early = old\nlate = old\n"
+        result, fo = self._apply(patch, original)
+        assert result.success is True, result.error
+        assert fo.files["m.py"] == "early = new\nlate = new\n"

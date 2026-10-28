@@ -174,6 +174,19 @@ def _seek_hunk(content: str, search_lines: list[str], cursor: int) -> Optional[t
     return None
 
 
+def _count_line_matches(content: str, search_lines: list[str]) -> int:
+    """How many places ``search_lines`` matches, by the first of exact / rstrip / strip that matches."""
+    content_lines = content.split('\n')
+    for transform in (lambda line: line, str.rstrip, str.strip):
+        wanted = [transform(line) for line in search_lines]
+        hits = sum(
+            1 for index in range(len(content_lines) - len(wanted) + 1)
+            if [transform(line) for line in content_lines[index:index + len(wanted)]] == wanted)
+        if hits:
+            return hits
+    return 0
+
+
 def _v4a_match_error(error: Optional[str], *, hint_window_ambiguous: bool = False) -> Optional[str]:
     """V4A cannot set ``replace_all``; keep ambiguity recovery actionable."""
     if error is None:
@@ -193,7 +206,13 @@ def _replace_hunk(content: str, hunk: Hunk, search_pattern: str, replacement: st
     """
     from tools.fuzzy_match import fuzzy_find_and_replace
 
-    location = _seek_hunk(content, search_pattern.split('\n'), cursor)
+    search_lines = search_pattern.split('\n')
+    # A hinted hunk keeps the original rule: the hint, not the cursor, resolves duplicate source text.
+    location = None if hunk.context_hint else _seek_hunk(content, search_lines, cursor)
+    if location is not None and location[0] < cursor and _count_line_matches(content, search_lines) > 1:
+        # Nothing matched after the cursor, so the seek fell back to the top of the file. With several
+        # copies there, the first one is a guess, not the block this hunk means.
+        location = None
     if location is not None:
         start, end = location
         window_new, count, strategy, _err = fuzzy_find_and_replace(
