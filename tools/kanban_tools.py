@@ -824,6 +824,7 @@ def _handle_complete(args: dict, **kw) -> str:
             # complete_task reports every refusal as bare False; a reopened or
             # never-finished parent is the actionable one. Name the blockers so
             # the worker/operator completes the parents instead of re-running.
+            from hermes_cli.kanban_live_verification import live_verification_refusal
             blockers = kb.unsatisfied_parents(conn, tid)
             if blockers:
                 detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
