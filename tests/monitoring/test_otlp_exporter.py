@@ -132,6 +132,11 @@ def test_signal_endpoint_swaps_between_known_suffixes():
     assert OE._signal_endpoint("http://127.0.0.1:4318/v1/logs", "traces") == "http://127.0.0.1:4318/v1/traces"
 
 
+def test_signal_endpoint_appends_suffix_to_a_custom_path():
+    assert OE._signal_endpoint("http://host/otlp", "traces") == "http://host/otlp/v1/traces"
+    assert OE._signal_endpoint("http://host/otlp/", "logs") == "http://host/otlp/v1/logs"
+
+
 def test_signal_endpoint_already_correct_is_unchanged():
     assert OE._signal_endpoint("http://127.0.0.1:4318/v1/traces", "traces") == "http://127.0.0.1:4318/v1/traces"
 
