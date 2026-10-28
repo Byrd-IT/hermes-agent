@@ -185,6 +185,18 @@ def _backend_is_windows(env: Any, cwd: str) -> bool:
         re.match(r"^[A-Za-z]:[\\/]", cwd))
 
 
+_LINE_TRANSFORMS = (lambda line: line, str.rstrip, str.strip)    # exact, rstrip, strip
+
+
+def _transform_views(content_lines: list[str], search_lines: list[str]):
+    """Yield ``(content_lines, search_lines)`` under each transform, in match-strength order.
+
+    Each transformed copy is built once per transform (lazily, so an exact match never pays for the
+    strip passes) instead of once per candidate index."""
+    for transform in _LINE_TRANSFORMS:
+        yield [transform(line) for line in content_lines], [transform(line) for line in search_lines]
+
+
 def _seek_hunk(content: str, search_lines: list[str], cursor: int) -> Optional[tuple[int, int]]:
     """Find a hunk from ``cursor`` using codex-style exact/rstrip/strip line matching.
 
@@ -202,12 +214,11 @@ def _seek_hunk(content: str, search_lines: list[str], cursor: int) -> Optional[t
         offset += len(line) + 1
     starts = (cursor, 0) if cursor else (0,)
     for start_at in starts:
-        for transform in (lambda line: line, str.rstrip, str.strip):
-            wanted = [transform(line) for line in search_lines]
+        for transformed, wanted in _transform_views(content_lines, search_lines):
             for index in range(len(content_lines) - len(wanted) + 1):
                 if offsets[index] < start_at:
                     continue
-                if [transform(line) for line in content_lines[index:index + len(wanted)]] == wanted:
+                if transformed[index:index + len(wanted)] == wanted:
                     end_index = index + len(wanted) - 1
                     return offsets[index], offsets[end_index] + len(content_lines[end_index])
     return None
@@ -216,11 +227,9 @@ def _seek_hunk(content: str, search_lines: list[str], cursor: int) -> Optional[t
 def _count_line_matches(content: str, search_lines: list[str]) -> int:
     """How many places ``search_lines`` matches, by the first of exact / rstrip / strip that matches."""
     content_lines = content.split('\n')
-    for transform in (lambda line: line, str.rstrip, str.strip):
-        wanted = [transform(line) for line in search_lines]
-        hits = sum(
-            1 for index in range(len(content_lines) - len(wanted) + 1)
-            if [transform(line) for line in content_lines[index:index + len(wanted)]] == wanted)
+    for transformed, wanted in _transform_views(content_lines, search_lines):
+        hits = sum(1 for index in range(len(content_lines) - len(wanted) + 1)
+                   if transformed[index:index + len(wanted)] == wanted)
         if hits:
             return hits
     return 0
@@ -367,12 +376,13 @@ def _validate_operations(operations: list[PatchOperation], file_ops: Any) -> lis
                     f"{op.file_path}: hunk 1 (no later ordering anchor) is ambiguous — "
                     "include unique context lines in its search text")
                 continue
-            # A later unanchored hunk cannot safely skip one of several identical source blocks.
+            # A later unanchored hunk cannot safely skip one of several identical source blocks (counted
+            # the way _seek_hunk matches: whole lines, exact / rstrip / strip).
             # An explicit run of identical changed hunks encodes a cursor-ordered sequence, so it
             # applies successively; a lone broad hunk is rejected instead of silently editing the
             # next block.
             if (cursor and not hunk.context_hint and search_pattern not in repeated
-                    and _count_occurrences(simulated[cursor:], search_pattern) > 1):
+                    and _count_line_matches(simulated[cursor:], search_lines) > 1):
                 errors.append(
                     f"{op.file_path}: hunk {hunk_index} (no hint) is ambiguous after the "
                     "previous hunk — include unique context lines in its search text")
