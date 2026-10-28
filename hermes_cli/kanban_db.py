@@ -1197,15 +1197,19 @@ def _reject_unresearched_tool_failure_card(title, body) -> None:
     if not (is_prefixed_failure or is_retitled_local_batching_failure):
         return
     researched = bool(
-        re.search(r"\bkb[ _-]?(?:id|entry|ref)?\s*[:=]?\s*[A-Za-z0-9_-]{8,}", b, re.I)
+        re.search(r"\bkb[ _-]?(?:id|entry|ref)?\s*[:=]?\s*[A-Za-z0-9_-]{8,}", b, re.IGNORECASE)
         or re.search(r"\b(?:search(?:ed)?(?:_kb)?|checked|looked)\b[^.\n]{0,100}"
                      r"\bkb\b[^.\n]{0,100}"
-                     r"\b(?:no (?:hit|match|result|entry)|empty|nothing|none)\b", b, re.I)
+                     r"\b(?:no (?:hit|match|result|entry)|empty|nothing|none)\b", b, re.IGNORECASE)
         or re.search(r"\bkb\b[^.\n]{0,100}\b(?:no (?:hit|match|result|entry)s?|"
-                     r"came back empty|returned nothing)\b", b, re.I)
+                     r"came back empty|returned nothing)\b", b, re.IGNORECASE)
         or re.search(r"\b(?:search_kb|kb[ _-]?search)\b[^.\n]{0,120}"
-                     r"\b(?:no (?:hit|match|result|entry)s?|empty|nothing|none)\b", b, re.I)
-        or re.search(r"\bno (?:existing )?kb (?:entry|hit|match)\b", b, re.I)
+                     r"\b(?:no (?:hit|match|result|entry)s?|empty|nothing|none)\b", b, re.IGNORECASE)
+        or re.search(r"\bno (?:existing )?kb (?:entry|hit|match)\b", b, re.IGNORECASE)
+        # Byrd-IT_Memory replaced the KB: a memory id, or a memory_search that found nothing.
+        or re.search(r"\bmemory[ _-]?(?:id|ref)\s*[:=]?\s*[A-Za-z0-9_-]{8,}", b, re.IGNORECASE)
+        or re.search(r"\bmemory_search\b[^.\n]{0,120}\b(?:no (?:hit|match|result|entry)s?|empty|nothing|none)\b",
+                     b, re.IGNORECASE)
     )
     if researched:
         return
@@ -1215,11 +1219,12 @@ def _reject_unresearched_tool_failure_card(title, body) -> None:
         "behavior (e.g. tool_call batches only connectors__ names; Tirith fails closed when "
         "package threat-intel cannot complete).\n"
         "Do this instead:\n"
-        "  1. search_kb for the exact error string / tool name / rule id.\n"
+        "  1. memory_search (or search_kb) for the exact error string / tool name / rule id.\n"
         "  2. KB HIT -> do not file. Note the KB id on your OWN card and continue using the "
         "documented workaround.\n"
-        "  3. KB EMPTY and you reproduced it live -> re-file including either the KB id you "
-        "checked, or the sentence 'searched the KB for <term>: no hits'.\n"
+        "  3. KB EMPTY and you reproduced it live -> re-file including either the KB/memory id you "
+        "checked, or the sentence 'searched the KB for <term>: no hits' (or 'memory_search for <term>: "
+        "no hits').\n"
         "See skill kanban-worker and KB entries tagged stop-filing-cards."
     )
 
