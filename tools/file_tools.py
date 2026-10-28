@@ -153,14 +153,20 @@ _V4A_MOVE_HEADER_RE = re.compile(r'^(\*\*\*\s*Move\s+File:\s*)(.+?)\s*->\s*(.+)$
 # The redactor returns three asterisks for short secrets and this exact marker for
 # vault-filled values. Those display-only replacements must never become file
 # content through a fuzzy patch whose source was a redacted tool result.
-# The vault marker is always refused. A run of exactly three asterisks is refused unless it is
-# plainly ordinary text: a Markdown rule (alone on its line), a bold-italic opener or closer, or a C
-# pointer type (touching a word character). The redactor has many mask shapes (env and JSON fields,
-# auth headers with any scheme, URL userinfo and query values, Telegram tokens, session links), so
-# listing them would miss some; every redactor shape sits next to punctuation or whitespace, never
-# inside a word, which is what the exemptions rely on.
+# The vault marker is always refused. A run of exactly three asterisks is refused only where it sits
+# in a credential context: after a credential word (env and JSON fields, auth
+# headers with any scheme), as a URL query value or userinfo, or after a Telegram bot id. Ordinary
+# source such as a Markdown rule, bold-italic, a C pointer type, ``return "<run>"`` or
+# ``text.replace(v, '<run>')`` has no credential word before it and is left alone; so is a run that
+# touches a word character. The credential words are matched anywhere before the run on the line,
+# because the redactor keeps the field name and masks only the value.
 _VAULT_SECRET_MARKER = "\u00abredacted-vault-secret\u00bb"
 _MASK_RUN_RE = re.compile(r"(?<!\*)\*{3}(?!\*)")
+_CREDENTIAL_WORD_RE = re.compile(
+    r"key|token|secret|pass|pwd|(?<![a-z])pw(?![a-z])|_pw\b|credential|auth|bearer|digest|basic|"
+    r"signature|(?<![a-z])sig(?![a-z])|cookie|session|ticket|jwt", re.IGNORECASE)
+_QUERY_VALUE_RE = re.compile(r"[?&;][\w.%-]+=$")
+_TELEGRAM_ID_RE = re.compile(r"\d{6,}:$")
 
 
 def _is_word_char(ch: str) -> bool:
@@ -174,7 +180,13 @@ def _is_masked_credential_run(text: str, start: int, end: int) -> bool:
     line_start = text.rfind("\n", 0, start) + 1
     line_end = text.find("\n", end)
     line_end = len(text) if line_end == -1 else line_end
-    return bool(text[line_start:start].strip() or text[end:line_end].strip())
+    prefix = text[line_start:start]
+    if not prefix.strip() and not text[end:line_end].strip():
+        return False                                        # alone on its line: a Markdown rule
+    if "://" in prefix and "/" not in prefix.split("://", 1)[1]:
+        return True                                         # URL userinfo
+    return bool(_CREDENTIAL_WORD_RE.search(prefix) or _QUERY_VALUE_RE.search(prefix)
+                or _TELEGRAM_ID_RE.search(prefix))
 
 
 def _has_masked_credential_run(text: str) -> bool:
@@ -186,7 +198,8 @@ def _masked_secret_edit_error() -> str:
     return (
         "Refused to apply an edit containing a masked credential literal. "
         "Masked tool output is display-only and must not be written to files. "
-        "Use the credential-vault or configuration path for secrets instead."
+        "Use the credential-vault or configuration path for secrets instead. If the file really "
+        "contains this literal, edit it with write_file or a terminal command."
     )
 
 

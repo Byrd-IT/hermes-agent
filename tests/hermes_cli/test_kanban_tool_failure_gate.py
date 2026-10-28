@@ -54,6 +54,8 @@ def test_ordinary_cards_are_untouched(tmp_path, monkeypatch):
     "Looked at the kb reference material, it timed out again.",
     "memory reference documents say nothing; web_search timed out.",
     "kb entries are large; this one failed.",
+    "kb: searched, nothing useful.",
+    "Checked kb: duplicates everywhere.",
 ])
 def test_prose_that_merely_mentions_kb_or_memory_is_not_research(tmp_path, monkeypatch, body):
     with _connect(tmp_path, monkeypatch) as conn:

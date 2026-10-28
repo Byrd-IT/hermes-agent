@@ -831,7 +831,7 @@ def _handle_complete(args: dict, **kw) -> str:
                 raise _Reject(
                     f"could not complete {tid}: unsatisfied parent dependencies: "
                     f"{detail}; complete the parents first (done or archived)")
-            _check(False, (live_verification_refusal(conn, tid) if task and task.status != "done" else None)
+            _check(False, (live_verification_refusal(conn, tid) if task and task.status not in ("done", "archived") else None)
                    or (task.last_failure_error if task else None)
                    or f"could not complete {tid} (unknown id, stale run, or already terminal)")
         run = kb.latest_run(conn, tid)
