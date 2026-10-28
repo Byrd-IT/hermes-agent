@@ -37,6 +37,7 @@ def test_unresearched_failure_card_is_refused(tmp_path, monkeypatch, title, body
     "memory id: 0123456789abcdef shows no workaround.",
     "kb id: stop-filing-cards, documented workaround applies.",
     "KB entry: kb_20260901a covers this.",
+    "KB: 20260901abc covers this.",
 ])
 def test_researched_failure_card_is_accepted(tmp_path, monkeypatch, body):
     with _connect(tmp_path, monkeypatch) as conn:
