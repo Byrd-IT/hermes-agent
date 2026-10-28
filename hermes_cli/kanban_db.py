@@ -1186,62 +1186,6 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
-_TOOL_FAILURE_PREFIXES = ("tool failure:", "tool/service failure", "service failure:")
-_RETITLED_LOCAL_TOOL_BATCHING_ERROR = "takes exactly one entry for local tools"
-
-
-def _reject_unresearched_tool_failure_card(title, body) -> None:
-    """Fail closed on duplicate tool-failure reports that cite no research.
-
-    Prefix-only matching let known local ``tool_call`` batching behavior be
-    re-filed as an apparently unrelated fix.  This chokepoint covers every
-    card-creating surface, while preserving a path for researched new reports.
-    """
-    t = (title or "").strip().lower()
-    b = (body or "")
-    is_prefixed_failure = any(t.startswith(prefix) for prefix in _TOOL_FAILURE_PREFIXES)
-    is_retitled_local_batching_failure = (
-        "tool_call" in t
-        and "batch" in t
-        and any(word in t for word in ("reject", "refus", "validation"))
-    ) or _RETITLED_LOCAL_TOOL_BATCHING_ERROR in b.lower()
-    if not (is_prefixed_failure or is_retitled_local_batching_failure):
-        return
-    researched = bool(
-        # An id must contain a digit: "kb searched" or "kb reference" is prose, not a cited entry.
-        re.search(r"\bkb[ _-]?(?:id|entry|ref)?\s*[:=]?\s*(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{8,}", b, re.IGNORECASE)
-        or re.search(r"\b(?:search(?:ed)?(?:_kb)?|checked|looked)\b[^.\n]{0,100}"
-                     r"\bkb\b[^.\n]{0,100}"
-                     r"\b(?:no (?:hit|match|result|entry)|empty|nothing|none)\b", b, re.IGNORECASE)
-        or re.search(r"\bkb\b[^.\n]{0,100}\b(?:no (?:hit|match|result|entry)s?|"
-                     r"came back empty|returned nothing)\b", b, re.IGNORECASE)
-        or re.search(r"\b(?:search_kb|kb[ _-]?search)\b[^.\n]{0,120}"
-                     r"\b(?:no (?:hit|match|result|entry)s?|empty|nothing|none)\b", b, re.IGNORECASE)
-        or re.search(r"\bno (?:existing )?kb (?:entry|hit|match)\b", b, re.IGNORECASE)
-        # Byrd-IT_Memory replaced the KB: a memory id, or a memory_search that found nothing.
-        or re.search(r"\bmemory[ _-]?(?:id|ref)\s*[:=]?\s*(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{8,}",
-                     b, re.IGNORECASE)
-        or re.search(r"\bmemory_search\b[^.\n]{0,120}\b(?:no (?:hit|match|result|entry)s?|empty|nothing|none)\b",
-                     b, re.IGNORECASE)
-    )
-    if researched:
-        return
-    raise ValueError(
-        "Refusing to create a tool/service-failure card with no research cited.\n"
-        "264 of these were filed in 30 days, almost all duplicates of known, intentional "
-        "behavior (e.g. tool_call batches only connectors__ names; Tirith fails closed when "
-        "package threat-intel cannot complete).\n"
-        "Do this instead:\n"
-        "  1. memory_search (or search_kb) for the exact error string / tool name / rule id.\n"
-        "  2. KB HIT -> do not file. Note the KB id on your OWN card and continue using the "
-        "documented workaround.\n"
-        "  3. KB EMPTY and you reproduced it live -> re-file including either the KB/memory id you "
-        "checked, or the sentence 'searched the KB for <term>: no hits' (or 'memory_search for <term>: "
-        "no hits').\n"
-        "See skill kanban-worker and KB entries tagged stop-filing-cards."
-    )
-
-
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1276,6 +1220,7 @@ def create_task(
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
+    from hermes_cli.kanban_tool_failure_gate import reject_unresearched_tool_failure_card
 
     completion_contract = validate_contract(completion_contract)
     verification_owner_id = str(verification_owner_id).strip() if verification_owner_id else None
@@ -1285,7 +1230,7 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
-    _reject_unresearched_tool_failure_card(title, body)
+    reject_unresearched_tool_failure_card(title, body)
     if verification_owner_id and verification_owner_id not in parents:
         owner = get_task(conn, verification_owner_id)
         if owner is None:
@@ -2770,25 +2715,6 @@ def _claim_is_live(trow) -> bool:
     )
 
 
-LIVE_VERIFICATION_REFUSAL = (
-    "{task_id} requires live verification (completion_state is {state}). Record it with "
-    "kanban_record_completion_state(state='verified', evidence={{'proof': '<what was observed live>'}}), "
-    "then complete again. Operator escape hatch: a human or orchestrator (no HERMES_KANBAN_TASK) may "
-    "record state 'verified' with a proof naming the waiver; tests and merges never satisfy this gate."
-)
-
-
-def live_verification_refusal(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """Why :func:`complete_task` refuses a live-verification card, or None when that gate is not the
-    reason. ``complete_task`` reports every refusal as a bare False; callers use this to say which."""
-    row = conn.execute(
-        "SELECT completion_state, requires_live_verification FROM tasks WHERE id = ?", (task_id,),
-    ).fetchone()
-    if not row or not bool(row["requires_live_verification"]) or row["completion_state"] == "verified":
-        return None
-    return LIVE_VERIFICATION_REFUSAL.format(task_id=task_id, state=row["completion_state"] or "unset")
-
-
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
@@ -2804,23 +2730,21 @@ def complete_task(
     :func:`request_review` applies. With no active run the handoff fields survive via
     :func:`_synthesize_ended_run`. ``summary`` (defaults to ``result``) and
     ``metadata`` land on the closing run for :func:`build_worker_context`.
-
-    A card created with ``requires_live_verification`` is refused (False, event
-    ``completion_refused_missing_live_verification``, nothing else written) until
-    ``completion_state`` is ``verified``; :func:`live_verification_refusal` gives the reason and the
-    operator escape hatch (record ``verified`` with a proof that names the waiver).
     ``created_cards`` are verified first — a phantom id raises
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
     Completions from non-review statuses need evidence: a stripped ``result``
     or ``summary``, or a stripped result already stored on the card. Empty or
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
-    auditable event. Approving a card out of ``review`` stays exempt.
+    auditable event. Approving a card out of ``review`` stays exempt. A
+    ``requires_live_verification`` card is refused until its state is ``verified``
+    (reason and escape hatch: ``kanban_live_verification``).
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+    from hermes_cli.kanban_live_verification import refuse_unverified_completion
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
@@ -2828,13 +2752,7 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
-    if live_verification_refusal(conn, task_id):
-        # Before prepare_acceptance: that step binds the PR and runs gh, none of which a refused
-        # completion may leave behind.
-        with write_txn(conn):
-            _append_event(conn, task_id, "completion_refused_missing_live_verification", {
-                "completion_state": conn.execute(
-                    "SELECT completion_state FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]})
+    if refuse_unverified_completion(conn, task_id):
         return False
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
