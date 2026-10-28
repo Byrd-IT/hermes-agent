@@ -68,19 +68,27 @@ def _assert_reset_kept_local_commit(checkout, local_sha, output):
     assert dropped == [local_sha]
 
 
-def test_hermes_update_keeps_local_commit_behind_a_rescue_ref(
+def test_hermes_update_refuses_reset_and_keeps_local_commit_on_branch(
         diverged_checkout, monkeypatch, capsys):
-    """The real apply path: ff-only fails, the reconcile resets, the local commit stays reachable."""
+    """The real apply path: ff-only fails, the reconcile refuses, the local commit stays on main.
+
+    Local commits on the update branch are never reset away (the 2026-10-18 loss of a fleet
+    fix), so the rescue-ref reset is not reached for them; nothing is changed.
+    """
     checkout, local_sha = diverged_checkout
     monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", checkout)
 
-    update_cmd._pull_updates(
-        GIT, "main", None, prompt_for_restore=False, gw_input_fn=None,
-        discard_local_changes=False, keep_stash=False)
+    with pytest.raises(SystemExit) as exc:
+        update_cmd._pull_updates(
+            GIT, "main", None, prompt_for_restore=False, gw_input_fn=None,
+            discard_local_changes=False, keep_stash=False)
 
+    assert exc.value.code == 1
+    assert _git(checkout, "rev-parse", "HEAD").stdout.strip() == local_sha
+    assert _rescue_refs(checkout) == {}
     out = capsys.readouterr().out
-    _assert_reset_kept_local_commit(checkout, local_sha, out)
-    assert "1 commit(s) not on origin/main" in out
+    assert "Refusing to reset main: 1 local commit(s) are not on origin/main" in out
+    assert "git reset --hard" not in out
 
 
 @pytest.fixture()
