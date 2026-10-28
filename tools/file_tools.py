@@ -150,10 +150,23 @@ def _file_ops_uses_host_paths(file_ops) -> bool:
 _V4A_SINGLE_HEADER_RE = re.compile(r'^(\*\*\*\s*(Update|Add|Delete)\s+File:\s*)(.+)$', re.MULTILINE)
 _V4A_MOVE_HEADER_RE = re.compile(r'^(\*\*\*\s*Move\s+File:\s*)(.+?)\s*->\s*(.+)$', re.MULTILINE)
 
-# The redactor returns ``***`` for short secrets and this exact marker for
+# The redactor returns three asterisks for short secrets and this exact marker for
 # vault-filled values. Those display-only replacements must never become file
 # content through a fuzzy patch whose source was a redacted tool result.
-_MASKED_SECRET_MARKERS = ("***", "«redacted-vault-secret»")
+# The vault marker is always refused. Three asterisks also mean a Markdown rule or bold-italic, or a
+# C pointer type, in ordinary source, so they are refused only where the redactor puts them: right
+# after a credential word (an env assignment, a JSON field, an Authorization header), after an auth
+# scheme (Bearer) or as URL userinfo (user:<asterisks>@host).
+_VAULT_SECRET_MARKER = "\u00abredacted-vault-secret\u00bb"
+_MASKED_CREDENTIAL_RE = re.compile(
+    r"""(?ix)
+    (?: (?:key|token|secret|passw(?:or)?d|pwd|credential|auth|bearer|signature|cookie)\w*
+        ["']?(?:[ \t]*[:=][ \t]*|[ \t]+)(?:(?:apikey|bearer|basic|token)[ \t]+)?["']?
+      | \b(?:bearer|basic|apikey|token)[ \t]+
+      | ://[^\s/:@]*:
+    )
+    \*\*\*(?!\w)
+    """)
 
 
 def _masked_secret_edit_error() -> str:
@@ -168,7 +181,7 @@ def _masked_secret_edit_error() -> str:
 def _contains_masked_secret_marker(*values: str | None) -> bool:
     """Whether patch text contains a display-only secret redaction marker."""
     return any(
-        isinstance(value, str) and any(marker in value for marker in _MASKED_SECRET_MARKERS)
+        isinstance(value, str) and (_VAULT_SECRET_MARKER in value or _MASKED_CREDENTIAL_RE.search(value))
         for value in values
     )
 
