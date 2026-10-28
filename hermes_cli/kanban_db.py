@@ -2768,6 +2768,25 @@ def _claim_is_live(trow) -> bool:
     )
 
 
+LIVE_VERIFICATION_REFUSAL = (
+    "{task_id} requires live verification (completion_state is {state}). Record it with "
+    "kanban_record_completion_state(state='verified', evidence={{'proof': '<what was observed live>'}}), "
+    "then complete again. Operator escape hatch: a human or orchestrator (no HERMES_KANBAN_TASK) may "
+    "record state 'verified' with a proof naming the waiver; tests and merges never satisfy this gate."
+)
+
+
+def live_verification_refusal(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Why :func:`complete_task` refuses a live-verification card, or None when that gate is not the
+    reason. ``complete_task`` reports every refusal as a bare False; callers use this to say which."""
+    row = conn.execute(
+        "SELECT completion_state, requires_live_verification FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if not row or not bool(row["requires_live_verification"]) or row["completion_state"] == "verified":
+        return None
+    return LIVE_VERIFICATION_REFUSAL.format(task_id=task_id, state=row["completion_state"] or "unset")
+
+
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
@@ -2783,6 +2802,11 @@ def complete_task(
     :func:`request_review` applies. With no active run the handoff fields survive via
     :func:`_synthesize_ended_run`. ``summary`` (defaults to ``result``) and
     ``metadata`` land on the closing run for :func:`build_worker_context`.
+
+    A card created with ``requires_live_verification`` is refused (False, event
+    ``completion_refused_missing_live_verification``, nothing else written) until
+    ``completion_state`` is ``verified``; :func:`live_verification_refusal` gives the reason and the
+    operator escape hatch (record ``verified`` with a proof that names the waiver).
     ``created_cards`` are verified first — a phantom id raises
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
@@ -2802,6 +2826,14 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
+    if live_verification_refusal(conn, task_id):
+        # Before prepare_acceptance: that step binds the PR and runs gh, none of which a refused
+        # completion may leave behind.
+        with write_txn(conn):
+            _append_event(conn, task_id, "completion_refused_missing_live_verification", {
+                "completion_state": conn.execute(
+                    "SELECT completion_state FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]})
+        return False
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
         return False
@@ -2810,19 +2842,21 @@ def complete_task(
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
             return False
-        if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
-            return False
         trow = conn.execute(
             "SELECT status, claim_lock, worker_pid, worker_started_at, completion_state, "
             "       requires_live_verification FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = trow["status"] if trow else None
+        # Re-checked in the txn (the label can change after the early check) and BEFORE the
+        # acceptance record is saved: a refused completion must leave no acceptance behind.
         if trow and bool(trow["requires_live_verification"]) and trow["completion_state"] != "verified":
             _append_event(
                 conn, task_id, "completion_refused_missing_live_verification",
                 {"completion_state": trow["completion_state"]},
             )
+            return False
+        if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
         # Refuse to close a LIVE worker's run without proof of ownership
         # (expected_run_id) or an explicit human override (force=True); see
