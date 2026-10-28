@@ -70,3 +70,14 @@ def test_verified_card_still_runs_acceptance_and_completes(conn, monkeypatch):
     kb.record_completion_state(conn, tid, "verified", {"proof": "operator waiver: checked live"})
     assert kb.complete_task(conn, tid, summary="done") is True
     assert calls == ["prepare"]
+
+
+def test_a_done_card_keeps_its_real_failure_reason(conn):
+    """A terminal card that still carries the flag is not told to record verification."""
+    from tools import kanban_tools as tools
+    tid = kb.create_task(conn, title="release", requires_live_verification=True)
+    kb.record_completion_state(conn, tid, "verified", {"proof": "live"})
+    assert kb.complete_task(conn, tid, summary="done")
+    kb.record_completion_state(conn, tid, "tested", {"proof": "re-tested"})
+    out = json.loads(tools._handle_complete({"task_id": tid, "summary": "again"}))
+    assert "requires live verification" not in out["error"]
