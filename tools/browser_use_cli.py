@@ -95,7 +95,7 @@ def _workspace_helpers_preamble(code: str, workspace: str) -> str:
     Load the optional module by its exact path, expose it as ``agent_helpers``, and
     mirror ``from agent_helpers import *`` for its public names.
     """
-    return """\
+    return f"""\
 # hermes: load optional workspace helpers into the Browser Harness globals
 import importlib.util as _hermes_importlib_util
 import sys as _hermes_sys
@@ -113,7 +113,7 @@ if _hermes_helpers_path.is_file():
         _hermes_names = (name for name in vars(_hermes_module) if not name.startswith("_"))
     globals().update({{name: getattr(_hermes_module, name) for name in _hermes_names}})
     agent_helpers = _hermes_module
-""".format(workspace=workspace) + code
+""" + code
 
 _DEFAULT_TIMEOUT_S = 300
 _MIN_TIMEOUT_S = 5

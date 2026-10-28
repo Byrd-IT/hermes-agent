@@ -1669,7 +1669,8 @@ def check_respawn_guard(
 def _pr_retired_after(conn: sqlite3.Connection, task_id: str, pr_time: int, now: int) -> bool:
     """True when an explicit ``kanban: pr-abandoned``/``pr-superseded`` comment follows the newest PR
     comment. The marker retires only the PR that precedes it: a newer PR comment re-arms the guard.
-    Comment ids break a same-second tie."""
+    Comment ids break a same-second tie. A marker comment that itself carries a PR URL (``kanban:
+    pr-superseded by https://github.com/o/r/pull/2``) is the newest PR comment, so it keeps the guard on."""
     rows = sorted(
         ((t, int(c["id"]), _kb._lossy_text(c["body"]) or "")
          for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
