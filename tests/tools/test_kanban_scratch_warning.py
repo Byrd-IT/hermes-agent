@@ -30,3 +30,8 @@ def test_worktree_and_dir_cards_never_warn():
 def test_branch_hint_without_a_path_still_warns():
     out = warn("Fix", "commit to the release branch", "scratch")
     assert out and "workspace_kind='worktree'" in out
+
+
+def test_a_query_string_in_card_text_is_never_echoed():
+    out = warn("Fix", "Branch off main, see /api/v1/items?api_key=SYNTHsecret99 for details", "scratch")
+    assert out and "/api/v1/items" in out and "SYNTHsecret99" not in out and "api_key" not in out
