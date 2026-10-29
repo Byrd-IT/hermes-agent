@@ -20,6 +20,8 @@ from telegram.request import BaseRequest
 
 from gateway.config import PlatformConfig
 from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.adapter_cold_start_poll import (
+    arm_cold_start_short_first_poll, disarm_cold_start_short_first_poll)
 
 
 _MESSAGE = {
@@ -281,7 +283,7 @@ async def test_short_poll_debug_log_does_not_echo_get_updates_error(caplog):
     adapter._app = type("App", (), {"bot": bot})()
     try:
         caplog.set_level(logging.DEBUG, logger="plugins.platforms.telegram.adapter")
-        assert adapter._arm_cold_start_short_first_poll() is True
+        assert arm_cold_start_short_first_poll(adapter) is True
         with pytest.raises(OSError):
             await bot.get_updates(timeout=timedelta(seconds=10))
         text = caplog.text
@@ -290,4 +292,4 @@ async def test_short_poll_debug_log_does_not_echo_get_updates_error(caplog):
         assert "user:pass@" not in text
     finally:
         ExtBot.get_updates = original
-        adapter._disarm_cold_start_short_first_poll()
+        disarm_cold_start_short_first_poll(adapter)
