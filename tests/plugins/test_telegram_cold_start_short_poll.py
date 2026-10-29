@@ -6,6 +6,7 @@ from that first real getUpdates, and the requested hold is 1s rather than 10s.
 
 import asyncio
 import json
+import logging
 import time
 
 import pytest
@@ -260,3 +261,33 @@ async def test_failure_before_first_success_still_raises_and_does_not_tight_loop
         assert all(float(call["timeout"]) == 10 for call in longs[1:])
     finally:
         await _stop(adapter, app)
+
+
+@pytest.mark.asyncio
+async def test_short_poll_debug_log_does_not_echo_get_updates_error(caplog):
+    """The new debug line is a static message. A secret in the getUpdates error must not appear."""
+    from datetime import timedelta
+    from telegram.ext import ExtBot
+
+    planted = "sk-SYNTH-probe-token-ABC123"
+    original = ExtBot.get_updates
+
+    async def boom(self, *args, **kwargs):
+        raise OSError("https://user:pass@probe.example.invalid " + planted)
+
+    ExtBot.get_updates = boom
+    bot = ExtBot("123456:test-token")
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="123456:test-token"))
+    adapter._app = type("App", (), {"bot": bot})()
+    try:
+        caplog.set_level(logging.DEBUG, logger="plugins.platforms.telegram.adapter")
+        assert adapter._arm_cold_start_short_first_poll() is True
+        with pytest.raises(OSError):
+            await bot.get_updates(timeout=timedelta(seconds=10))
+        text = caplog.text
+        assert "Cold-start first getUpdates long poll shortened to 1s" in text
+        assert planted not in text
+        assert "user:pass@" not in text
+    finally:
+        ExtBot.get_updates = original
+        adapter._disarm_cold_start_short_first_poll()
