@@ -214,6 +214,20 @@ def test_new_stdio_logs_do_not_echo_synthetic_secrets(caplog):
         assert leaked == [], [value[:8] for value in leaked]
         assert "not reaping pid 987656" in caplog.text
         assert "SIGKILL" in detail
+        caplog.clear()
+        lc._stdio_pids.pop(pid, None)
+        lc._orphan_stdio_pids.add(pid)
+        lc._orphan_stdio_pid_servers[pid] = token
+        with patch.object(lc, "_signal_mcp_process"), \
+             patch.object(lc.time, "sleep"), \
+             patch("gateway.status._pid_exists", return_value=True), \
+             caplog.at_level("INFO"):
+            lc._kill_orphaned_mcp_children(reason=f"pre-spawn sweep before starting '{bearer}'")
+        killed = caplog.text
+        leaked = [value for value in needles if value and value in killed]
+        assert leaked == [], [value[:8] for value in leaked]
+        assert "Force-killed MCP process 987656" in killed
+        assert bearer not in killed and token not in killed
     finally:
         _clean(pid)
         lc._recent_reaps.pop(pid, None)

@@ -469,19 +469,34 @@ def _group_alive(pgid: Optional[int], my_pgid: Optional[int]) -> bool:
         return False
 
 
+_REAP_CATEGORIES = (
+    "orphan sweep",
+    "pre-spawn sweep",
+    "cron post-tick orphan sweep",
+    "final shutdown (live servers included)",
+    "stdio transport ended",
+)
+
+
+def _reap_category(reason: Optional[str]) -> str:
+    """A fixed label safe to log. Caller text can carry a server name, so anything else is dropped."""
+    return reason if reason in _REAP_CATEGORIES else "orphan sweep"
+
+
 def _kill_orphaned_mcp_children(include_active: bool = False, server_name: Optional[str] = None,
                                 reason: Optional[str] = None) -> None:
     """Best-effort reap of stdio MCP subprocesses: SIGTERM, wait 2s, SIGKILL survivors. By
     default only ``_orphan_stdio_pids`` are reaped so concurrent cron jobs / live sessions are
     untouched; ``include_active=True`` also kills every ``_stdio_pids`` entry and is only for
     final shutdown after the MCP loop has stopped. ``server_name`` limits the sweep to one
-    server (stdio reconnects cleaning up their old transport). ``reason`` names the caller in
-    the INFO log and in the reap record a later mid-call death report quotes."""
+    server (stdio reconnects cleaning up their old transport). ``reason`` is a fixed category
+    (see ``_REAP_CATEGORIES``); anything else is logged as ``orphan sweep`` so a server name
+    cannot reach the INFO line."""
     import signal as _signal
     pids, pgids, starts = _take_reapable_pids(include_active, server_name)
     if not pids:  # skip the 2s sleep every MCP-free shutdown would otherwise pay
         return
-    reason = reason or ("final shutdown (live servers included)" if include_active else "orphan sweep")
+    reason = _reap_category(reason or ("final shutdown (live servers included)" if include_active else "orphan sweep"))
 
     try:  # our own pgid, so we never killpg() the gateway itself
         my_pgid = os.getpgrp()
@@ -489,7 +504,7 @@ def _kill_orphaned_mcp_children(include_active: bool = False, server_name: Optio
         my_pgid = None  # Windows or restricted environment
 
     logger.info("Reaping %d MCP stdio process(es) [%s]: %s", len(pids), reason,
-                ", ".join(f"{pid} ({owner})" for pid, owner in sorted(pids.items())))
+                ", ".join(str(pid) for pid, _owner in sorted(pids.items())))
     for pid, owner in pids.items():
         _signal_mcp_process(pid, _signal.SIGTERM, owner, pgids.get(pid), my_pgid, starts.get(pid))
         _note_reap(pid, reason, "SIGTERM")
@@ -501,7 +516,7 @@ def _kill_orphaned_mcp_children(include_active: bool = False, server_name: Optio
         if _pid_exists(pid) or _group_alive(pgids.get(pid), my_pgid):  # leader or descendants survived SIGTERM
             _signal_mcp_process(pid, sigkill, owner, pgids.get(pid), my_pgid, starts.get(pid))
             _note_reap(pid, reason, "SIGKILL")
-            logger.warning("Force-killed MCP process %d (%s) after SIGTERM timeout [%s]", pid, owner, reason)
+            logger.warning("Force-killed MCP process %d after SIGTERM timeout [%s]", pid, reason)
     # These groups are reaped. Release them last, so a crash partway through the SIGTERM/SIGKILL
     # dance still leaves the supervisor holding them.
     release_process_groups(pgids.values())
