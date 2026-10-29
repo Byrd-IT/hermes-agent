@@ -179,3 +179,38 @@ def test_orphan_sweep_skips_pid_still_owned_then_reaps_after_release():
         assert pid in pids
     finally:
         _clean(pid)
+
+
+def test_new_stdio_logs_do_not_echo_synthetic_secrets(caplog, capsys):
+    """The new sweep warning and exit detail must not echo a credential-shaped label or reason."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "secret_probe",
+        "/home/brandonabyrd/.hermes/profiles/app-coder/skills/software-development/"
+        "pre-review-self-check/scripts/secret_probe.py",
+    )
+    assert spec is not None and spec.loader is not None
+    probe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+    generated = probe.gen()
+    needles = [value for _key, _kind, value in probe.needles(generated)]
+    pid = 987656
+    try:
+        lc._stdio_pids[pid] = generated["bearer_token"]
+        lc._orphan_stdio_pids.add(pid)
+        lc._orphan_stdio_pid_servers[pid] = generated["token_suffix"]
+        lc._recent_reaps[pid] = (0.0, generated["header_api_key"], "SIGKILL")
+        with caplog.at_level("DEBUG"):
+            lc._take_reapable_pids(False, None)
+            detail = lc.describe_child_exit([pid])
+        text = caplog.text + "\n" + detail
+        leaked = [kind for _key, kind, value in probe.needles(generated) if value in text]
+        assert leaked == [], leaked
+        assert "not reaping pid 987656" in caplog.text
+        assert "SIGKILL" in detail
+    finally:
+        _clean(pid)
+        lc._recent_reaps.pop(pid, None)
+    with capsys.disabled():
+        print(f"stdio-pid secret probe: shapes={len(needles)} outputs=2 chars={len(text)}")

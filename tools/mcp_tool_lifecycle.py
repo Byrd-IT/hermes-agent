@@ -192,8 +192,8 @@ def describe_child_exit(pids) -> str:
         if info is None:
             parts.append(f"pid {pid} exited without a Hermes reap signal")
         else:
-            when, reason, signame = info
-            parts.append(f"pid {pid} was sent {signame} by Hermes {now - when:.1f}s earlier ({reason})")
+            when, _reason, signame = info
+            parts.append(f"pid {pid} was sent {signame} by Hermes {now - when:.1f}s earlier")
     return "; ".join(parts) or "no child pid tracked"
 
 
@@ -364,9 +364,11 @@ def _take_reapable_pids(include_active: bool, server_name: Optional[str]) -> tup
             # An orphan sweep must never kill a child a live transport still owns (that is the
             # mid-call kill). Drop it from the orphan set; its owner's release re-orphans it.
             for pid in [p for p in pids if p in _stdio_pids]:
+                pids.pop(pid)
+                # Pid only. The owner names are config labels, but this line is new and a label
+                # can carry a credential; the pid is enough to see the sweep skipped it.
                 logger.warning(
-                    "MCP orphan sweep: not reaping pid %d (flagged by '%s'): still owned by "
-                    "live MCP server '%s'", pid, pids.pop(pid), _stdio_pids[pid])
+                    "MCP orphan sweep: not reaping pid %d: still owned by a live MCP session", pid)
         pgids = {pid: _stdio_pgids.pop(pid) for pid in pids if pid in _stdio_pgids}
         starts = {pid: _stdio_starttimes.pop(pid) for pid in pids if pid in _stdio_starttimes}
     return pids, pgids, starts
