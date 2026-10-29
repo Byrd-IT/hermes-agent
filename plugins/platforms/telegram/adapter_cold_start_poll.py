@@ -101,3 +101,21 @@ def disarm_cold_start_short_first_poll(adapter) -> None:
         bot.__class__ = original
     except TypeError:
         return
+
+
+class ColdStartShortFirstPoll:
+    """Arm the one-shot short poll for a cold start, and always disarm after."""
+
+    def __init__(self, adapter, *, enabled: bool) -> None:
+        self._adapter = adapter
+        self._armed = False
+        self._enabled = enabled
+
+    async def __aenter__(self):
+        if self._enabled:
+            self._armed = arm_cold_start_short_first_poll(self._adapter)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._armed:
+            disarm_cold_start_short_first_poll(self._adapter)
