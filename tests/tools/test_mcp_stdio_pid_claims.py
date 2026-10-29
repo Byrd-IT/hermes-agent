@@ -181,36 +181,39 @@ def test_orphan_sweep_skips_pid_still_owned_then_reaps_after_release():
         _clean(pid)
 
 
-def test_new_stdio_logs_do_not_echo_synthetic_secrets(caplog, capsys):
+def test_new_stdio_logs_do_not_echo_synthetic_secrets(caplog):
     """The new sweep warning and exit detail must not echo a credential-shaped label or reason."""
-    import importlib.util
+    import base64
+    import urllib.parse
 
-    spec = importlib.util.spec_from_file_location(
-        "secret_probe",
-        "/home/brandonabyrd/.hermes/profiles/app-coder/skills/software-development/"
-        "pre-review-self-check/scripts/secret_probe.py",
-    )
-    assert spec is not None and spec.loader is not None
-    probe = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(probe)
-    generated = probe.gen()
-    needles = [value for _key, _kind, value in probe.needles(generated)]
+    # Inline fakes (not a machine-local probe script) so CI can run this file.
+    bearer = "sk-synthprobebearerABCDEF"
+    password = "SynthPwXYZ123"
+    token = "ghp_SYNTH0123456789abcdefSUFFIX"
+    header_key = "SYNTHhdrkey0123456789AB"
+    query_key = "AKSYNTH0123456789queryCD"
+    secrets = [bearer, password, token, header_key, query_key]
+    needles = []
+    for value in secrets:
+        needles.append(value)
+        needles.append(urllib.parse.quote(value, safe=""))
+        needles.append(base64.b64encode(value.encode()).decode().rstrip("="))
+        needles.append(value[:8])
+        needles.append(value[-6:])
     pid = 987656
     try:
-        lc._stdio_pids[pid] = generated["bearer_token"]
+        lc._stdio_pids[pid] = f"https://synthuser:{password}@probe.example.invalid/api"
         lc._orphan_stdio_pids.add(pid)
-        lc._orphan_stdio_pid_servers[pid] = generated["token_suffix"]
-        lc._recent_reaps[pid] = (0.0, generated["header_api_key"], "SIGKILL")
+        lc._orphan_stdio_pid_servers[pid] = token
+        lc._recent_reaps[pid] = (0.0, f"{header_key} {query_key} {bearer}", "SIGKILL")
         with caplog.at_level("DEBUG"):
             lc._take_reapable_pids(False, None)
             detail = lc.describe_child_exit([pid])
         text = caplog.text + "\n" + detail
-        leaked = [kind for _key, kind, value in probe.needles(generated) if value in text]
-        assert leaked == [], leaked
+        leaked = [value for value in needles if value and value in text]
+        assert leaked == [], [value[:8] for value in leaked]
         assert "not reaping pid 987656" in caplog.text
         assert "SIGKILL" in detail
     finally:
         _clean(pid)
         lc._recent_reaps.pop(pid, None)
-    with capsys.disabled():
-        print(f"stdio-pid secret probe: shapes={len(needles)} outputs=2 chars={len(text)}")
