@@ -13,7 +13,7 @@ import html as _html
 import re
 import time
 from contextvars import ContextVar
-from datetime import datetime, timezone, UTC
+from datetime import datetime, timedelta, timezone, UTC
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set
 from hermes_cli import setup_platforms
 
@@ -448,6 +448,36 @@ _UPDATER_START_TIMEOUT = 30.0  # start_polling() can hang on a degraded pool aft
 # unreachable. Bounding start_polling() prevents the reconnect ladder from stalling indefinitely and allows
 # the heartbeat loop to trigger its own recovery path. Refs: NousResearch/hermes-agent#59614
 _INITIAL_POLLING_PROGRESS_TIMEOUT = 60.0
+# First cold-start getUpdates only. PTB 22.8 closes over start_polling(timeout=) for the
+# whole loop, so this is applied by a one-shot rewrite of that first long poll's timeout
+# argument — not by restarting the updater. A restart re-runs delete_webhook(drop_pending_updates)
+# and can drop updates that arrived after the first poll. Reconnects do not arm this.
+_COLD_START_FIRST_POLL_TIMEOUT = 1.0
+
+
+def _poll_timeout_seconds(value: object) -> Optional[float]:
+    """Seconds in a PTB getUpdates timeout (int or timedelta), or None if it is not one."""
+    total = getattr(value, "total_seconds", None)
+    if callable(total):
+        try:
+            seconds = total()
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+            return None
+        return float(seconds)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _short_first_poll_timeout(original: object) -> object:
+    """Same type PTB passed in, so its read_timeout math stays on the short hold."""
+    if hasattr(original, "total_seconds"):
+        return timedelta(seconds=_COLD_START_FIRST_POLL_TIMEOUT)
+    return _COLD_START_FIRST_POLL_TIMEOUT
+
+
 # Bounded drain (shutdown()/initialize() of the getUpdates request) so a wedged socket can't freeze
 # _polling_error_task and gate every escalation path behind its in-flight guard.
 # shutdown()/initialize() on the getUpdates httpx request close and rebuild the connection pool. When a
@@ -1770,6 +1800,76 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         request.__class__ = _InstrumentedPollingRequest
         return request
 
+    def _arm_cold_start_short_first_poll(self) -> bool:
+        """Shorten only the next long getUpdates. Returns False if the bot cannot be wrapped.
+
+        The wrapper changes the timeout argument of PTB's own get_updates call. It does not
+        issue a getUpdates of its own (that would confirm updates) and it does not touch
+        offset, allowed_updates, or drop_pending_updates. A timeout of 0 (updater.stop
+        cleanup) is left alone so the arm stays available for the real first long poll.
+        """
+        bot = getattr(self._app, "bot", None)
+        if bot is None:
+            return False
+        original_cls = bot.__class__
+        if not inspect.iscoroutinefunction(getattr(original_cls, "get_updates", None)):
+            return False
+        if getattr(original_cls, "_hermes_cold_start_short_poll", False):
+            self._cold_start_short_poll_armed = True
+            self._cold_start_short_poll_bot = bot
+            return True
+        adapter = self
+
+        class _ColdStartShortPollBot(original_cls):
+            __slots__ = ()
+            _hermes_cold_start_short_poll = True
+
+            async def get_updates(self, *args, **kwargs):
+                timeout = kwargs["timeout"] if "timeout" in kwargs else (args[2] if len(args) > 2 else None)
+                if adapter._consume_cold_start_short_poll(timeout):
+                    try:
+                        self.__class__ = original_cls
+                    except TypeError:
+                        pass
+                    short = _short_first_poll_timeout(timeout)
+                    if "timeout" in kwargs or len(args) <= 2:
+                        kwargs = {**kwargs, "timeout": short}
+                    else:
+                        args = (*args[:2], short, *args[3:])
+                    logger.debug(
+                        "[%s] Cold-start first getUpdates long poll shortened to %.0fs",
+                        adapter.name, _COLD_START_FIRST_POLL_TIMEOUT)
+                return await original_cls.get_updates(self, *args, **kwargs)
+
+        try:
+            bot.__class__ = _ColdStartShortPollBot
+        except TypeError:
+            return False
+        self._cold_start_short_poll_armed = True
+        self._cold_start_short_poll_bot = bot
+        self._cold_start_short_poll_original_cls = original_cls
+        return True
+
+    def _consume_cold_start_short_poll(self, timeout: object) -> bool:
+        if not getattr(self, "_cold_start_short_poll_armed", False):
+            return False
+        seconds = _poll_timeout_seconds(timeout)
+        if seconds is None or seconds <= _COLD_START_FIRST_POLL_TIMEOUT:
+            return False
+        self._cold_start_short_poll_armed = False
+        return True
+
+    def _disarm_cold_start_short_first_poll(self) -> None:
+        self._cold_start_short_poll_armed = False
+        bot = getattr(self, "_cold_start_short_poll_bot", None)
+        original = getattr(self, "_cold_start_short_poll_original_cls", None)
+        if bot is None or original is None or bot.__class__ is original:
+            return
+        try:
+            bot.__class__ = original
+        except TypeError:
+            return
+
     async def _start_polling_once(
         self, app, *, drop_pending_updates: bool, error_callback, abandon_app_on_timeout: bool = False,
         schedule_verifier: bool = True) -> tuple[int, asyncio.Event]:
@@ -1967,6 +2067,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 loop.call_soon_threadsafe(strict_error_event.set)
 
             effective_callback = _strict_error_callback
+        # require_progress is the cold-start gate. Reconnects call _start_polling_once directly
+        # and must keep the 10s long poll, so only this path arms the one-shot short first poll.
+        armed_short_poll = self._arm_cold_start_short_first_poll() if require_progress else False
         try:
             # Same watchdog bound as the reconnect ladders; the TimeoutError is an OSError subclass, so
             # the except below classifies it as a network error → background recovery.
@@ -2000,6 +2103,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 self._schedule_polling_recovery(err, reason="polling bootstrap")
                 return False
             raise
+        finally:
+            if armed_short_poll:
+                self._disarm_cold_start_short_first_poll()
 
     async def _go_fatal_network(self, message: str, log_message: str, *log_args) -> None:
         """Retryable ``telegram_network_error`` fatal + runner handoff (supervisor rebuilds the adapter)."""
