@@ -211,10 +211,12 @@ class TestStdioPgroupReaping:
 
     def _reset_state(self):
         from tools.mcp_tool_lifecycle import (
-            _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids, _stdio_pids, _stdio_starttimes)
+            _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids, _stdio_pid_claims,
+            _stdio_pids, _stdio_starttimes)
         from tools.mcp_tool import _lock
         with _lock:
             _stdio_pids.clear()
+            _stdio_pid_claims.clear()
             _orphan_stdio_pids.clear()
             _orphan_stdio_pid_servers.clear()
             _stdio_pgids.clear()
@@ -470,11 +472,12 @@ class TestStdioPgroupReaping:
 
         # Drive the reaper: register the parent pid + pgid + start baseline as an orphan.
         from tools.mcp_tool_lifecycle import (
-            _kill_orphaned_mcp_children, _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids, _stdio_pids,
-            _stdio_starttimes)
+            _kill_orphaned_mcp_children, _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids,
+            _stdio_pid_claims, _stdio_pids, _stdio_starttimes)
         from tools.mcp_tool import _lock
         with _lock:
             _stdio_pids.clear()
+            _stdio_pid_claims.clear()
             _orphan_stdio_pids.clear()
             _orphan_stdio_pid_servers.clear()
             _stdio_pgids.clear()

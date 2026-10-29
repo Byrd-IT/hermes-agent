@@ -34,6 +34,33 @@ _stdio_pgids: dict[int, int] = {}
 # never killed.  None entries are dropped: a capture that raced the child's exit keeps
 # the legacy best-effort behaviour.
 _stdio_starttimes: dict[int, int] = {}  # pid -> leader start ticks
+# pid -> number of live transports that claim it. A pid is only released to the orphan sweep when
+# its LAST claim drops, so one transport ending can never orphan a child another session is still
+# using. Missing entry = one implicit claim (callers/tests that fill ``_stdio_pids`` directly).
+_stdio_pid_claims: dict[int, int] = {}
+# pid -> (wall time, reason, signal name) of the most recent Hermes reap, so a mid-call child
+# death can say whether Hermes itself killed the child (and why) or it exited on its own.
+_recent_reaps: dict[int, tuple[float, str, str]] = {}
+_RECENT_REAPS_MAX = 256
+# Serializes the snapshot -> spawn -> snapshot window of concurrent stdio spawns on one loop.
+# Without it every server spawned at the same moment (a multi-profile gateway boots all its
+# servers together) sees its siblings in its /proc delta and ledgers them as its own; when that
+# server's transport later ends, the siblings' LIVE children were orphaned and SIGTERM->SIGKILLed
+# by the next sweep, mid-call ("lost its stdio subprocess after the tool call began").
+_spawn_locks: dict = {}  # id(loop) -> (loop, asyncio.Lock)
+
+
+def _stdio_spawn_lock() -> asyncio.Lock:
+    """The spawn-window lock for the running loop. asyncio locks are loop-bound and the MCP loop
+    can be restarted (tests, shutdown/restart), so the lock is keyed per loop; closed loops drop."""
+    loop = asyncio.get_running_loop()
+    with _core._lock:
+        for key in [k for k, (lp, _) in _spawn_locks.items() if lp.is_closed()]:
+            _spawn_locks.pop(key, None)
+        entry = _spawn_locks.get(id(loop))
+        if entry is None or entry[0] is not loop:
+            entry = _spawn_locks[id(loop)] = (loop, asyncio.Lock())
+        return entry[1]
 
 
 def _leader_start_time(pid: int) -> Optional[int]:
@@ -108,6 +135,66 @@ def _filter_mcp_children(pids: set) -> set:
         if not any(marker in arg for arg in argv[1:] for marker in _NON_MCP_CHILD_CMDLINE_MARKERS):
             kept.add(pid)
     return kept
+
+
+def _cmdline_matches(argv, command, args) -> bool:
+    """Whether a process argv is the stdio server just launched. The tail must equal the configured
+    args (a shebang script or ``npx`` runs as ``[interpreter, script, *args]``, so the head is not
+    reliable); with no args, the command's basename must be one of the first argv entries."""
+    if not argv:
+        return False
+    args = [str(a) for a in (args or ())]
+    if args:
+        return len(argv) > len(args) and [str(a) for a in argv[-len(args):]] == args
+    base = os.path.basename(str(command or ""))
+    return bool(base) and any(os.path.basename(str(a)) == base for a in argv[:3])
+
+
+def _attribute_spawned_children(pids: set, command, args) -> set:
+    """Narrow a post-spawn child-PID delta to the process this transport launched: drop known
+    non-MCP children, then keep only argv matches when any match (another thread, e.g. a terminal
+    command or a sandbox ``docker run``, can fork into the window). No match keeps the filtered
+    delta (the prior behaviour), so fast-fail and the shutdown sweep never lose the child."""
+    kept = _filter_mcp_children(pids)
+    if len(kept) <= 1:
+        return kept
+    try:
+        import psutil
+    except ImportError:
+        return kept
+    matched = set()
+    for pid in kept:
+        try:
+            argv = psutil.Process(pid).cmdline()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            continue
+        if _cmdline_matches(argv, command, args):
+            matched.add(pid)
+    return matched or kept
+
+
+def _note_reap(pid: int, reason: str, signame: str) -> None:
+    with _core._lock:
+        _recent_reaps.pop(pid, None)
+        _recent_reaps[pid] = (time.time(), reason, signame)
+        while len(_recent_reaps) > _RECENT_REAPS_MAX:
+            _recent_reaps.pop(next(iter(_recent_reaps)))
+
+
+def describe_child_exit(pids) -> str:
+    """Cause of death for stdio children that vanished: the Hermes reap (signal, reason, age) when
+    Hermes sent one, otherwise that the child exited without a Hermes signal."""
+    now = time.time()
+    with _core._lock:
+        reaps = {pid: _recent_reaps.get(pid) for pid in (pids or ())}
+    parts = []
+    for pid, info in sorted(reaps.items()):
+        if info is None:
+            parts.append(f"pid {pid} exited without a Hermes reap signal")
+        else:
+            when, _reason, signame = info
+            parts.append(f"pid {pid} was sent {signame} by Hermes {now - when:.1f}s earlier")
+    return "; ".join(parts) or "no child pid tracked"
 
 
 def _clear_connect_cooldowns(keys=None) -> None:
@@ -272,6 +359,16 @@ def _take_reapable_pids(include_active: bool, server_name: Optional[str]) -> tup
             pids.update(active)
             for pid in active:
                 _stdio_pids.pop(pid, None)
+                _stdio_pid_claims.pop(pid, None)
+        else:
+            # An orphan sweep must never kill a child a live transport still owns (that is the
+            # mid-call kill). Drop it from the orphan set; its owner's release re-orphans it.
+            for pid in [p for p in pids if p in _stdio_pids]:
+                pids.pop(pid)
+                # Pid only. The owner names are config labels, but this line is new and a label
+                # can carry a credential; the pid is enough to see the sweep skipped it.
+                logger.warning(
+                    "MCP orphan sweep: not reaping pid %d: still owned by a live MCP session", pid)
         pgids = {pid: _stdio_pgids.pop(pid) for pid in pids if pid in _stdio_pgids}
         starts = {pid: _stdio_starttimes.pop(pid) for pid in pids if pid in _stdio_starttimes}
     return pids, pgids, starts
@@ -372,24 +469,45 @@ def _group_alive(pgid: Optional[int], my_pgid: Optional[int]) -> bool:
         return False
 
 
-def _kill_orphaned_mcp_children(include_active: bool = False, server_name: Optional[str] = None) -> None:
+_REAP_CATEGORIES = (
+    "orphan sweep",
+    "pre-spawn sweep",
+    "cron post-tick orphan sweep",
+    "final shutdown (live servers included)",
+    "stdio transport ended",
+)
+
+
+def _reap_category(reason: Optional[str]) -> str:
+    """A fixed label safe to log. Caller text can carry a server name, so anything else is dropped."""
+    return reason if reason in _REAP_CATEGORIES else "orphan sweep"
+
+
+def _kill_orphaned_mcp_children(include_active: bool = False, server_name: Optional[str] = None,
+                                reason: Optional[str] = None) -> None:
     """Best-effort reap of stdio MCP subprocesses: SIGTERM, wait 2s, SIGKILL survivors. By
     default only ``_orphan_stdio_pids`` are reaped so concurrent cron jobs / live sessions are
     untouched; ``include_active=True`` also kills every ``_stdio_pids`` entry and is only for
     final shutdown after the MCP loop has stopped. ``server_name`` limits the sweep to one
-    server (stdio reconnects cleaning up their old transport)."""
+    server (stdio reconnects cleaning up their old transport). ``reason`` is a fixed category
+    (see ``_REAP_CATEGORIES``); anything else is logged as ``orphan sweep`` so a server name
+    cannot reach the INFO line."""
     import signal as _signal
     pids, pgids, starts = _take_reapable_pids(include_active, server_name)
     if not pids:  # skip the 2s sleep every MCP-free shutdown would otherwise pay
         return
+    reason = _reap_category(reason or ("final shutdown (live servers included)" if include_active else "orphan sweep"))
 
     try:  # our own pgid, so we never killpg() the gateway itself
         my_pgid = os.getpgrp()
     except (AttributeError, OSError):
         my_pgid = None  # Windows or restricted environment
 
+    logger.info("Reaping %d MCP stdio process(es) [%s]: %s", len(pids), reason,
+                ", ".join(str(pid) for pid, _owner in sorted(pids.items())))
     for pid, owner in pids.items():
         _signal_mcp_process(pid, _signal.SIGTERM, owner, pgids.get(pid), my_pgid, starts.get(pid))
+        _note_reap(pid, reason, "SIGTERM")
         logger.debug("Sent SIGTERM to orphaned MCP process %d (%s)", pid, owner)
     time.sleep(2)
     sigkill = getattr(_signal, "SIGKILL", _signal.SIGTERM)
@@ -397,7 +515,8 @@ def _kill_orphaned_mcp_children(include_active: bool = False, server_name: Optio
     for pid, owner in pids.items():
         if _pid_exists(pid) or _group_alive(pgids.get(pid), my_pgid):  # leader or descendants survived SIGTERM
             _signal_mcp_process(pid, sigkill, owner, pgids.get(pid), my_pgid, starts.get(pid))
-            logger.warning("Force-killed MCP process %d (%s) after SIGTERM timeout", pid, owner)
+            _note_reap(pid, reason, "SIGKILL")
+            logger.warning("Force-killed MCP process %d after SIGTERM timeout [%s]", pid, reason)
     # These groups are reaped. Release them last, so a crash partway through the SIGTERM/SIGKILL
     # dance still leaves the supervisor holding them.
     release_process_groups(pgids.values())
