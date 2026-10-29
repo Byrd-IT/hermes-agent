@@ -53,8 +53,10 @@ def _tool_is_read_only(server_name: str, tool_name: str) -> bool:
     """True only when discovery captured ``readOnlyHint=True`` for the tool. Missing or malformed
     metadata fails safe to False (treated as write-capable). readOnlyHint is a property of the
     connection's tools, so it lives under the connection key."""
-    from tools.mcp_tool_scope import _resolve_server_key
-    return _core._tool_read_only_hints.get(_resolve_server_key(server_name), {}).get(tool_name) is True
+    from tools.mcp_tool_scope import _resolve_shared_key
+    # Always the shared connection's hints: a session_env variant may not be connected yet on the
+    # session's first call, and it serves the same tools.
+    return _core._tool_read_only_hints.get(_resolve_shared_key(server_name), {}).get(tool_name) is True
 
 
 def _trust_approval_key(server_name: str, tool_name: str) -> str:
@@ -851,11 +853,13 @@ def _make_check_fn(server_name: str):
     stale connection lingers. With no declaration registered the check is the connection check
     alone. Returns a plain bool: the registry caches ``bool(fn())``.
     """
-    from tools.mcp_tool_scope import _resolve_server_key
+    from tools.mcp_tool_scope import _resolve_shared_key
 
     def _connected() -> bool:
         with _core._lock:
-            key = _resolve_server_key(server_name)
+            # Availability is a property of the shared connection, never of a session_env variant
+            # (not yet connected on a session's first turn, and the answer is cached per profile).
+            key = _resolve_shared_key(server_name)
             server = _core._servers.get(key)
             return ((server is not None and (server.session is not None or server._is_recycled_stdio()))
                     or key in _core._lazy_server_configs)
