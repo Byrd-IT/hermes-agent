@@ -411,7 +411,7 @@ class MCPServerTransportMixin:
         # off-loop because the reaper blocks up to 2s.
         await asyncio.to_thread(
             _lifecycle._kill_orphaned_mcp_children,
-            reason=f"pre-spawn sweep before starting '{self.name}'")
+            reason="pre-spawn sweep")
         # Reap any orphaned subprocesses from prior failed connection attempts before spawning a new one.
         # Without this, each retry in the run() reconnect loop spawns a fresh process pair while the
         # previous failed pair lingers — leading to rapid zombie accumulation (see #57355, #57228). The
