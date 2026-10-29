@@ -2367,9 +2367,9 @@ DEFAULT_CONFIG = {
         # merge origin/<target> INTO it after leaving a pre-update-<stamp> tag; a conflict stops the
         # update cleanly. `hermes update --switch-branch` overrides to switch for one run.
         "parked_branch_strategy": "switch",
-        # Refresh an installed cua-driver during `hermes update` (best-effort, macOS only). Turn off
-        # e.g. on non-admin accounts where /Applications isn't writable.
+        # Refresh an installed cua-driver during `hermes update` (best-effort, macOS only; off if read-only).
         "refresh_cua_driver": True,
+        "carry_reapply": "dry-run",  # off | dry-run | apply: what to do with parked commits (carry-reapply docs)
     },
     # LSP diagnostics (pyright, gopls, rust-analyzer...) in the post-write lint check of
     # write_file/patch. Runs only when the cwd or edited file is inside a git worktree; otherwise

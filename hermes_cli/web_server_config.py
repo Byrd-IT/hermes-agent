@@ -160,6 +160,12 @@ _SCHEMA_OVERRIDES: dict[str, dict[str, Any]] = {
         "Terminal updates always ask, regardless of this setting.",
         "stash", "discard",
     ),
+    "updates.carry_reapply": _select(
+        "After an update parks local commits or a conflicted stash, what to do "
+        "with them. 'dry-run' prints which are already upstream and which "
+        "would reapply; 'apply' replays the clean ones in place; 'off' skips.",
+        "off", "dry-run", "apply",
+    ),
     "updates.refresh_cua_driver": {
         "type": "boolean",
         "description": (
