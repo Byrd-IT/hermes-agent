@@ -99,7 +99,7 @@ import {
 } from "@/lib/terminal-font-refit";
 import { generateChannelId } from "@/lib/chat-channel-id";
 import { sendCopyLastCommand } from "@/lib/chat-copy-last";
-import { CopyLastButton } from "@/lib/chat-copy-last-button";
+import { ChatComposerOverlays } from "@/lib/chat-composer-overlays";
 import {
   probeWebglSupport,
   shouldUseWebglRenderer,
@@ -1984,10 +1984,9 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             </div>
           )}
 
-          <CopyLastButton
-            onClick={handleCopyLast}
-            copied={copyState === "copied"}
-            color={terminalFg}
+          <ChatComposerOverlays
+            onCopyLast={handleCopyLast} copied={copyState === "copied"} color={terminalFg} profile={scopedProfile}
+            ptyState={ptyState} wsRef={wsRef} ptyStateRef={ptyStateRef} termRef={termRef}
           />
 
           {chatPanelCollapsed && (
