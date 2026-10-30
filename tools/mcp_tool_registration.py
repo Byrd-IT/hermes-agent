@@ -216,13 +216,14 @@ def _select_utility_schemas(server_name: str, server: "MCPServerTask", config: d
 def _existing_tool_names() -> list[str]:
     """Tool names for all connected servers plus lazy (cache-registered) servers, whose tools live only in the registry."""
     scope = _core._mcp_registry_scope()
+    from tools.mcp_tool_session_env import is_variant_key
     if scope is not None:
         from tools.registry import registry
 
         with _core._lock:
             server_names = [
                 _key_name(key) for key in _core._servers
-                if _core._server_visible_in_scope(key, scope)
+                if not is_variant_key(key) and _core._server_visible_in_scope(key, scope)
             ]
             server_names.extend(
                 _key_name(key) for key in _core._lazy_server_tool_names
@@ -235,7 +236,9 @@ def _existing_tool_names() -> list[str]:
         })
 
     names: list[str] = []
-    for server in _core._servers.values():
+    for key, server in _core._servers.items():
+        if is_variant_key(key):
+            continue
         names.extend(server._registered_tool_names if hasattr(server, "_registered_tool_names")
                      else (_schema._convert_mcp_schema(server.name, t)["name"] for t in server._tools))
     with _core._lock:
@@ -546,6 +549,7 @@ def _register_connected_into_current_scope(servers: dict) -> int:
     Missing or changed config entries remove only this profile's overlay.
     """
     from tools.registry import registry
+    from tools.mcp_tool_session_env import is_variant_key
 
     scope = _core._mcp_registry_scope()
     if scope is None:
@@ -558,7 +562,8 @@ def _register_connected_into_current_scope(servers: dict) -> int:
         omitted = {_key_name(key) for key, scopes in _core._server_tool_scopes.items()
                    if scope in scopes and _key_name(key) not in servers}
         # Only a name another profile holds a connection for reaches a cross-profile comparison.
-        foreign = {_key_name(key) for key in _core._servers if _key_scope(key) != scope}
+        foreign = {_key_name(key) for key in _core._servers
+                   if not is_variant_key(key) and _key_scope(key) != scope}
     # Resolving what this profile would connect with does PATH lookups, secret-scope reads and
     # live-endpoint probes: do it only for names that can be compared across profiles, once each,
     # before taking the global registry lock. A foreign key that appears after the snapshot has
@@ -602,7 +607,8 @@ def _register_connected_into_current_scope(servers: dict) -> int:
                 continue  # this profile has its own connection for the name
             # Any other profile's live connection with the same route AND credentials is shareable.
             shared = [(key, live) for key, live in _core._servers.items()
-                      if _key_name(key) == name and getattr(live, "session", None) is not None
+                      if not is_variant_key(key)
+                      and _key_name(key) == name and getattr(live, "session", None) is not None
                       and _same_server_route(live, config, cross_profile=True,
                                              resolved_identity=resolved_ids.get(name))]
         if not shared:

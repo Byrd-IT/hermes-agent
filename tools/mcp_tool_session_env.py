@@ -119,8 +119,7 @@ def reap_idle(now: Optional[float] = None) -> int:
                 _pending.pop(k, None)
                 _last_used.pop(k, None)
                 _connect_locks.pop(k, None)
-    _close(live)
-    return len(live)
+    return _close(live, protect_in_use=True, decided_at=now)
 
 
 def _reaper_loop(stop: threading.Event) -> None:
@@ -219,15 +218,15 @@ def _render(config: dict, values: dict) -> dict:
         return _config._interpolate_env_vars(_plain(config))
 
 
-def _evict(now: float) -> list:
+def _evict(now: float, keep=None) -> list:
     """Variant servers to close: idle past the TTL, then the least recently used beyond the cap.
 
-    A variant with a call in flight is never closed. If every variant is busy, the count
-    may exceed ``_MAX_VARIANTS`` until one finishes.
+    A variant with a call in flight is never closed, and neither is *keep* (the key a connect
+    is about to use). If every other variant is busy, the count may exceed ``_MAX_VARIANTS``.
     """
     with _guard:
         live = [k for k in _last_used if k in _core._servers]
-        closable = [k for k in live if not _variant_busy(k)]
+        closable = [k for k in live if k != keep and not _variant_busy(k)]
         stale = [k for k in closable if now - _last_used[k] > _IDLE_TTL_SEC]
         rest = sorted((k for k in closable if k not in stale), key=lambda k: _last_used[k])
         remaining = len(live) - len(stale)
@@ -235,9 +234,20 @@ def _evict(now: float) -> list:
         return stale + rest[:extra]
 
 
-def _close(keys) -> None:
+def _close(keys, *, protect_in_use: bool = False, decided_at: Optional[float] = None) -> int:
+    """Close variant servers. With ``protect_in_use``, skip a key that became busy or was
+    touched after ``decided_at`` (a call resolved it between the snapshot and this close).
+    Returns how many were closed. Shutdown passes neither flag and always closes.
+    """
     if not keys:
-        return
+        return 0
+    if protect_in_use:
+        with _guard:
+            keys = [k for k in keys
+                    if not _variant_busy(k)
+                    and (decided_at is None or _last_used.get(k, 0) <= decided_at)]
+    if not keys:
+        return 0
     with _core._lock:
         servers = [(k, _core._servers.pop(k, None)) for k in keys]
         for k in keys:
@@ -262,6 +272,7 @@ def _close(keys) -> None:
         _loop._run_on_mcp_loop(_shutdown, timeout=20)
     except Exception:  # health: allow BLE001 -- best-effort close, logged
         logger.debug("MCP session-env variant close could not reach the loop", exc_info=True)
+    return len(keys)
 
 
 def ensure_connected(server_name: str, key) -> Optional[object]:
@@ -285,7 +296,8 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
         base_config = _base_config(pending[0]) if pending else None
         if base_config is None:
             return server
-        _close(_evict(time.monotonic()))
+        now = time.monotonic()
+        _close(_evict(now, keep=key), protect_in_use=True, decided_at=now)
         config = _render(base_config, pending[1])
         # The server never sees the values in a log: only the declared names and the digest.
         logger.info("MCP server '%s': starting a per-session connection (session_env %s, id %s)",

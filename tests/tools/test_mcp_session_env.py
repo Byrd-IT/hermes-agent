@@ -451,3 +451,28 @@ def test_evict_skips_a_busy_variant_and_may_exceed_the_cap():
             _core._servers.pop(key, None)
             se._last_used.pop(key, None)
             se._pending.pop(key, None)
+
+
+def test_mcp_status_reports_the_shared_server_not_a_per_session_copy():
+    """A live per-session connection must not replace the shared server in status."""
+    from tools.mcp_tool_discovery import get_mcp_status
+    from tools.mcp_tool_common import _core
+
+    class _Srv:
+        def __init__(self, connected, tools):
+            self.session = object() if connected else None
+            self._registered_tool_names = tools
+            self._sampling = None
+
+    shared = "pinsrv"
+    variant = ("scope#env:deadbeef", "pinsrv")
+    try:
+        _core._servers[shared] = _Srv(True, ["a", "b", "c"])
+        _core._servers[variant] = _Srv(True, [])
+        row = get_mcp_status({"pinsrv": {"command": "pin"}})[0]
+        assert row["connected"] is True
+        assert row["tools"] == 3
+        assert row["status"] == "connected"
+    finally:
+        _core._servers.pop(shared, None)
+        _core._servers.pop(variant, None)
