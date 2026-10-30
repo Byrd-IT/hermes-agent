@@ -389,3 +389,65 @@ def test_failed_variant_connect_is_not_respawned_inside_the_cooldown(tmp_path):
                 assert _core._server_error_counts.get(vkey, 0) >= 3 and vkey in _core._server_breaker_opened_at
     finally:
         shutdown_mcp_servers()
+
+
+class _StillRunning:
+    def done(self):
+        return False
+
+
+def test_idle_reaper_does_not_close_a_variant_with_a_call_in_flight(tmp_path):
+    """A variant past the idle TTL stays up while a call is in flight, then closes once it finishes."""
+    from tools import mcp_tool_session_env as se
+    from tools.mcp_tool_common import _core
+    from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+    try:
+        with patch.dict(os.environ, _clean_env(), clear=True):
+            tool = _setup(tmp_path)
+            _call(tool, {"TEST_RUN_PIN": "slug-a"})
+            (vkey,) = [k for k in _core._servers if se.is_variant_key(k)]
+            server = _core._servers[vkey]
+            server._inflight_tasks.add(_StillRunning())
+            se._last_used[vkey] = 0.0
+            assert se.reap_idle(now=se._IDLE_TTL_SEC + 5) == 0
+            assert vkey in _core._servers
+            assert vkey in se._last_used
+            server._inflight_tasks.clear()
+            assert se.reap_idle(now=se._IDLE_TTL_SEC + 5) == 1
+            assert vkey not in _core._servers
+    finally:
+        shutdown_mcp_servers()
+
+
+def test_evict_skips_a_busy_variant_and_may_exceed_the_cap():
+    """Making room for a new variant never closes one with a call in flight."""
+    from tools import mcp_tool_session_env as se
+    from tools.mcp_tool_common import _core
+    busy = ("scope#env:busy", "pinsrv")
+    idle = [(f"scope#env:idle{i}", "pinsrv") for i in range(se._MAX_VARIANTS)]
+
+    class _Server:
+        def __init__(self, running):
+            self._inflight_tasks = {_StillRunning()} if running else set()
+
+            class _Open:
+                def locked(self):
+                    return False
+
+            self._rpc_lock = _Open()
+
+    try:
+        _core._servers[busy] = _Server(True)
+        se._last_used[busy] = 10_000.0
+        for i, key in enumerate(idle):
+            _core._servers[key] = _Server(False)
+            se._last_used[key] = 10_000.0 + i
+        # 17 live, none past the TTL. Room for one more closes the two oldest idle ones, not the busy one.
+        victims = se._evict(now=10_000.0 + len(idle))
+        assert busy not in victims
+        assert victims == idle[:2]
+    finally:
+        for key in [busy, *idle]:
+            _core._servers.pop(key, None)
+            se._last_used.pop(key, None)
+            se._pending.pop(key, None)
