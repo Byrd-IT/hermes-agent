@@ -52,6 +52,7 @@ describe('parseDashboardTalkPaste', () => {
 
   it('re-sanitizes controls and rejects an oversize transcript', () => {
     expect(sanitizeTalkText('hello\r\nworld\u001b[31m')).toBe('hello world [31m')
+    expect(sanitizeTalkText('line\u2028sep\u2029end')).toBe('line sep end')
     expect(parseDashboardTalkPaste(paste('hello\r\nworld\u001b[31m', 'direct'))).toEqual({
       kind: 'talk',
       payload: { text: 'hello world [31m', mode: 'direct' }
