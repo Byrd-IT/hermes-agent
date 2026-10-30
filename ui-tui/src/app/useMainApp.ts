@@ -16,7 +16,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { sharedControlParams } from '../canonicalGateway.js'
 import { DASHBOARD_TUI_MODE, NATIVE_MODE, STARTUP_RESUME_ID } from '../config/env.js'
 import { WHEEL_SCROLL_STEP } from '../config/limits.js'
-import { RESIZE_COALESCE_MS } from '../config/timing.js'
 import { hasLeadGap, prevRenderedMsg } from '../domain/blockLayout.js'
 import { SECTION_NAMES, sectionMode } from '../domain/details.js'
 import { composeTabTitle, fmtProjectCwdBranch, shortCwd } from '../domain/paths.js'
@@ -37,8 +36,7 @@ import { t } from '../i18n/runtime.js'
 import { useT } from '../i18n/useT.js'
 import { composerPromptWidth } from '../lib/inputMetrics.js'
 import { appendTranscriptMessage, capTranscriptHistory } from '../lib/messages.js'
-import { DEFAULT_VOICE_RECORD_KEY, isMac, type ParsedVoiceRecordKey } from '../lib/platform.js'
-import { createResizeCoalescer } from '../lib/resizeCoalescer.js'
+import { isMac } from '../lib/platform.js'
 import { asRpcResult, rpcErrorMessage } from '../lib/rpc.js'
 import { terminalParityHints } from '../lib/terminalParity.js'
 import { formatAbandonedClarify, sameToolTrailGroup, toolTrailLabel } from '../lib/text.js'
@@ -70,8 +68,10 @@ import { $uiState, getUiState, patchUiState } from './uiStore.js'
 import { useBatteryPoll } from './useBatteryPoll.js'
 import { useComposerState } from './useComposerState.js'
 import { useConfigSync } from './useConfigSync.js'
+import { useDashboardTalkPaste } from './useDashboardTalkPaste.js'
 import { shouldDetachEditedHistoryInput, useInputHandlers } from './useInputHandlers.js'
 import { useLongRunToolCharms } from './useLongRunToolCharms.js'
+import { useMainAppResize } from './useMainAppResize.js'
 import {
   backendGaveUp,
   backendGaveUpActivity,
@@ -81,11 +81,10 @@ import {
   connectionLostActivity,
   lastStderrLine
 } from './userMessages.js'
+import { useSessionChromeState, useTurnClock } from './useSessionChromeState.js'
 import { useSessionLifecycle } from './useSessionLifecycle.js'
 import { useSubmission } from './useSubmission.js'
 
-const BRACKET_PASTE_ON = '\x1b[?2004h'
-const BRACKET_PASTE_OFF = '\x1b[?2004l'
 const MAX_HEIGHT_CACHE_BUCKETS = 12
 
 interface ExitClose {
@@ -127,7 +126,9 @@ function deferExitForClose(gw: GatewayClient, state: ExitClose, again: () => voi
   }
 
   state.flight = true
-  void Promise.race([state.close().catch(() => undefined), new Promise(resolve => setTimeout(resolve, 1500))]).then(again)
+  void Promise.race([state.close().catch(() => undefined), new Promise(resolve => setTimeout(resolve, 1500))]).then(
+    again
+  )
 
   return true
 }
@@ -258,41 +259,27 @@ export async function startPromptLiveSession({
   return sid
 }
 
+function useSessionChromeConfig(
+  gw: GatewayClient,
+  chrome: ReturnType<typeof useSessionChromeState>,
+  sid: null | string
+): void {
+  useConfigSync({
+    gw,
+    setBellOnComplete: chrome.bell.setOnComplete,
+    setBellOnPrompt: chrome.bell.setOnPrompt,
+    setVoiceEnabled: chrome.voice.setEnabled,
+    setVoiceRecordKey: chrome.voice.setRecordKey,
+    sid
+  })
+}
+
 export function useMainApp(gw: GatewayClient) {
   const { exit } = useApp()
   const { stdout } = useStdout()
   const [cols, setCols] = useState(stdout?.columns ?? 80)
 
-  useEffect(() => {
-    if (!stdout) {
-      return
-    }
-
-    // A drag-resize emits a burst of 'resize' events; syncing `cols` on every
-    // one remounts the visible transcript rows each tick (they're keyed on
-    // cols so yoga re-measures), turning a smooth drag into a flickering
-    // remount storm. Coalesce the burst with a leading+trailing throttle: the
-    // first event reflows immediately (the drag stays responsive), the rest
-    // collapse to at most one reflow per RESIZE_COALESCE_MS, and the trailing
-    // edge always applies the final width so the settled layout is exact.
-    const coalescer = createResizeCoalescer(() => setCols(stdout.columns ?? 80), RESIZE_COALESCE_MS)
-    const sync = () => coalescer.schedule()
-
-    stdout.on('resize', sync)
-
-    if (stdout.isTTY) {
-      stdout.write(BRACKET_PASTE_ON)
-    }
-
-    return () => {
-      coalescer.cancel()
-      stdout.off('resize', sync)
-
-      if (stdout.isTTY) {
-        stdout.write(BRACKET_PASTE_OFF)
-      }
-    }
-  }, [stdout])
+  useMainAppResize(stdout, setCols)
 
   const [historyItems, setHistoryItemsState] = useState<Msg[]>(() => [{ kind: 'intro', role: 'system', text: '' }])
   const [historyGeneration, setHistoryGeneration] = useState(0)
@@ -307,19 +294,9 @@ export function useMainApp(gw: GatewayClient) {
 
   const [lastUserMsg, setLastUserMsg] = useState('')
   const [stickyPrompt, setStickyPrompt] = useState('')
-  const [voiceEnabled, setVoiceEnabled] = useState(false)
-  const [voiceTts, setVoiceTts] = useState(false)
-  const [voiceRecording, setVoiceRecording] = useState(false)
-  const [voiceProcessing, setVoiceProcessing] = useState(false)
-  const [voiceRecordKey, setVoiceRecordKey] = useState<ParsedVoiceRecordKey>(DEFAULT_VOICE_RECORD_KEY)
-  const [sessionStartedAt, setSessionStartedAt] = useState(() => Date.now())
-  const [dashboardFreshSessionId, setDashboardFreshSessionId] = useState<null | string>(null)
-  const [turnStartedAt, setTurnStartedAt] = useState<null | number>(null)
-  const [lastTurnEndedAt, setLastTurnEndedAt] = useState<null | number>(null)
+  const chrome = useSessionChromeState()
   // Bumped by the gateway `reaction` event (core-detected affection).
   const goodVibesTick = useStore($goodVibesTick)
-  const [bellOnComplete, setBellOnComplete] = useState(false)
-  const [bellOnPrompt, setBellOnPrompt] = useState(false)
 
   const ui = useStore($uiState)
   const overlay = useStore($overlayState)
@@ -644,40 +621,30 @@ export function useMainApp(gw: GatewayClient) {
     colsRef,
     composerActions,
     gw,
-    onFreshSessionStarted: DASHBOARD_TUI_MODE ? setDashboardFreshSessionId : undefined,
+    onFreshSessionStarted: DASHBOARD_TUI_MODE ? chrome.clock.setFreshSessionId : undefined,
     panel,
     rpc,
     scrollRef,
     setHistoryItems,
     setLastUserMsg,
-    setSessionStartedAt,
+    setSessionStartedAt: chrome.clock.setSessionStartedAt,
     setStickyPrompt,
-    setVoiceProcessing,
-    setVoiceRecording,
+    setVoiceProcessing: chrome.voice.setProcessing,
+    setVoiceRecording: chrome.voice.setRecording,
     sys
   })
 
   exitClose.close = session.closeForExit
 
   useEffect(() => {
-    if (dashboardFreshSessionId) {
+    if (chrome.clock.freshSessionId) {
       forceRedraw(stdout ?? process.stdout)
     }
-  }, [dashboardFreshSessionId, stdout])
+  }, [chrome.clock.freshSessionId, stdout])
 
-  useEffect(() => {
-    if (ui.busy) {
-      setTurnStartedAt(prev => prev ?? Date.now())
-    } else if (turnStartedAt != null) {
-      // Only stamp the idle marker when a turn was actually live — busy is
-      // also false on mount and we don't want a phantom "done" timestamp
-      // before the first turn has completed.
-      setLastTurnEndedAt(Date.now())
-      setTurnStartedAt(null)
-    }
-  }, [ui.busy, turnStartedAt])
+  useTurnClock(chrome.clock, ui.busy)
 
-  useConfigSync({ gw, setBellOnComplete, setBellOnPrompt, setVoiceEnabled, setVoiceRecordKey, sid: ui.sid })
+  useSessionChromeConfig(gw, chrome, ui.sid)
   useBatteryPoll(gw)
 
   useEffect(() => {
@@ -689,7 +656,9 @@ export function useMainApp(gw: GatewayClient) {
 
     // Offline (sid kept across a socket close): each poll would re-dial through
     // ensureAttachedWebSocket and collapse GatewayClient's backoff (B2-20).
-    if (ui.gatewayConnected === false) { return }
+    if (ui.gatewayConnected === false) {
+      return
+    }
 
     let stopped = false
     applyAgentSnapshot(ui.sid)
@@ -1009,16 +978,18 @@ export function useMainApp(gw: GatewayClient) {
     gateway,
     terminal: { hasSelection, scrollRef, scrollWithSelection, selection, stdout },
     voice: {
-      enabled: voiceEnabled,
-      recordKey: voiceRecordKey,
-      recording: voiceRecording,
-      setProcessing: setVoiceProcessing,
-      setRecording: setVoiceRecording,
-      setVoiceEnabled,
-      setVoiceTts
+      enabled: chrome.voice.enabled,
+      recordKey: chrome.voice.recordKey,
+      recording: chrome.voice.recording,
+      setProcessing: chrome.voice.setProcessing,
+      setRecording: chrome.voice.setRecording,
+      setVoiceEnabled: chrome.voice.setEnabled,
+      setVoiceTts: chrome.voice.setTts
     },
     wheelStep: WHEEL_SCROLL_STEP
   })
+
+  useDashboardTalkPaste({ enqueue: composerActions.enqueue, setInput: composerActions.setInput, submitRef, sys })
 
   const onEvent = useMemo(
     () =>
@@ -1035,19 +1006,24 @@ export function useMainApp(gw: GatewayClient) {
           setCatalog: setSlashCatalog
         },
         submission: { submitLiteralRef, submitRef },
-        system: { bellOnComplete, bellOnPrompt, stdout, sys },
+        system: {
+          bellOnComplete: chrome.bell.onComplete,
+          bellOnPrompt: chrome.bell.onPrompt,
+          stdout,
+          sys
+        },
         transcript: { appendMessage, panel, setHistoryItems },
         voice: {
-          setProcessing: setVoiceProcessing,
-          setRecording: setVoiceRecording,
-          setVoiceEnabled,
-          setVoiceTts
+          setProcessing: chrome.voice.setProcessing,
+          setRecording: chrome.voice.setRecording,
+          setVoiceEnabled: chrome.voice.setEnabled,
+          setVoiceTts: chrome.voice.setTts
         }
       }),
     [
       appendMessage,
-      bellOnComplete,
-      bellOnPrompt,
+      chrome.bell.onComplete,
+      chrome.bell.onPrompt,
       composerActions.enqueue,
       composerActions.setInput,
       gateway,
@@ -1056,9 +1032,10 @@ export function useMainApp(gw: GatewayClient) {
       session.resetSession,
       session.resumeById,
       setHistoryItems,
-      setVoiceEnabled,
-      setVoiceProcessing,
-      setVoiceRecording,
+      chrome.voice.setEnabled,
+      chrome.voice.setProcessing,
+      chrome.voice.setRecording,
+      chrome.voice.setTts,
       stdout,
       submitLiteralRef,
       submitRef,
@@ -1072,13 +1049,13 @@ export function useMainApp(gw: GatewayClient) {
     () =>
       createServerRequestHandler({
         ringPromptBell: () => {
-          if (bellOnPrompt && stdout?.isTTY) {
+          if (chrome.bell.onPrompt && stdout?.isTTY) {
             stdout.write('\x07')
           }
         },
         setStatus: status => patchUiState({ status })
       }),
-    [bellOnPrompt, stdout]
+    [chrome.bell.onPrompt, stdout]
   )
 
   onServerRequestRef.current = onServerRequest
@@ -1206,11 +1183,15 @@ export function useMainApp(gw: GatewayClient) {
           newSession: session.newSession,
           resetVisibleHistory: session.resetVisibleHistory,
           resumeById: session.resumeById,
-          setSessionStartedAt
+          setSessionStartedAt: chrome.clock.setSessionStartedAt
         },
         slashFlightRef,
         transcript: { page, panel, send, setHistoryItems, sys, trimLastExchange: session.trimLastExchange },
-        voice: { setVoiceEnabled, setVoiceRecordKey, setVoiceTts }
+        voice: {
+          setVoiceEnabled: chrome.voice.setEnabled,
+          setVoiceRecordKey: chrome.voice.setRecordKey,
+          setVoiceTts: chrome.voice.setTts
+        }
       }),
     [
       catalog,
@@ -1227,6 +1208,10 @@ export function useMainApp(gw: GatewayClient) {
       send,
       session,
       setHistoryItems,
+      chrome.clock.setSessionStartedAt,
+      chrome.voice.setEnabled,
+      chrome.voice.setRecordKey,
+      chrome.voice.setTts,
       sys
     ]
   )
@@ -1586,9 +1571,9 @@ export function useMainApp(gw: GatewayClient) {
       queuedDisplay: composerState.queuedDisplay,
       submit,
       updateInput,
-      voiceRecordKey
+      voiceRecordKey: chrome.voice.recordKey
     }),
-    [cols, composerActions, composerState, empty, pagerPageSize, submit, updateInput, voiceRecordKey]
+    [cols, composerActions, composerState, empty, pagerPageSize, submit, updateInput, chrome.voice.recordKey]
   )
 
   // Pass current progress through unfrozen — streaming update throttling
@@ -1606,35 +1591,35 @@ export function useMainApp(gw: GatewayClient) {
       // essentials and truncates this further on narrow terminals.
       cwdLabel: fmtProjectCwdBranch(cwd, gitBranch, ui.info?.project?.name, 28),
       goodVibesTick,
-      lastTurnEndedAt: ui.sid ? lastTurnEndedAt : null,
-      sessionStartedAt: ui.sid ? sessionStartedAt : null,
+      lastTurnEndedAt: ui.sid ? chrome.clock.lastTurnEndedAt : null,
+      sessionStartedAt: ui.sid ? chrome.clock.sessionStartedAt : null,
       sessionTitle: ui.sid ? ui.sessionTitle : '',
       showStickyPrompt: !!stickyPrompt,
       statusColor: statusColorOf(ui.status, ui.theme.color),
       stickyPrompt,
-      turnStartedAt: ui.sid ? turnStartedAt : null,
+      turnStartedAt: ui.sid ? chrome.clock.turnStartedAt : null,
       // CLI parity: the classic prompt_toolkit status bar shows a red dot
       // on REC (cli.py:_get_voice_status_fragments line 2344).
-      voiceLabel: voiceRecording
+      voiceLabel: chrome.voice.recording
         ? i18n.session.main.voiceRec
-        : voiceProcessing
+        : chrome.voice.processing
           ? i18n.session.main.voiceStt
-          : `${voiceEnabled ? i18n.session.main.voiceOn : i18n.session.main.voiceOff}${voiceTts ? i18n.session.main.voiceTtsSuffix : ''}`
+          : `${chrome.voice.enabled ? i18n.session.main.voiceOn : i18n.session.main.voiceOff}${chrome.voice.tts ? i18n.session.main.voiceTtsSuffix : ''}`
     }),
     [
       cwd,
       gitBranch,
       goodVibesTick,
       i18n,
-      lastTurnEndedAt,
-      sessionStartedAt,
+      chrome.clock.lastTurnEndedAt,
+      chrome.clock.sessionStartedAt,
       stickyPrompt,
-      turnStartedAt,
+      chrome.clock.turnStartedAt,
       ui,
-      voiceEnabled,
-      voiceProcessing,
-      voiceRecording,
-      voiceTts
+      chrome.voice.enabled,
+      chrome.voice.processing,
+      chrome.voice.recording,
+      chrome.voice.tts
     ]
   )
 
