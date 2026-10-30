@@ -850,9 +850,12 @@ def get_mcp_status(configured: Optional[dict[str, dict]] = None, *, include_runt
             # servers from a status read scoped to a different profile.
             return include_runtime and _core._server_visible_in_scope(key, current_scope)
 
-        active_servers = {_key_name(k): s for k, s in _core._servers.items() if visible(k)}
-        connecting = {_key_name(k) for k in _core._server_connecting if visible(k)}
-        connect_errors = {_key_name(k): e for k, e in _core._server_connect_errors.items() if visible(k)}
+        active_servers = {_key_name(k): s for k, s in _core._servers.items()
+                          if visible(k) and not _session_env.is_variant_key(k)}
+        connecting = {_key_name(k) for k in _core._server_connecting
+                      if visible(k) and not _session_env.is_variant_key(k)}
+        connect_errors = {_key_name(k): e for k, e in _core._server_connect_errors.items()
+                          if visible(k) and not _session_env.is_variant_key(k)}
         # A lazy registration is not a live connection: ``_server_visible_in_scope`` reads the
         # adoption/teardown maps a lazy server never populates, so use the registration-level
         # predicate ``_resolve_server_key`` already relies on for this state.
