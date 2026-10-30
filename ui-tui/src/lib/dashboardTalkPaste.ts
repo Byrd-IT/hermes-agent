@@ -9,7 +9,9 @@
  * the web client is not trusted.
  */
 
-export const DASHBOARD_TALK_PREFIX = 'HERMES_DASH_TALK:'
+import { DASHBOARD_TALK_PREFIX, sanitizeTalkText } from '@hermes/shared/dashboard-talk'
+
+export { DASHBOARD_TALK_PREFIX, sanitizeTalkText }
 
 /** A 120s utterance is a few thousand characters. Longer is a forged dump. */
 export const MAX_TALK_TEXT_CHARS = 8000
@@ -56,23 +58,6 @@ function unwrapPaste(input: string): string {
   text = stripEdge(text, BARE_END, false)
 
   return text
-}
-
-/** Strip controls so a forged paste cannot inject Enter, Ctrl, or an escape. */
-export function sanitizeTalkText(text: string): string {
-  let cleaned = ''
-
-  for (const ch of text) {
-    const code = ch.codePointAt(0) ?? 0
-
-    if (code <= 0x1f || code === 0x7f || code === 0x2028 || code === 0x2029) {
-      cleaned += ' '
-    } else {
-      cleaned += ch
-    }
-  }
-
-  return cleaned.replace(/[ \t\n\f\v]+/g, ' ').trim()
 }
 
 function decodePayload(body: string): DashboardTalkPayload | null {

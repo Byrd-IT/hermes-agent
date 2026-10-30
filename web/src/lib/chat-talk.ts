@@ -9,6 +9,11 @@
  * mode, and only when no menu is open. Draft mode inserts and does not submit.
  */
 
+import {
+  DASHBOARD_TALK_PREFIX,
+  sanitizeTalkText as sanitizeTranscriptForPty,
+} from "@hermes/shared/dashboard-talk";
+
 export type VoiceSubmitMode = "direct" | "draft";
 
 /** Defaults match hermes_cli.config_defaults voice.* */
@@ -23,8 +28,10 @@ export const VOICE_TALK_DEFAULTS = {
  * The TUI recognizes this prefix inside one bracketed paste and applies the
  * transcript itself (clear the whole composer, then submit). Raw keystrokes
  * are not used: Ctrl+U only clears one line, and Enter can land in a menu.
+ * Prefix and control strip live in @hermes/shared so the TUI parses the same
+ * bytes this module sends.
  */
-export const DASHBOARD_TALK_PREFIX = "HERMES_DASH_TALK:";
+export { DASHBOARD_TALK_PREFIX, sanitizeTranscriptForPty };
 
 /** Server rejects audio over 25 MB. Fail before the POST. */
 export const MAX_TALK_AUDIO_BYTES = 25 * 1024 * 1024;
@@ -79,25 +86,6 @@ export function readVoiceTalkSettings(config: unknown): VoiceTalkSettings {
       VOICE_TALK_DEFAULTS.silenceThreshold,
     ),
   };
-}
-
-/**
- * A transcript is typed into the TUI composer. Strip controls so it cannot
- * inject an early Enter, a Ctrl sequence, or a terminal escape.
- */
-export function sanitizeTranscriptForPty(text: string): string {
-  let cleaned = "";
-  for (const ch of text) {
-    const code = ch.codePointAt(0) ?? 0;
-    // C0 controls, DEL, and Unicode line separators. A regex class would
-    // trip no-control-regex and is easier to get wrong here.
-    if (code <= 0x1f || code === 0x7f || code === 0x2028 || code === 0x2029) {
-      cleaned += " ";
-    } else {
-      cleaned += ch;
-    }
-  }
-  return cleaned.replace(/[ \t\n\f\v]+/g, " ").trim();
 }
 
 export function mimeBase(mimeType: string): string {
