@@ -358,6 +358,16 @@ install give the user one with `sudo loginctl enable-linger <user>`.
   advance `consecutive_failures`, so a host blip never parks cards as a bare
   `blocked`; the respawn guard spaces the retries (`infrastructure_cooldown`,
   same window as the rate-limit cooldown) until the bus is back.
+- **Gateway restart or drain.** A release switch or `hermes gateway restart`
+  drains the gateway that owns every worker, and the workers lose their owner at
+  once. A loss with that evidence (the owner process is gone, or the worker's last
+  output is `Kanban owner silent for Ns: ...`) is recorded as *infrastructure*:
+  the run's metadata carries `owner_restart` and `infrastructure: true`,
+  `consecutive_failures` does not advance, it never counts toward the systemic
+  rule, and the card goes back to its retry status. While the gateway is draining
+  (`restart_wait`), update-paused or not ready (session API `starting`/`failed`), its dispatcher claims nothing, and
+  resumes on the replacement gateway. Five consecutive restart losses of one card
+  block it, sticky, as `owner did not return`; `unblock` (only) starts a fresh count.
 - **`hermes kanban dispatch` from your own unit** (a `Type=oneshot` timer, a
   sequencer service): the worker gets the same scope when the bus is
   reachable. Without one the worker is still spawned — inside *your* unit's
