@@ -18,6 +18,7 @@ from typing import Any, Optional
 from gateway.kanban_watchers_common import (
     _acquire_singleton_lock,
     _kanban_dispatch_allowed,
+    _kanban_owner_unavailable,
     _release_singleton_lock,
     _resolve_auto_decompose_settings,
     _gc_retention_days,
@@ -279,6 +280,7 @@ class GatewayKanbanWatchersMixin:
         bad_ticks = 0
         last_warn_at = 0
         results: Optional[list] = None
+        last_owner_state = ""
         dispatcher = _KanbanDispatcher(_kb, settings)
 
         logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
@@ -298,7 +300,18 @@ class GatewayKanbanWatchersMixin:
                 # dispatch while paused; running workers finish naturally.
                 if not _kanban_dispatch_allowed():
                     bad_ticks = 0
+                elif owner_state := await _to_thread_process_service(_kanban_owner_unavailable, self):
+                    # Claiming now would spawn workers onto an owner that is going away: they wait
+                    # out OWNER_WAIT_S and exit. The replacement gateway's dispatcher resumes.
+                    # The whole tick is skipped, crash sweep included: a worker that really crashed
+                    # meanwhile is swept by the replacement with its owner gone and books as
+                    # infrastructure (bounded by OWNER_RESTART_RETRY_LIMIT).
+                    bad_ticks = 0
+                    if owner_state != last_owner_state:
+                        logger.info("kanban dispatcher: paused, gateway %s", owner_state)
+                    last_owner_state = owner_state
                 else:
+                    last_owner_state = ""
                     # Re-read the auto-decompose toggle live so disabling it
                     # takes effect on the next tick, not on restart.
                     _ad_enabled, _ad_per_tick = _resolve_auto_decompose_settings(_load_config)
