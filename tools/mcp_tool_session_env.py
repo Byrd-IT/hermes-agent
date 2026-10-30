@@ -91,6 +91,18 @@ def close_for_bases(base_keys) -> int:
     return len(doomed)
 
 
+def _variant_busy(key) -> bool:
+    """True when a call is in flight. Eviction and the idle reaper must not close it."""
+    server = _core._servers.get(key)
+    if server is None:
+        return False
+    lock = getattr(server, "_rpc_lock", None)
+    if lock is not None and getattr(lock, "locked", lambda: False)():
+        return True
+    tasks = tuple(getattr(server, "_inflight_tasks", ()) or ())
+    return any(not t.done() for t in tasks)
+
+
 def reap_idle(now: Optional[float] = None) -> int:
     """Close variant connections idle past the TTL and forget bookkeeping of keys that never
     connected (or were evicted) and have not been used for the TTL. Returns the closed count."""
@@ -99,10 +111,11 @@ def reap_idle(now: Optional[float] = None) -> int:
         for k in [k for k, t in _retry_after.items() if now >= t]:
             _retry_after.pop(k, None)
         idle = [k for k, t in _last_used.items() if now - t > _IDLE_TTL_SEC]
-    live = [k for k in idle if k in _core._servers]
+    connected = [k for k in idle if k in _core._servers]
+    live = [k for k in connected if not _variant_busy(k)]
     with _guard:
         for k in idle:
-            if k not in live:
+            if k not in connected:
                 _pending.pop(k, None)
                 _last_used.pop(k, None)
                 _connect_locks.pop(k, None)
@@ -207,13 +220,19 @@ def _render(config: dict, values: dict) -> dict:
 
 
 def _evict(now: float) -> list:
-    """Variant servers to close: idle past the TTL, then the least recently used beyond the cap."""
+    """Variant servers to close: idle past the TTL, then the least recently used beyond the cap.
+
+    A variant with a call in flight is never closed. If every variant is busy, the count
+    may exceed ``_MAX_VARIANTS`` until one finishes.
+    """
     with _guard:
         live = [k for k in _last_used if k in _core._servers]
-        stale = [k for k in live if now - _last_used[k] > _IDLE_TTL_SEC]
-        rest = sorted((k for k in live if k not in stale), key=_last_used.get)
-        stale += rest[:max(0, len(rest) - _MAX_VARIANTS + 1)]
-        return stale
+        closable = [k for k in live if not _variant_busy(k)]
+        stale = [k for k in closable if now - _last_used[k] > _IDLE_TTL_SEC]
+        rest = sorted((k for k in closable if k not in stale), key=lambda k: _last_used[k])
+        remaining = len(live) - len(stale)
+        extra = max(0, remaining - _MAX_VARIANTS + 1)
+        return stale + rest[:extra]
 
 
 def _close(keys) -> None:
