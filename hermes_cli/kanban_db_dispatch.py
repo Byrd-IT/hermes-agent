@@ -27,6 +27,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.kanban_db_dispatch_streaks import _protocol_violation_streak
+from hermes_cli import kanban_continuity
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
@@ -2030,6 +2031,7 @@ def dispatch_once(
             result = DispatchResult(skipped_locked=True)
         else:
             result = _locked_tick()
+            kanban_continuity.progress_tick(conn, dry_run=dry_run)
             # Still under the dispatch lock: periodic PASSIVE WAL checkpoint.
             _kbc._maybe_checkpoint_wal(conn, db_path)
     # Lock released. Fire the tick observer strictly OUTSIDE the critical
@@ -2145,9 +2147,9 @@ def _dispatch_lane_task(
     if claimed.workspace_kind == "worktree":
         _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
     _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+    kanban_continuity.on_claim(conn, claimed.id, board)
     if lane == "review":
-        # Force-load sdlc-review; the kanban lifecycle is already in every
-        # worker's system prompt via KANBAN_GUIDANCE.
+        # Force-load sdlc-review; the kanban lifecycle is already in every worker's prompt (KANBAN_GUIDANCE).
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
@@ -2155,9 +2157,7 @@ def _dispatch_lane_task(
             _set_worker_pid(conn, claimed.id, int(pid), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
-        # consecutive_failures is deliberately NOT reset here: resetting on
-        # spawn would let a task that keeps timing out loop forever. Cleared
-        # only on successful completion (complete_task).
+        # consecutive_failures is NOT reset on spawn (a task that keeps timing out would loop forever); only complete_task clears it.
         result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
         _count_spawn(claimed.assignee)
         return True
@@ -2960,8 +2960,7 @@ def run_daemon(
             if on_tick is not None:
                 with contextlib.suppress(Exception):
                     on_tick(res)
-        except Exception:
-            # Don't let any single tick kill the daemon.
+        except Exception:  # a single tick must not kill the daemon
             import traceback
             traceback.print_exc()
         stop_event.wait(timeout=interval)
