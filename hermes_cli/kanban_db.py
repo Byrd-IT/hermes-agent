@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
+from hermes_cli import kanban_continuity
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than
 
@@ -250,10 +251,7 @@ def _fire_dispatch_tick_hook(
     """``on_kanban_dispatch_tick`` — strictly AFTER ``_dispatch_tick_lock`` is
     released so a slow subscriber cannot stall a sibling dispatcher.
 
-    Re-port of PR #56066 per the #64231 batch disposition: renamed to the taxonomy form and called by
-    ``dispatch_once`` strictly AFTER ``_dispatch_tick_lock`` has been released — the original fired inside
-    the lock, so a slow subscriber could extend the single-writer critical section and stall a sibling
-    dispatcher's tick. Observer-only and fully best-effort: any subscriber failure is swallowed.
+    Re-port of PR #56066 (#64231 disposition): fired AFTER the lock is released, not inside it; observer-only, best-effort.
     """
     if not _kanban_observer_consumed("on_kanban_dispatch_tick"):
         return
@@ -4006,6 +4004,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     _ctx_parent_results(lines, conn, task_id, now)
     _ctx_role_history(lines, conn, task, now)
     _ctx_comments(lines, list_comments(conn, task_id), now)
+    lines.extend(kanban_continuity.context_lines(conn, task_id))
     return "\n".join(lines).rstrip() + "\n"
 
 
