@@ -526,14 +526,53 @@ def stop_if_idle(launcher: Optional[tuple[int, float]] = None) -> bool:
     return True
 
 
+_STALE_MARKER_WARNED: set[str] = set()
+
+
+def _terminal_is_local() -> bool:
+    """True when this profile's terminal is the gateway host itself: ``terminal.backend`` is local, or the
+    terminal environment already running for it is a ``LocalEnvironment``. Env-only (no config load).
+    Never raises: a probe failure (e.g. a malformed TERMINAL_* value) keeps a live sandbox marker in force."""
+    try:
+        if placement._terminal_backend() == "local":
+            return True
+        from tools.environments.local import LocalEnvironment
+        return isinstance(_sandbox_env(create=False), LocalEnvironment)
+    except Exception:
+        return False
+
+
+def _owner_marker() -> dict:
+    """The sandbox marker, unless the backend it records no longer matches the terminal.
+
+    The marker is only ever written for a sandbox backend (docker / ssh / a streaming plugin). When the
+    profile's terminal has since moved to the local backend while the old container keeps running, the
+    recorded owner can no longer be reached through the terminal environment: every probe would try to exec
+    into a ``LocalEnvironment`` ("LocalEnvironment cannot exec argv") and break the browser and the pane.
+    Such a marker is stale and is ignored (not deleted, so the old container's screen stays traceable);
+    callers then take the host path. A docker -> ssh style move between two sandbox backends keeps the
+    recorded owner winning, as before."""
+    from tools.bot_desktop import sandbox_host
+    marker = sandbox_host._read_marker()
+    if not marker or not _terminal_is_local():
+        return marker
+    key = str(sandbox_host._marker())
+    if key not in _STALE_MARKER_WARNED:
+        _STALE_MARKER_WARNED.add(key)
+        logger.warning(
+            "Bot Desktop for profile %s: ignoring stale sandbox marker %s (recorded backend %s, container %s); "
+            "the terminal backend is now local. Stop that container separately if it is no longer needed",
+            _profile_name(), key, marker.get("backend") or "?", marker.get("container") or "-")
+    return {}
+
+
 def published_env() -> dict[str, str]:
     """Variables the launcher wrote once Xfce's private bus existed; empty when the desktop is down.
 
     Pure file reads on the common path: this is called from every browser / cua-driver env builder, so it
     must not load config (that initializes HERMES_HOME). A sandbox-hosted screen leaves a host-side marker at
-    start; only its presence routes to the sandbox probe."""
-    from tools.bot_desktop import sandbox_host
-    if sandbox_host._read_marker():
+    start; only its presence (and a terminal that is still a sandbox) routes to the sandbox probe."""
+    if _owner_marker():
         return _sandbox_published_env()
     if _launcher_pid() is None:
         return {}
@@ -551,8 +590,7 @@ def published_env() -> dict[str, str]:
 def rfb_socket_path() -> Optional[Path]:
     """Host path of the RFB socket; None when down OR when the screen lives in a sandbox (use
     :func:`open_rfb_stream` there: the socket is not on this filesystem)."""
-    from tools.bot_desktop import sandbox_host
-    if sandbox_host._read_marker():
+    if _owner_marker():
         return None
     sock = state_dir() / "rfb.sock"
     return sock if _launcher_pid() is not None and sock.exists() else None
@@ -571,7 +609,7 @@ def sandbox_screen_running() -> bool:
     dead container; an unregistered-but-alive one is re-attached by ``_sandbox_env(create=True)`` at the
     next spawn (the terminal planner reuses the persisted container by label)."""
     from tools.bot_desktop import sandbox_host
-    marker = sandbox_host._read_marker()
+    marker = _owner_marker()
     if not marker:
         return False
     if _sandbox_env(create=False) is not None:
@@ -587,7 +625,7 @@ def _owned_sandbox_env():
     sandbox is still alive; None when there is no marker or its sandbox is gone. Never builds a sandbox for
     a screen that is not there."""
     from tools.bot_desktop import sandbox_host
-    marker = sandbox_host._read_marker()
+    marker = _owner_marker()
     if not marker:
         return None
     env = _sandbox_env(create=False)
@@ -620,11 +658,11 @@ def geometry() -> str:
 def status(profile: Optional[str] = None) -> DesktopStatus:
     from tools.bot_desktop import browser as _bd_browser
     from tools.bot_desktop import resources
-    from tools.bot_desktop import sandbox_host
     where = placement.resolve()
-    if where.where == placement.TERMINAL or sandbox_host._read_marker():
+    if where.where == placement.TERMINAL or _owner_marker():
         # A screen already running inside a sandbox is reported (and stoppable) even after the placement
-        # setting moved: the recorded owner wins over the current policy until it is stopped.
+        # setting moved: the recorded owner wins over the current policy until it is stopped (unless the
+        # terminal itself moved to the local backend: see _owner_marker).
         return _sandbox_status(profile, where)
     missing: list[str] = missing_binaries() if is_supported_host() else list(REQUIRED_BINARIES)
     pid = _launcher_pid()
@@ -893,7 +931,7 @@ def stop(still_due: Optional[Callable[[], bool]] = None) -> bool:
     was signalled. ``still_due`` is asked again before anything is killed (under ``start.lock`` for a screen on
     this host); False there leaves the screen running."""
     from tools.bot_desktop import sandbox_host
-    if sandbox_host._read_marker() or placement.resolve().where == placement.TERMINAL:
+    if _owner_marker() or placement.resolve().where == placement.TERMINAL:
         if still_due is not None and not still_due():
             return False
         # The marker names the sandbox that owns the screen; stop THAT one (re-attaching after a restart),
