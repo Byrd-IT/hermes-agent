@@ -244,7 +244,8 @@ def test_autostash_refs_ignore_position(tmp_path: Path):
     assert "manual-note" not in " ".join(refs)
 
 
-def test_apply_state_dir_survives_a_changed_carried_set(tmp_path: Path, capsys):
+@pytest.mark.parametrize("replacement", ["edit2\n", "edit1  \n"])
+def test_apply_state_dir_survives_a_changed_carried_set(tmp_path: Path, capsys, replacement):
     repo = _init(tmp_path)
     (repo / "clean.txt").write_text("edit1\n", encoding="utf-8")
     source_head = _git(repo, "rev-parse", "HEAD")
@@ -256,15 +257,16 @@ def test_apply_state_dir_survives_a_changed_carried_set(tmp_path: Path, capsys):
     assert update_carry.main(argv) == 0
     assert update_carry.main(argv) == 0
     assert "unchanged" in capsys.readouterr().out
-    (repo / "clean.txt").write_text("edit2\n", encoding="utf-8")
+    (repo / "clean.txt").write_text(replacement, encoding="utf-8")
     rc = update_carry.main(argv)
     captured = capsys.readouterr()
     assert rc == 0
     assert "already exists" not in captured.err
+    assert "unchanged" not in captured.out
     found = [
         path for path in tmp_path.iterdir()
-        if path.is_dir() and (path / "clean.txt").is_file()
-        and (path / "clean.txt").read_text(encoding="utf-8") == "edit2\n"
+        if path != repo and path.is_dir() and (path / "clean.txt").is_file()
+        and (path / "clean.txt").read_text(encoding="utf-8") == replacement
     ]
     assert found
     assert _git(repo, "rev-parse", "HEAD") == source_head

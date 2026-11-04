@@ -709,7 +709,7 @@ def _dedupe(items: list[dict]) -> list[dict]:
     seen: dict[str, str] = {}
     out = []
     for item in items:
-        key = item.get("patch_id") or ""
+        key = hashlib.sha256(item["patch"].encode("utf-8", errors="surrogateescape")).hexdigest() if item.get("patch") else ""
         if key and key in seen:
             item = dict(item)
             item["action"] = "drop"
@@ -858,10 +858,10 @@ def apply_in_worktree(
 
 def fingerprint(plan: dict) -> str:
     rows = [
-        (item.get("identity"), item.get("action"), item.get("patch_id", ""))
+        (item.get("identity"), item.get("action"), item.get("patch", ""))
         for item in plan.get("items") or []
     ]
-    return hashlib.sha256(json.dumps(rows).encode("utf-8")).hexdigest()
+    return hashlib.sha256(json.dumps(rows, ensure_ascii=True).encode("utf-8")).hexdigest()
 
 
 _AUTOSTASH_PREFIX = "hermes-update-autostash-"
