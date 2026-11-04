@@ -426,24 +426,27 @@ def _decide(runner: Any) -> None:
 
 def run_watcher(stop: threading.Event, runner: Any, loop: Any, poll_interval: float = POLL_S) -> None:
     """Thread target: when a request file exists, run the decision ON THE LOOP THREAD. It only looks for a file;
-    all trust, validation and effect are in :func:`decide`."""
+    all trust, validation and effect are in :func:`decide`. A request that cannot be consumed (unwritable directory)
+    is retried with a growing pause, not every poll."""
     try:
-        home = _home()
-        path = request_path(home)
+        path = request_path(_home())
         mark_active(True)
+        pause = max(poll_interval, 0.05)
         while not stop.is_set():
             try:
                 present = path.exists()
             except OSError:
                 present = False
-            if present:                                   # decide() answers even a draining / stopping gateway
-                try:
-                    loop.call_soon_threadsafe(runner.handle_restart_if_idle_request)
-                except RuntimeError:                      # loop closed: the gateway is going away
-                    break
-                stop.wait(max(poll_interval, 0.05))      # give the loop time to consume it
+            if not present:
+                pause = max(poll_interval, 0.05)
+                stop.wait(poll_interval)
                 continue
-            stop.wait(poll_interval)
+            try:
+                loop.call_soon_threadsafe(runner.handle_restart_if_idle_request)
+            except RuntimeError:                          # loop closed: the gateway is going away
+                break
+            stop.wait(pause)                              # give the loop time to consume it
+            pause = min(pause * 2, 8.0)                   # still there next time: it cannot be consumed; back off
     finally:
         mark_active(False)
 
