@@ -2912,6 +2912,18 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
 # Long-lived dispatcher daemon
 # ---------------------------------------------------------------------------
 
+def _kanban_daemon_paused() -> bool:
+    """True while the global emergency stop (or a scoped ``kanban`` hold) is engaged. Fails open if
+    estop is unimportable, like the gateway dispatcher's gate."""
+    try:
+        from agent.estop import check_paused
+    except ImportError:
+        return False
+    import logging
+
+    return check_paused("kanban", logging.getLogger(__name__))
+
+
 def run_daemon(
     *,
     interval: float = 60.0,
@@ -2947,6 +2959,12 @@ def run_daemon(
 
     while not stop_event.is_set():
         try:
+            # `hermes pause` / a scoped "kanban" hold: a standing background spawner must not claim
+            # or spawn while held (the gateway dispatcher honors the same gate). In-flight workers
+            # are untouched; the next tick after the hold lifts resumes.
+            if _kanban_daemon_paused():
+                stop_event.wait(timeout=interval)
+                continue
             # Re-resolved every tick (config load is mtime-cached) so operator
             # edits apply without a restart.
             max_in_progress = resolve_max_in_progress(configured_max_in_progress())

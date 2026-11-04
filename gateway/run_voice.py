@@ -32,6 +32,30 @@ _VOICE_MODES = {"off", "voice_only", "all"}
 
 
 class GatewayVoiceMixin:
+    def _active_voice_session_count(self) -> Optional[int]:
+        """Voice sessions connected right now, across the default and every served profile's adapters,
+        or ``None`` when that cannot be counted (published as null, never as a zero: an updater fails
+        closed on it). An adapter without voice support has no sessions to count; one that claims voice
+        support but cannot be inspected makes the whole count unknown."""
+        try:
+            maps = [self.adapters, *getattr(self, "_profile_adapters", {}).values()]
+            total = 0
+            for adapters in maps:
+                for adapter in list(adapters.values()):
+                    if not hasattr(adapter, "join_voice_channel"):
+                        continue
+                    clients, is_in = getattr(adapter, "_voice_clients", None), getattr(adapter, "is_in_voice_channel", None)
+                    if not isinstance(clients, dict) or not callable(is_in):
+                        return None
+                    total += sum(1 for guild_id in list(clients) if is_in(guild_id))
+            return total
+        except Exception:
+            return None
+
+    def _runtime_activity(self) -> dict:
+        """The ``activity`` record for ``gateway_state.json`` (what a maintenance updater waits on)."""
+        return {"voice_sessions": self._active_voice_session_count()}
+
     def _voice_key(self, platform: Platform, chat_id: str, profile: Optional[str] = None) -> str:
         """``<profile>:<platform>:<chat_id>`` under multiplexing (else two bots in one channel
         share a key and one ``/voice`` flips the other's); default keeps ``<platform>:<chat>``.
@@ -188,6 +212,8 @@ class GatewayVoiceMixin:
             adapter._voice_sources[guild_id] = event.source.to_dict()
         self._apply_voice_mode(adapter, self._voice_key_for_source(event.source),
                                event.source.chat_id, "all")
+        # A control command is exempt from a scoped "turns" hold: show the new session to an updater now.
+        self._persist_active_agents()
         return t("gateway.voice.channel_joined", name=voice_channel.name)
 
     async def _handle_voice_channel_leave(self, event: MessageEvent) -> str:
@@ -206,6 +232,7 @@ class GatewayVoiceMixin:
                                event.source.chat_id, "off")
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = None
+        self._persist_active_agents()
         return t("gateway.voice.channel_left")
 
     def _voice_ack_guild_for(self, source: SessionSource) -> Optional[int]:

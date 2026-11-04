@@ -100,6 +100,13 @@ def _estop_status_line():
     if state is None:
         return None
     reason = state.get("reason")
+    if state.get("mode") == "scoped":
+        from agent.estop import SCOPE_TURNS
+
+        turns = "user turns ALSO held" if SCOPE_TURNS in state["scopes"] else "user turns running"
+        scopes = ", ".join(s for s in state["scopes"] if s != SCOPE_TURNS) or "-"
+        return (f"⏸️  PAUSED (scoped hold by {state.get('owner') or 'unknown'}: {scopes}; {turns}"
+                f"{f' — reason: {reason}' if reason else ''}; auto-releases, or `hermes resume` to lift)")
     return f"⏸️  PAUSED (global emergency stop{f' — reason: {reason}' if reason else ''}; `hermes resume` to lift)"
 
 
