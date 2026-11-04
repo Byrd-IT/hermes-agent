@@ -1727,11 +1727,13 @@ export function ChatSidebar({
                     ) : (
                       button
                     )}
-                    {asksProfile && (
+                    {/* Stays mounted while open so leaving All profiles closes it through Radix
+                        (focus and pointer-events cleanup) before the effect below resets the state. */}
+                    {isNewSession && (showAllProfiles || newSessionPickerOpen) && (
                       <NewSessionProfilePicker
                         anchorRef={newSessionRowRef}
                         onOpenChange={setNewSessionPickerOpen}
-                        open={newSessionPickerOpen}
+                        open={showAllProfiles && newSessionPickerOpen}
                       />
                     )}
                   </SidebarMenuItem>

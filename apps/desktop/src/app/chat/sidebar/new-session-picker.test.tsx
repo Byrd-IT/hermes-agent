@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -183,6 +183,25 @@ describe('ChatSidebar New session under All profiles', () => {
     expect(onNavigate).toHaveBeenCalledTimes(1)
     expect(onNavigate.mock.calls[0]?.[0]).toMatchObject({ id: 'new-session', action: 'new-session' })
     expect(newSessionRow().getAttribute('aria-haspopup')).toBeNull()
+  })
+
+  it('returns focus to the row after a dismissal but not after a pick', async () => {
+    setShowAllProfiles(true)
+
+    renderSidebar()
+    fireEvent.click(newSessionRow())
+    fireEvent.keyDown(screen.getByRole('menu'), { key: 'Escape' })
+    await waitFor(() => expect(newSessionRow().ownerDocument.activeElement).toBe(newSessionRow()))
+
+    newSessionRow().blur()
+    fireEvent.click(newSessionRow())
+    fireEvent.click(within(screen.getByRole('menu')).getByText('work'))
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull())
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 50))
+    })
+
+    expect(newSessionRow().ownerDocument.activeElement).not.toBe(newSessionRow())
   })
 
   it('closes the menu when the scope leaves All profiles', () => {
