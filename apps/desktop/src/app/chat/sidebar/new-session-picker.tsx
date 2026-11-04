@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import type { RefObject } from 'react'
+import { type RefObject, useRef } from 'react'
 
 import { setWorkspaceScope } from '@/components/pane-shell/workspace-scope'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
@@ -88,6 +88,7 @@ export function NewSessionProfilePicker({ anchorRef, onOpenChange, open }: NewSe
   const colors = useStore($profileColors)
   const listed = newSessionTargets(useGatewaySessionGroups(sessions, true, false) ?? [])
   const targets = listed.length ? listed : fallbackNewSessionTargets(profiles, colors)
+  const picked = useRef(false)
 
   return (
     <DropdownMenu modal onOpenChange={onOpenChange} open={open}>
@@ -96,7 +97,7 @@ export function NewSessionProfilePicker({ anchorRef, onOpenChange, open }: NewSe
         <span
           aria-hidden="true"
           aria-label={t.sidebar.nav['new-session']}
-          className="pointer-events-none absolute inset-0"
+          className="pointer-events-none absolute inset-0 [-webkit-app-region:no-drag]"
           data-new-session-anchor=""
         />
       </DropdownMenuTrigger>
@@ -107,7 +108,13 @@ export function NewSessionProfilePicker({ anchorRef, onOpenChange, open }: NewSe
         collisionPadding={8}
         onCloseAutoFocus={event => {
           event.preventDefault()
-          anchorRef.current?.focus({ preventScroll: true })
+
+          // A pick opens a draft that owns focus; only a dismissal returns it to the row.
+          if (!picked.current) {
+            anchorRef.current?.focus({ preventScroll: true })
+          }
+
+          picked.current = false
         }}
         side="bottom"
       >
@@ -116,7 +123,10 @@ export function NewSessionProfilePicker({ anchorRef, onOpenChange, open }: NewSe
             className="min-w-0"
             data-new-session-target={target.id}
             key={target.id}
-            onSelect={() => startNewSessionIn(target)}
+            onSelect={() => {
+              picked.current = true
+              startNewSessionIn(target)
+            }}
           >
             <span className="flex min-w-0 items-center gap-1.5">
               <ProfileGlyph
