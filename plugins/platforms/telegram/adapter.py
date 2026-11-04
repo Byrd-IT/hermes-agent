@@ -180,6 +180,7 @@ _MEDIA_KIND_KEYS = {
     "video file": "platform.telegram.media.kind_video", "video note": "platform.telegram.media.kind_video"}
 
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from plugins.platforms.telegram.adapter_cold_start_poll import ColdStartShortFirstPoll
 from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInboundMixin
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id, parse_send_target, parse_telegram_message_id
@@ -1967,39 +1968,38 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 loop.call_soon_threadsafe(strict_error_event.set)
 
             effective_callback = _strict_error_callback
-        try:
-            # Same watchdog bound as the reconnect ladders; the TimeoutError is an OSError subclass, so
-            # the except below classifies it as a network error → background recovery.
-            # Same watchdog bound as the reconnect ladders: a wedged httpx connection pool can hang
-            # start_polling() forever at bootstrap too (#59614).
-            _generation, progress = await self._start_polling_once(
-                self._app, drop_pending_updates=drop_pending_updates, error_callback=effective_callback,
-                abandon_app_on_timeout=require_progress,
-                # The strict gate IS the cold-start verifier; a background one would race it.
-                schedule_verifier=not require_progress)
-            if require_progress:
-                await self._await_cold_start_readiness(progress, strict_error_event, strict_error)
-                # Readiness proven — close the gate so later errors reach background recovery.
-                strict_gate_open = False
-                self._polling_error_callback_ref = error_callback
-            return True
-        except _PollingLifecycleAbort:
-            return False
-        except Exception as err:
-            if self._teardown_started:
+        async with ColdStartShortFirstPoll(self, enabled=require_progress):
+            try:
+                # Same watchdog bound as the reconnect ladders. TimeoutError is an OSError, so a hung
+                # start_polling() is a network error and the except below recovers (#59614).
+                _generation, progress = await self._start_polling_once(
+                    self._app, drop_pending_updates=drop_pending_updates, error_callback=effective_callback,
+                    abandon_app_on_timeout=require_progress,
+                    # The strict gate IS the cold-start verifier; a background one would race it.
+                    schedule_verifier=not require_progress)
+                if require_progress:
+                    await self._await_cold_start_readiness(progress, strict_error_event, strict_error)
+                    # Readiness proven — close the gate so later errors reach background recovery.
+                    strict_gate_open = False
+                    self._polling_error_callback_ref = error_callback
+                return True
+            except _PollingLifecycleAbort:
                 return False
-            if require_progress:
+            except Exception as err:
+                if self._teardown_started:
+                    return False
+                if require_progress:
+                    raise
+                if self._looks_like_polling_conflict(err):
+                    logger.warning(
+                        "[%s] Telegram polling bootstrap conflict; gateway stays alive while conflict retry runs: %s",
+                        self.name, _redact_telegram_error_text(err))
+                    self._spawn_polling_recovery(asyncio.get_running_loop(), self._handle_polling_conflict(err))
+                    return False
+                if self._looks_like_network_error(err):
+                    self._schedule_polling_recovery(err, reason="polling bootstrap")
+                    return False
                 raise
-            if self._looks_like_polling_conflict(err):
-                logger.warning(
-                    "[%s] Telegram polling bootstrap conflict; gateway stays alive while conflict retry runs: %s",
-                    self.name, _redact_telegram_error_text(err))
-                self._spawn_polling_recovery(asyncio.get_running_loop(), self._handle_polling_conflict(err))
-                return False
-            if self._looks_like_network_error(err):
-                self._schedule_polling_recovery(err, reason="polling bootstrap")
-                return False
-            raise
 
     async def _go_fatal_network(self, message: str, log_message: str, *log_args) -> None:
         """Retryable ``telegram_network_error`` fatal + runner handoff (supervisor rebuilds the adapter)."""
