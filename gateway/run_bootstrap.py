@@ -503,6 +503,8 @@ async def _start_gateway_shutdown_tail(
     await _await_thread_exit(housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT)
 
     # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
+    from gateway import restart_if_idle
+    restart_if_idle.detach_watcher(runner)
     _planned_stop_watcher_stop.set()
     _planned_stop_watcher_thread.join(timeout=2)
 
@@ -878,6 +880,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         try:
             # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
             publish_gateway_runtime_ready(runner)
+            # Conditional restart ("restart only if idle", gateway/restart_if_idle.py): listening only from READY,
+            # and the capability is claimed (and re-published) only while this poller is alive.
+            from gateway import restart_if_idle
+            _best_effort(lambda: restart_if_idle.attach_watcher(runner, loop),
+                         "restart-if-idle watcher did not start: %s")
             runner._start_systemd_watchdog()
             if idle_exit:
                 from gateway.run_idle_exit import arm_unmanaged_idle_exit
@@ -912,6 +919,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         finally:
             if _planned_stop_watcher_stop is not None:
                 _planned_stop_watcher_stop.set()
+            if runner is not None:
+                from gateway import restart_if_idle
+                restart_if_idle.detach_watcher(runner)
             if _control_server is not None:
                 await _control_server.stop()
             remove_pid_file()

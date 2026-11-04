@@ -49,6 +49,8 @@ running gateway will do with a scoped sentinel.
 from __future__ import annotations
 
 import errno
+import hashlib
+import hmac
 import json
 import logging
 import math
@@ -651,6 +653,21 @@ def foreign_holds(token: str) -> list[dict]:
     replaced. :func:`verify` only inspects one home; an owner that must not proceed while anything
     else is holding (e.g. before a restart) asks for ``foreign_holds(token) == []`` as well."""
     return [_public(h) for h in _visible_holds() if not _owned(h, token)]
+
+
+def live_hold_by_token_digest(digest: str) -> Optional[dict]:
+    """The live SCOPED hold (profile home or fleet root) whose token hashes to ``digest`` (SHA-256 hex), without
+    its token, or None. It lets the running gateway authenticate a request that proves it by the owner's token
+    (``gateway/restart_if_idle.py``): only the holder of a live hold can ask, a full/legacy pause, an expired or a
+    released hold cannot. The comparison is constant-time."""
+    if not isinstance(digest, str) or not digest:
+        return None
+    for hold in _visible_holds():
+        if hold.mode != "scoped" or not hold.token:
+            continue
+        if hmac.compare_digest(hashlib.sha256(hold.token.encode("utf-8")).hexdigest(), digest):
+            return _public(hold)
+    return None
 
 
 def get_state() -> Optional[dict]:
