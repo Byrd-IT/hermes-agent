@@ -27,16 +27,28 @@ keep working, then — atomically, only when the owner decides — hold the user
   strands the fleet). The owner :func:`renew`\\ s while it is alive. Legacy pauses never expire.
 * Composition: holds in the process home and the fleet root are UNIONED; a FULL hold anywhere is
   FULL. A profile-level owner can therefore never weaken a root-level (or any foreign) hold.
-* Writes are serialized by an ``ESTOP.lock`` flock and land via write-temp + ``os.replace``, so a
-  transition never exposes a partial file or a moment with no hold.
+* Every write — including the operator's :func:`engage` / :func:`disengage` — is serialized by an
+  ``ESTOP.lock`` flock and lands via write-temp + ``os.replace``, so a transition never exposes a
+  partial file or a moment with no hold, and an operator ``hermes resume`` can never be undone by an
+  owner write that was already in flight. Where no file lock exists (neither ``fcntl`` nor ``msvcrt``)
+  the owner's writes refuse to run rather than pretend to be serialized; the operator's pause/resume
+  still work, unserialized (they only ever fail safe).
+* ``engage()`` never reports a pause that did not land: when the atomic write fails it truncates the
+  sentinel in place (readers see a hold at every instant) and, if even that cannot produce a FULL
+  hold, raises ``OSError``.
 
 Old runtimes read the same file as an ordinary (full) engaged sentinel — fail safe, but it would
-pause Telegram too — so an updater must check :func:`capabilities` (``hermes pause --capabilities``)
-of the runtime it is about to drain before scoping anything.
+pause Telegram too. An updater must therefore judge the RUNNING gateway, not the code on disk: read
+the ``capabilities`` claim in that gateway's ``gateway_state.json`` and accept it only when its
+``capabilities_pid`` (and ``capabilities_start_time``) match that same record's ``pid`` /
+``start_time``. :func:`capabilities` / ``hermes pause --capabilities`` only describe the code of the
+process that calls them (a CLI that may be newer than the gateway) and are NOT proof of what the
+running gateway will do with a scoped sentinel.
 """
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import math
@@ -44,7 +56,7 @@ import os
 import secrets
 import threading
 import time
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone, UTC
 from pathlib import Path
@@ -53,10 +65,18 @@ from typing import Any, Iterable, Iterator, Optional
 # Same profile-aware / fleet-root resolvers the file-safety guards use (fail-open to ~/.hermes).
 from agent.file_safety import _hermes_home_path as _hermes_home, _hermes_root_path as _canonical_root
 
-try:  # POSIX advisory locks; on Windows the atomic os.replace alone serializes readers.
+try:  # POSIX advisory locks
     import fcntl
 except ImportError:  # pragma: no cover - exercised on Windows only
     fcntl = None  # type: ignore[assignment]
+try:  # Windows byte-range lock (the Windows counterpart of flock)
+    import msvcrt
+except ImportError:
+    msvcrt = None  # type: ignore[assignment]
+
+# Windows has no blocking flock: poll a 1-byte lock up to this long, then fail the write.
+_LOCK_TIMEOUT_S = 30.0
+_LOCK_POLL_S = 0.05
 
 SENTINEL_NAME = "ESTOP"
 LOCK_NAME = "ESTOP.lock"
@@ -278,9 +298,13 @@ def is_held(component: str) -> bool:
 
 
 def capabilities() -> dict:
-    """Machine-readable feature descriptor (``hermes pause --capabilities``). An updater must see
-    ``scoped_estop >= 1`` on the runtime it drains, or refuse: an older runtime reads any scoped
-    sentinel as a FULL pause (Telegram included)."""
+    """Machine-readable feature descriptor of THIS process's code (``hermes pause --capabilities``).
+
+    This is what the code that is calling can do — not proof about the gateway that is running, which may
+    be older than the CLI (an older runtime reads any scoped sentinel as a FULL pause, Telegram included).
+    An updater must gate on the RUNNING gateway's own claim: ``capabilities`` in its ``gateway_state.json``
+    (written from this function at that process's start), valid only while ``capabilities_pid`` and
+    ``capabilities_start_time`` equal that record's ``pid`` / ``start_time``; otherwise refuse."""
     return {
         "scoped_estop": SCOPED_ESTOP_VERSION,
         "scopes": list(ALL_SCOPES),
@@ -301,17 +325,41 @@ def _iso(epoch: Optional[float] = None) -> str:
 
 @contextmanager
 def _locked(directory: Path) -> Iterator[None]:
-    """Serialize sentinel read-modify-write cycles in ``directory`` (POSIX flock; readers never lock)."""
-    if fcntl is None:  # pragma: no cover
-        yield
-        return
+    """Serialize sentinel read-modify-write cycles in ``directory`` (readers never lock).
+
+    POSIX ``flock`` or a Windows ``msvcrt`` byte lock on ``ESTOP.lock``. Raises ``OSError`` when the lock
+    cannot be taken (no primitive on this platform, lock file unusable, Windows timeout): callers either
+    fail the write (owner operations) or, for the operator's pause/resume, proceed unserialized."""
+    if fcntl is None and msvcrt is None:
+        raise OSError(errno.ENOLCK, "no file-locking primitive on this platform: ESTOP writes cannot be serialized")
     fd = os.open(str(directory / LOCK_NAME), os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+
+            def unlock() -> None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        else:
+            deadline = time.monotonic() + _LOCK_TIMEOUT_S
+            while True:
+                os.lseek(fd, 0, os.SEEK_SET)
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(_LOCK_POLL_S)
+
+            def unlock() -> None:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        try:
+            yield
+        finally:
+            with suppress(OSError):
+                unlock()
     finally:
-        with suppress(OSError):
-            fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
 
@@ -332,28 +380,73 @@ def _atomic_write(path: Path, payload: dict) -> None:
         raise
 
 
+def _place_full_sentinel(path: Path, payload: dict) -> None:
+    """Make ``path`` hold a FULL pause, or raise ``OSError`` (nothing is claimed that did not land).
+
+    First choice is the atomic replace. If that fails (disk full, temp file unwritable) the sentinel is
+    truncated and rewritten IN PLACE: there is never a moment without a hold, and an empty or partial body is
+    itself a FULL pause, so even a failed rewrite replaces an owned scoped body by a stronger hold. Finally the
+    result is read back: only a FULL hold counts as success.
+    """
+    try:
+        _atomic_write(path, payload)
+        return
+    except OSError as first:
+        failure = first
+    with suppress(OSError):
+        fd = os.open(str(path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, indent=2) + "\n")
+    try:
+        landed = _load(path, include_expired=True)
+    except OSError:
+        landed = None
+    if landed is None or landed.mode != "full":
+        raise failure
+
+
 def engage(reason: Optional[str] = None) -> Path:
     """Create the (legacy, FULL) ESTOP sentinel. Idempotent; re-engaging updates the file. An owned
-    scoped hold in the same home is replaced — an operator pause only ever strengthens."""
+    scoped hold in the same home is replaced — an operator pause only ever strengthens.
+
+    Raises ``OSError`` when no FULL pause could be put in place (and the caller must say so): it never
+    returns a path for a pause that is not holding.
+    """
     path = sentinel_path()
     payload = {"engaged_at": datetime.now(UTC).isoformat(), "reason": reason or None}
-    try:
+    with suppress(OSError):
         path.parent.mkdir(parents=True, exist_ok=True)
-        with _locked(path.parent):
-            _atomic_write(path, payload)
-    except OSError:
-        with suppress(OSError):  # Best effort: an empty/partial sentinel still pauses (fail safe).
-            path.touch(exist_ok=True)
+    with ExitStack() as stack:
+        with suppress(OSError):  # no usable lock: still pause — an operator pause only ever fails safe
+            stack.enter_context(_locked(path.parent))
+        _place_full_sentinel(path, payload)
     return path
 
 
 def disengage() -> bool:
     """Remove every visible sentinel (process-local and fleet-root), whoever owns it: the operator
-    override behind ``hermes resume`` and ``/pause off``."""
+    override behind ``hermes resume`` and ``/pause off``.
+
+    Each removal happens under that directory's ``ESTOP.lock``, so an owner's ``renew`` / ``set_scopes`` /
+    ``engage_scoped`` that already passed its ownership check finishes first and cannot ``os.replace`` the
+    hold back afterwards; the owner's next call then finds :class:`HoldLost`. The override never depends on
+    the lock being obtainable: if it is not, the sentinel is removed unserialized.
+    """
     lifted = False
     for path in _candidate_sentinel_paths():
         try:
-            path.unlink()
+            present = path.exists()
+        except OSError:
+            present = True  # cannot tell: try to remove it
+        except AttributeError:
+            continue
+        if not present:
+            continue  # nothing to lift, and no lock file is created for it
+        try:
+            with ExitStack() as stack:
+                with suppress(OSError):
+                    stack.enter_context(_locked(path.parent))
+                path.unlink()
             lifted = True
         except (OSError, AttributeError):
             continue
@@ -379,6 +472,12 @@ def _check_ttl(ttl_s: Any) -> float:
     if not _is_real_number(ttl_s) or not 0 < ttl_s <= MAX_TTL_S:
         raise InvalidScope(f"ttl_s must be a number in (0, {MAX_TTL_S}], got {ttl_s!r}")
     return float(ttl_s)
+
+
+def _new_token() -> str:
+    """Fresh ownership token. Hex, never ``token_urlsafe``: that alphabet includes ``-``, and a token that
+    starts with it cannot be passed as ``hermes pause --token T`` (argparse reads it as an option; ~1 in 64)."""
+    return secrets.token_hex(16)
 
 
 def _check_owner(owner: Any) -> str:
@@ -444,7 +543,7 @@ def engage_scoped(scopes: Iterable[str], *, owner: str, ttl_s: float, reason: Op
     ttl = _check_ttl(ttl_s)
     owner = _check_owner(owner)
     if token is None:
-        token = secrets.token_urlsafe(16)
+        token = _new_token()
     elif not isinstance(token, str) or not token.strip():
         raise InvalidScope("token must be a non-empty string")
     directory = _target_dir(home)

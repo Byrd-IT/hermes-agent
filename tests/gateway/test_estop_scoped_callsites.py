@@ -125,7 +125,7 @@ async def test_cron_webhook_is_refused_only_for_its_scope(monkeypatch):
             self.fired.append(job["id"])
             return True
 
-    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "sk-secret"}))
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "dummy-api-key-for-tests"}))
     app = web.Application(middlewares=[cors_middleware])
     app["api_server_adapter"] = adapter
     app.router.add_post("/api/cron/fire", adapter._handle_cron_fire)
