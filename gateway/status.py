@@ -1177,8 +1177,14 @@ def _prepare_runtime_status_update(
         else:
             # The pid + start_time stamps let a reader reject a claim that outlived its process (an older
             # runtime that does not know these keys leaves them on disk after a rollback, and a pid can be reused).
-            payload["capabilities"], payload["capabilities_pid"] = capabilities, current_record["pid"]
-            payload["capabilities_start_time"] = current_record["start_time"]
+            if current_record.get("start_time") is None:
+                # No process start time (no /proc): the claim cannot be bound to this process, so a reader
+                # could not tell it from a reused pid's. Publish no claim rather than an unbound one.
+                for key in _CAPABILITY_CLAIM_KEYS:
+                    payload.pop(key, None)
+            else:
+                payload["capabilities"], payload["capabilities_pid"] = capabilities, current_record["pid"]
+                payload["capabilities_start_time"] = current_record["start_time"]
         if activity is not _UNSET:
             record = _coerce_activity(activity)
             if record is None:
