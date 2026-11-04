@@ -122,7 +122,8 @@ def test_stale_marker_warns_once(monkeypatch, home, local_env, caplog):
         runtime.published_env()
         runtime.rfb_socket_path()
     hits = [r for r in caplog.records if "stale sandbox marker" in r.getMessage()]
-    assert len(hits) == 1 and "c00e53b4ac9b" in hits[0].getMessage()
+    assert len(hits) == 1
+    assert "c00e53b4ac9b" not in hits[0].getMessage()
 
 
 def test_sandbox_terminal_still_honours_its_marker(monkeypatch, home):
@@ -137,6 +138,35 @@ def test_sandbox_terminal_still_honours_its_marker(monkeypatch, home):
     assert runtime.published_env() == {"DISPLAY": ":20"}
     assert runtime.rfb_socket_path() is None
     assert runtime.sandbox_screen_running() is True
+
+
+def test_registered_local_env_does_not_override_sandbox_policy(monkeypatch, home, local_env):
+    monkeypatch.setattr(placement, "_terminal_backend", lambda: "docker")
+    monkeypatch.setattr(placement, "_setting", lambda: "auto")
+    monkeypatch.setattr(runtime, "_stop_locked", lambda sd: pytest.fail("must not stop host screen"))
+    st = runtime.status()
+    assert st.placement == "terminal:docker" and st.running is False
+    assert runtime.stop() is False
+    assert sandbox_host._marker().exists()
+    assert home.probes == []
+
+
+@pytest.mark.parametrize("secret", ['sk-SYNTHbearerz3zb6kvuq44YM18U', 'SynthPwo5653cLBO84Z', 'synthuserm70q', 'ghp_SYNTHjd49u4aibbj7g8u6pdirEAFL4M', 'SYNTHhdrkeyijda9djwbmon2BC0EB', 'AKSYNTHqt37r2ku0o0ggB8GZMY', 'https://synthuserm70q:SynthPwo5653cLBO84Z@probe.example.invalid/api/v1', 'Authorization: Bearer sk-SYNTHbearerz3zb6kvuq44YM18U', 'X-Api-Key: SYNTHhdrkeyijda9djwbmon2BC0EB', 'https://probe.example.invalid/v1/items?api_key=AKSYNTHqt37r2ku0o0ggB8GZMY&q=1'])
+def test_stale_marker_warning_never_echoes_marker_fields(monkeypatch, home, caplog, capsys, secret):
+    import base64
+    from urllib.parse import quote
+
+    marker = dict(DOCKER_ERA_MARKER, backend=secret, container=secret, profile=secret)
+    sandbox_host._marker().write_text(json.dumps(marker), encoding="utf-8")
+    monkeypatch.setattr(runtime, "_profile_name", lambda: secret)
+    monkeypatch.setattr(placement, "_terminal_backend", lambda: "local")
+    with caplog.at_level("WARNING", logger="tools.bot_desktop.runtime"):
+        assert runtime._owner_marker() == {}
+    captured = capsys.readouterr()
+    output = caplog.text + captured.out + captured.err
+    assert "ignoring stale sandbox marker" in output
+    for value in (secret, secret[:8], secret[-6:], quote(secret, safe=""), base64.b64encode(secret.encode()).decode()):
+        assert value not in output
 
 
 def test_a_failing_backend_probe_keeps_the_marker_in_force(monkeypatch, home):

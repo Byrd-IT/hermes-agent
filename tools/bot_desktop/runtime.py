@@ -538,7 +538,7 @@ def _terminal_is_local() -> bool:
             return True
         from tools.environments.local import LocalEnvironment
         return isinstance(_sandbox_env(create=False), LocalEnvironment)
-    except Exception:
+    except Exception:  # health: allow BLE001 -- hot-path probe must preserve sandbox ownership on config/plugin errors; no secret-bearing exception text
         return False
 
 
@@ -560,9 +560,8 @@ def _owner_marker() -> dict:
     if key not in _STALE_MARKER_WARNED:
         _STALE_MARKER_WARNED.add(key)
         logger.warning(
-            "Bot Desktop for profile %s: ignoring stale sandbox marker %s (recorded backend %s, container %s); "
-            "the terminal backend is now local. Stop that container separately if it is no longer needed",
-            _profile_name(), key, marker.get("backend") or "?", marker.get("container") or "-")
+            "Bot Desktop: ignoring stale sandbox marker; the terminal backend is now local. "
+            "Inspect bot-desktop/sandbox.json and stop its recorded container separately if no longer needed")
     return {}
 
 
@@ -692,7 +691,9 @@ def _sandbox_status(profile: Optional[str], where) -> DesktopStatus:
     """Status of a sandbox-placed screen. Package presence is only known once the sandbox exists; before
     that the pane shows "installed" with the image hint carried in ``install_command`` so Start can explain."""
     from tools.bot_desktop import sandbox_host
-    env = _owned_sandbox_env() or _sandbox_env(create=False)
+    # A configured sandbox can temporarily still have a local terminal registered.
+    # Report the configured placement as down; never probe that local environment.
+    env = None if _terminal_is_local() else (_owned_sandbox_env() or _sandbox_env(create=False))
     missing = sandbox_host.missing_binaries(env) if env is not None else []
     published = sandbox_host.published_env(env, profile or _profile_name()) if env is not None else {}
     running = bool(published.get("DISPLAY"))
@@ -932,6 +933,8 @@ def stop(still_due: Optional[Callable[[], bool]] = None) -> bool:
     this host); False there leaves the screen running."""
     from tools.bot_desktop import sandbox_host
     if _owner_marker() or placement.resolve().where == placement.TERMINAL:
+        if _terminal_is_local():
+            return False  # A stale marker is traceability, not permission to delete or stop anything.
         if still_due is not None and not still_due():
             return False
         # The marker names the sandbox that owns the screen; stop THAT one (re-attaching after a restart),
