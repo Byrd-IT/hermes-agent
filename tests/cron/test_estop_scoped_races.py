@@ -359,6 +359,49 @@ def test_windows_lock_uses_msvcrt_byte_lock_and_releases_it(hermes_home, monkeyp
     assert events and events.count(("lock", 1)) == events.count(("unlock", 1)) == 2
 
 
+def test_windows_lock_seeds_a_byte_first_because_msvcrt_cannot_lock_an_empty_file(hermes_home, monkeypatch):
+    sizes: list = []
+
+    class StrictMsvcrt:
+        LK_NBLCK, LK_UNLCK = 2, 0
+
+        @staticmethod
+        def locking(fd, mode, nbytes):
+            if mode == StrictMsvcrt.LK_NBLCK:
+                sizes.append(os.fstat(fd).st_size)
+                if sizes[-1] == 0:
+                    raise OSError(errno.EACCES, "cannot lock past end of an empty file")
+
+    monkeypatch.setattr(estop, "fcntl", None)
+    monkeypatch.setattr(estop, "msvcrt", StrictMsvcrt)
+    monkeypatch.setattr(estop, "_LOCK_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(estop, "_LOCK_POLL_S", 0.01)
+    _hold()
+    assert sizes and all(size >= 1 for size in sizes)
+
+
+def test_windows_lock_retries_only_contention_errors(hermes_home, monkeypatch):
+    calls: list = []
+
+    class Broken:
+        LK_NBLCK, LK_UNLCK = 2, 0
+
+        @staticmethod
+        def locking(fd, mode, nbytes):
+            if mode == Broken.LK_NBLCK:
+                calls.append(1)
+                raise OSError(errno.EBADF, "bad handle")
+
+    monkeypatch.setattr(estop, "fcntl", None)
+    monkeypatch.setattr(estop, "msvcrt", Broken)
+    monkeypatch.setattr(estop, "_LOCK_TIMEOUT_S", 5.0)
+    monkeypatch.setattr(estop, "_LOCK_POLL_S", 0.01)
+    t0 = time.monotonic()
+    with pytest.raises(OSError):
+        _hold()
+    assert len(calls) == 1 and time.monotonic() - t0 < 2
+
+
 def test_windows_lock_gives_up_after_its_deadline_rather_than_hanging(hermes_home, monkeypatch):
     class Busy:
         LK_NBLCK, LK_UNLCK = 2, 0
