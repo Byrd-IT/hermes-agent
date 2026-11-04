@@ -75,7 +75,7 @@ def test_dry_run_hook_reports_and_leaves_head_alone(tmp_path: Path, monkeypatch,
     head = _git(repo, "rev-parse", "HEAD")
     reapply_after_diverged_reset(["git"], repo, pre_pull_sha=tip, upstream_ref="origin/main")
     out = capsys.readouterr().out
-    assert "carry clean" in out and "carry conflict" in out
+    assert "reapplied=1" in out and "conflicted=1" in out
     assert _git(repo, "rev-parse", "HEAD") == head
     assert (repo / "clean.txt").read_text(encoding="utf-8") == "base\n"
 

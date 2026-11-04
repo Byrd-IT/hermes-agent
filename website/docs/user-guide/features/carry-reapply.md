@@ -19,7 +19,13 @@ Leave the hook at `dry-run` when that tree must stay untouched, and replay with
 whose carried set changed picks a new branch and a free worktree path. The
 previous branch is kept. Untracked worktree files and untracked files parked
 by `stash push --include-untracked` (the stash's third parent) are part of the
-plan.
+plan. Binary contents, symlink targets (not the target files), executable modes,
+and rename source deletions are preserved. Unsupported file types are left out.
+
+Console and JSON diagnostics use opaque `ref:` hashes for free-form repository
+metadata (paths, branch names, subjects), since those fields can contain credentials.
+Commit SHA fields and classification labels remain readable. The Python planning
+API retains the original metadata for local integrations.
 
 A standalone run defaults to dry-run:
 

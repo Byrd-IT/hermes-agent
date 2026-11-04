@@ -26,12 +26,15 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +57,8 @@ logger.addFilter(_RedactFilter())
 _MODES = ("off", "dry-run", "apply")
 _BANNED_HEAD = {"reset", "clean", "push", "rebase", "checkout", "switch"}
 _BACKUP_NAMES = re.compile(r"(^|/)[^/]+\.(bak|orig|rej)(-|$)")
+# Modes git can replay as a file. Anything else (submodule, tree) is left out.
+_FAITHFUL_BLOB_MODES = frozenset({"100644", "100755", "120000"})
 _REDACTIONS = (
     (re.compile(r"(?i)(authorization\s*:\s*bearer\s+)\S+"), r"\1[REDACTED]"),
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{8,}"), "bearer [REDACTED]"),
@@ -128,7 +133,7 @@ def _updates_section() -> dict:
         from hermes_cli.update_cmd import _updates_config
         return _updates_config()
     except Exception:
-        logger.exception("carry-reapply could not read config; using dry-run")
+        logger.error("carry-reapply could not read config; using dry-run")
         return {}
 
 
@@ -153,15 +158,18 @@ def _reject(args: list[str]) -> None:
 
 def _git(cwd: Path, args: list[str], *, git_bin: str = "git") -> subprocess.CompletedProcess:
     _reject(args)
-    return subprocess.run(
-        [git_bin, *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=120,
+    proc = subprocess.run([git_bin, "--literal-pathspecs", *args], cwd=cwd, capture_output=True, check=False, timeout=120)
+    # text=True normalizes CR/CRLF, corrupting patches and newline-bearing paths.
+    return subprocess.CompletedProcess(
+        proc.args, proc.returncode,
+        proc.stdout.decode("utf-8", errors="surrogateescape"),
+        proc.stderr.decode("utf-8", errors="surrogateescape"),
     )
 
 
 def _ok(proc: subprocess.CompletedProcess, what: str) -> str:
     if proc.returncode != 0:
-        detail = redact((proc.stderr or proc.stdout or "").strip())
-        raise CarryError(f"{what} failed: {detail or proc.returncode}")
+        raise CarryError(f"{what} failed (git exit {proc.returncode})")
     return proc.stdout
 
 
@@ -169,7 +177,7 @@ def _patch_id(diff: str, *, git_bin: str = "git") -> str:
     if not diff.strip():
         return ""
     proc = subprocess.run(
-        [git_bin, "patch-id", "--stable"], input=diff, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
+        [git_bin, "patch-id", "--stable"], input=diff, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", check=False,
         timeout=120,
     )
     parts = (proc.stdout or "").split()
@@ -201,7 +209,9 @@ def _status_entries(repo: Path, *, git_bin: str) -> list[tuple[str, str]]:
             continue
         xy, path = raw[:2], raw[3:]
         if "R" in xy or "C" in xy:
-            # -z order is "XY <new>\0<old>\0": keep the new path, skip the source.
+            # A rename includes both the addition and the source deletion.
+            if "R" in xy and index < len(parts):
+                entries.append((" D", parts[index]))
             index += 1
         if path:
             entries.append((xy, path))
@@ -209,19 +219,29 @@ def _status_entries(repo: Path, *, git_bin: str) -> list[tuple[str, str]]:
 
 
 def _diff_token(prefix: str, path: str) -> str:
-    token = f"{prefix}{path}"
-    if any(char in path for char in ' \t"\\'):
-        escaped = token.replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{escaped}"'
-    return token
+    raw = (prefix + path).encode("utf-8", errors="surrogateescape")
+    encoded = "".join(chr(b) if 33 <= b <= 126 and b not in (34, 92)
+                      else f"\\{b:03o}" for b in raw)
+    return f'"{encoded}"'
+
+
+def _unusable_binary_summary(diff: str) -> bool:
+    """True for git's non-applicable ``Binary files ... differ`` summary.
+
+    A text hunk that merely contains those words is not a binary summary.
+    ``git diff --binary`` emits ``GIT binary patch`` instead, which applies.
+    """
+    if "GIT binary patch" in diff:
+        return False
+    return any(line.startswith("Binary files ") for line in diff.splitlines())
 
 
 def _normalize_diff(diff: str, path: str) -> str:
     """Rewrite a no-index diff so ``git apply`` uses ``path``."""
-    if not diff.strip() or "Binary files" in diff:
+    if not diff.strip() or _unusable_binary_summary(diff):
         return ""
     lines = []
-    for line in diff.splitlines(keepends=True):
+    for line in (part + "\n" for part in diff.split("\n")[:-1]):
         if line.startswith("diff --git "):
             lines.append(f"diff --git {_diff_token('a/', path)} {_diff_token('b/', path)}\n")
         elif line.startswith("--- /dev/null"):
@@ -237,40 +257,137 @@ def _normalize_diff(diff: str, path: str) -> str:
     return "".join(lines)
 
 
-def _bytes_diff(path: str, current: bytes | None, baseline: bytes | None, *, git_bin: str) -> str:
-    """Diff ``current`` against ``baseline`` (or /dev/null) without touching an index."""
-    if current is None:
+def _no_index_patch(rel: str, right: str, *, git_bin: str, cwd: Path, left: str = "/dev/null") -> str:
+    """``git diff --binary --no-index``. Git lstats ``right``; a symlink is not opened."""
+    proc = subprocess.run(
+        [git_bin, "diff", "--no-index", "--binary", "--", left, right],
+        cwd=cwd, capture_output=True, check=False, timeout=120,
+    )
+    if proc.returncode not in (0, 1):
         return ""
-    if b"\0" in current or (baseline is not None and b"\0" in baseline):
+    return _normalize_diff(proc.stdout.decode("utf-8", errors="surrogateescape"), rel)
+
+
+def _discard_tree(root: Path) -> None:
+    """Remove a temp tree without following a symlink into the user's files."""
+    if not root.exists():
+        return
+    # shutil.rmtree unlinks symlinks; it does not traverse their targets.
+    shutil.rmtree(root)
+
+
+def _carryable(path: Path) -> bool:
+    try:
+        mode = path.lstat().st_mode
+    except OSError:
+        return False
+    return stat.S_ISREG(mode) or stat.S_ISLNK(mode)
+
+
+def _stored_bytes(path: Path) -> bytes | None:
+    """Bytes git would store. Link text only — ``read_bytes`` and ``hash-object`` follow."""
+    try:
+        mode = path.lstat().st_mode
+    except OSError:
+        return None
+    if stat.S_ISLNK(mode):
+        return os.fsencode(os.readlink(path))
+    if stat.S_ISREG(mode):
+        return path.read_bytes()
+    return None
+
+
+def _git_mode(path: Path) -> str | None:
+    try:
+        mode = path.lstat().st_mode
+    except OSError:
+        return None
+    if stat.S_ISLNK(mode):
+        return "120000"
+    if not stat.S_ISREG(mode):
+        return None
+    return "100755" if mode & 0o111 else "100644"
+
+
+def _materialize(root: Path, rel: str, mode: str | None, payload: bytes) -> Path | None:
+    """Recreate ``payload`` at ``mode`` without opening a symlink target."""
+    if mode not in _FAITHFUL_BLOB_MODES:
+        return None
+    dest = root / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if mode == "120000":
+            dest.symlink_to(os.fsdecode(payload))
+            return dest
+        dest.write_bytes(payload)
+        if mode == "100755":
+            dest.chmod(0o755)
+    except OSError:
+        return None
+    return dest
+
+
+def _bytes_diff(
+    path: str, current: bytes | None, baseline: bytes | None, *, git_bin: str,
+    live: tuple[Path, str] | None = None, mode: str | None = None,
+    baseline_mode: str | None = "100644",
+) -> str:
+    """Diff one path without touching an index.
+
+    ``live`` is ``(cwd, relative arg)`` for a worktree path git must lstat
+    itself, so executable and symlink modes survive. In-memory blobs (stash^3)
+    are materialized at ``mode``; an unsupported mode yields "" rather than an
+    empty regular file.
+    """
+    if live is None and current is None:
+        return ""
+    if live is None and mode not in (None, *_FAITHFUL_BLOB_MODES):
         return ""
     temp = Path(tempfile.mkdtemp(prefix="carry-diff-"))
     try:
-        right = temp / "right"
-        right.write_bytes(current)
-        if baseline is None:
-            argv = [git_bin, "diff", "--no-index", "--", "/dev/null", str(right)]
-        else:
-            left = temp / "left"
-            left.write_bytes(baseline)
-            argv = [git_bin, "diff", "--no-index", "--", str(left), str(right)]
-        proc = subprocess.run(
-            argv, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=120,
-        )
-        if proc.returncode not in (0, 1):
+        left = "/dev/null"
+        if baseline is not None:
+            baseline_path = _materialize(temp, "baseline", baseline_mode, baseline)
+            if baseline_path is None:
+                return ""
+            left = str(baseline_path)
+        if live is not None:
+            cwd, right = live
+            return _no_index_patch(path, right, git_bin=git_bin, cwd=cwd, left=left)
+        tree = temp / "tree"
+        made = _materialize(tree, path, mode or "100644", current or b"")
+        if made is None:
             return ""
-        return _normalize_diff(proc.stdout or "", path)
+        return _no_index_patch(path, path, git_bin=git_bin, cwd=tree, left=left)
     finally:
-        shutil.rmtree(temp, ignore_errors=True)
+        _discard_tree(temp)
 
 
-def _addition_patch(path: str, current: bytes | None, *, git_bin: str) -> str:
-    """A new-file patch, including an empty file (that is still a carried add)."""
-    patch = _bytes_diff(path, current, None, git_bin=git_bin)
-    if patch.strip() or current is None:
+def _empty_regular(current: bytes | None, mode: str | None, live: tuple[Path, str] | None) -> bool:
+    if mode == "120000":
+        return False
+    if live is not None:
+        cwd, right = live
+        try:
+            st = (cwd / right).lstat()
+        except OSError:
+            return False
+        return stat.S_ISREG(st.st_mode) and st.st_size == 0
+    return current == b""
+
+
+def _addition_patch(
+    path: str, current: bytes | None, *, git_bin: str,
+    live: tuple[Path, str] | None = None, mode: str | None = None,
+) -> str:
+    """A new-file patch. Empty only when the source itself is an empty regular file."""
+    patch = _bytes_diff(path, current, None, git_bin=git_bin, live=live, mode=mode)
+    if patch.strip() or not _empty_regular(current, mode, live):
         return patch
+    file_mode = "100755" if mode == "100755" or (live and _git_mode(live[0] / live[1]) == "100755") else "100644"
     return (
         f"diff --git {_diff_token('a/', path)} {_diff_token('b/', path)}\n"
-        "new file mode 100644\n"
+        f"new file mode {file_mode}\n"
         "index 0000000..e69de29\n"
         "--- /dev/null\n"
         f"+++ {_diff_token('b/', path)}\n"
@@ -315,14 +432,21 @@ def _blob(repo: Path, upstream: str, path: str, *, git_bin: str) -> bytes | None
     return proc.stdout
 
 
+def _tree_mode(repo: Path, ref: str, path: str, *, git_bin: str) -> str | None:
+    proc = _git(repo, ["ls-tree", "-z", ref, "--", path], git_bin=git_bin)
+    rows = _ls_tree_rows(proc.stdout)
+    return rows[0][0] if proc.returncode == 0 and rows else None
+
+
 def _matches_upstream(
     repo: Path, upstream: str, path: str, current: bytes | None, *, git_bin: str,
+    mode: str | None = None,
 ) -> bool:
     """True when ``current`` is already the upstream blob. Missing files are not a match."""
     if current is None:
         return False
     blob = _blob(repo, upstream, path, git_bin=git_bin)
-    return blob is not None and blob == current
+    return blob is not None and blob == current and mode == _tree_mode(repo, upstream, path, git_bin=git_bin)
 
 
 def _file_apply_check(repo: Path, patch: str, paths: list[str], upstream: str, *, git_bin: str) -> str:
@@ -332,13 +456,13 @@ def _file_apply_check(repo: Path, patch: str, paths: list[str], upstream: str, *
     try:
         for path in paths:
             blob = _blob(repo, upstream, path, git_bin=git_bin)
-            dest = temp / path
-            dest.parent.mkdir(parents=True, exist_ok=True)
             if blob is not None:
-                dest.write_bytes(blob)
+                mode = _tree_mode(repo, upstream, path, git_bin=git_bin)
+                if _materialize(temp, path, mode, blob) is None:
+                    return "unknown"
         proc = subprocess.run(
             [git_bin, "apply", "--check", "--unsafe-paths", "-"],
-            cwd=temp, input=patch, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=120,
+            cwd=temp, input=patch, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", check=False, timeout=120,
         )
         return "clean" if proc.returncode == 0 else "conflict"
     finally:
@@ -348,7 +472,7 @@ def _file_apply_check(repo: Path, patch: str, paths: list[str], upstream: str, *
 def _ahead(repo: Path, upstream: str, tip: str, *, git_bin: str) -> tuple[list[str], list[str]]:
     listed = _git(repo, ["rev-list", "--reverse", f"{upstream}..{tip}"], git_bin=git_bin)
     if listed.returncode != 0:
-        raise CarryError(redact((listed.stderr or "could not list carried commits").strip()))
+        raise CarryError("could not list carried commits")
     shas = [line for line in listed.stdout.splitlines() if line]
     merges = _git(repo, ["rev-list", "--merges", f"{upstream}..{tip}"], git_bin=git_bin)
     merge_set = set(merges.stdout.splitlines()) if merges.returncode == 0 else set()
@@ -383,27 +507,43 @@ def _classify_commit(repo, sha, upstream, marks, *, git_bin: str) -> dict:
     return item
 
 
+def _ls_tree_rows(text: str) -> list[tuple[str, str]]:
+    rows = []
+    for rec in text.split("\0"):
+        if not rec:
+            continue
+        meta, sep, path = rec.partition("\t")
+        if not sep or not path:
+            continue
+        rows.append((meta.split(" ", 1)[0], path))
+    return rows
+
+
 def _untracked_file_item(
     repo: Path, upstream: str, path: str, *, identity: str, kind: str,
     current: bytes | None, git_bin: str, extra: dict | None = None,
+    live: tuple[Path, str] | None = None, mode: str | None = None,
 ) -> dict:
     """Classify a file git diff does not see (worktree ``??`` or stash^3)."""
-    equivalent = _matches_upstream(repo, upstream, path, current, git_bin=git_bin)
+    equivalent = _matches_upstream(repo, upstream, path, current, git_bin=git_bin, mode=mode)
     baseline = None if equivalent else _blob(repo, upstream, path, git_bin=git_bin)
     if equivalent:
         patch = ""
         apply_check = "clean"
-    elif current is None:
+    elif current is None and live is None:
         patch = ""
         apply_check = "unknown"
     elif baseline is None:
-        patch = _addition_patch(path, current, git_bin=git_bin)
+        patch = _addition_patch(path, current, git_bin=git_bin, live=live, mode=mode)
         apply_check = (
             _file_apply_check(repo, patch, [path], upstream, git_bin=git_bin)
             if patch.strip() else "unknown"
         )
     else:
-        patch = _bytes_diff(path, current, baseline, git_bin=git_bin)
+        patch = _bytes_diff(
+            path, current, baseline, git_bin=git_bin, live=live, mode=mode,
+            baseline_mode=_tree_mode(repo, upstream, path, git_bin=git_bin),
+        )
         apply_check = (
             _file_apply_check(repo, patch, [path], upstream, git_bin=git_bin)
             if patch.strip() else "unknown"
@@ -431,23 +571,33 @@ def _worktree_items(repo: Path, upstream: str, *, git_bin: str) -> list[dict]:
         if _is_backup(path):
             continue
         file_path = repo / path
-        current = file_path.read_bytes() if file_path.is_file() else None
+        # lstat: is_file()/read_bytes() follow symlinks and would copy the target.
+        live = (repo, path) if _carryable(file_path) else None
+        current = _stored_bytes(file_path)
+        mode = _git_mode(file_path)
         if xy == "??":
             items.append(_untracked_file_item(
                 repo, upstream, path, identity=f"worktree:{path}", kind="uncommitted",
-                current=current, git_bin=git_bin,
+                current=current, git_bin=git_bin, live=live, mode=mode,
             ))
             continue
-        diff = _git(repo, ["diff", "HEAD", "--", path], git_bin=git_bin).stdout
+        diff = _git(repo, ["diff", "--binary", "HEAD", "--", path], git_bin=git_bin).stdout
         if not diff.strip():
-            diff = _git(repo, ["diff", "--cached", "--", path], git_bin=git_bin).stdout
-        equivalent = _matches_upstream(repo, upstream, path, current, git_bin=git_bin)
+            diff = _git(repo, ["diff", "--binary", "--cached", "--", path], git_bin=git_bin).stdout
+        equivalent = _matches_upstream(repo, upstream, path, current, git_bin=git_bin, mode=mode)
         if not diff.strip() and not equivalent:
             items.append(_untracked_file_item(
                 repo, upstream, path, identity=f"worktree:{path}", kind="uncommitted",
-                current=current, git_bin=git_bin,
+                current=current, git_bin=git_bin, live=live, mode=mode,
             ))
             continue
+        if diff.strip() and _unusable_binary_summary(diff):
+            diff = ""
+            apply_check = "unknown"
+        else:
+            apply_check = "clean" if equivalent else _file_apply_check(
+                repo, diff, [path], upstream, git_bin=git_bin,
+            )
         item = {
             "kind": "uncommitted",
             "identity": f"worktree:{path}",
@@ -457,9 +607,7 @@ def _worktree_items(repo: Path, upstream: str, *, git_bin: str) -> list[dict]:
             "patch": diff,
             "patch_id": _patch_id(diff, git_bin=git_bin),
             "patch_equivalent": equivalent,
-            "apply_check": "clean" if equivalent else _file_apply_check(
-                repo, diff, [path], upstream, git_bin=git_bin,
-            ),
+            "apply_check": apply_check,
         }
         item.update(decide(item))
         items.append(item)
@@ -467,27 +615,35 @@ def _worktree_items(repo: Path, upstream: str, *, git_bin: str) -> list[dict]:
 
 
 def _stash_items(repo: Path, stash_ref: str, upstream: str, *, git_bin: str) -> list[dict]:
-    names = _git(repo, ["stash", "show", "--name-only", stash_ref], git_bin=git_bin)
+    names = _git(repo, ["diff", "--no-renames", "--name-only", "-z", f"{stash_ref}^1", stash_ref], git_bin=git_bin)
     items = []
     if names.returncode != 0:
         return _stash_untracked_items(
             repo, stash_ref, upstream, git_bin=git_bin, seen=set(),
         )
-    for path in [line for line in names.stdout.splitlines() if line]:
-        diff_proc = _git(repo, ["diff", f"{stash_ref}^1", stash_ref, "--", path], git_bin=git_bin)
-        diff = diff_proc.stdout if diff_proc.returncode == 0 else ""
-        shown = subprocess.run(
-            [git_bin, "show", f"{stash_ref}:{path}"],
-            cwd=repo, capture_output=True, check=False, timeout=120,
+    for path in [name for name in names.stdout.split("\0") if name]:
+        diff_proc = _git(
+            repo, ["diff", "--binary", f"{stash_ref}^1", stash_ref, "--", path], git_bin=git_bin,
         )
-        current = shown.stdout if shown.returncode == 0 else None
-        equivalent = _matches_upstream(repo, upstream, path, current, git_bin=git_bin)
-        if equivalent:
-            apply_check = "clean"
-        elif diff_proc.returncode == 0:
-            apply_check = _file_apply_check(repo, diff, [path], upstream, git_bin=git_bin)
-        else:
+        diff = diff_proc.stdout if diff_proc.returncode == 0 else ""
+        if diff.strip() and _unusable_binary_summary(diff):
+            diff = ""
             apply_check = "unknown"
+            equivalent = False
+        else:
+            shown = subprocess.run(
+                [git_bin, "show", f"{stash_ref}:{path}"],
+                cwd=repo, capture_output=True, check=False, timeout=120,
+            )
+            current = shown.stdout if shown.returncode == 0 else None
+            mode = _tree_mode(repo, stash_ref, path, git_bin=git_bin)
+            equivalent = _matches_upstream(repo, upstream, path, current, git_bin=git_bin, mode=mode)
+            if equivalent:
+                apply_check = "clean"
+            elif diff_proc.returncode == 0 and diff.strip():
+                apply_check = _file_apply_check(repo, diff, [path], upstream, git_bin=git_bin)
+            else:
+                apply_check = "unknown"
         item = {
             "kind": "stash",
             "identity": f"stash:{stash_ref}:{path}",
@@ -516,17 +672,26 @@ def _stash_untracked_items(
     probe = _git(repo, ["rev-parse", "--verify", "--quiet", f"{stash_ref}^3"], git_bin=git_bin)
     if probe.returncode != 0 or not (probe.stdout or "").strip():
         return []
-    listed = _git(repo, ["ls-tree", "-r", "--name-only", "-z", f"{stash_ref}^3"], git_bin=git_bin)
+    listed = _git(repo, ["ls-tree", "-r", "-z", f"{stash_ref}^3"], git_bin=git_bin)
     if listed.returncode != 0:
         return []
     extra = []
-    for path in [name for name in listed.stdout.split("\0") if name]:
+    for mode, path in _ls_tree_rows(listed.stdout or ""):
         if path in seen or _is_backup(path):
+            continue
+        if mode not in _FAITHFUL_BLOB_MODES:
+            extra.append(_untracked_file_item(
+                repo, upstream, path,
+                identity=f"stash:{stash_ref}:untracked:{path}",
+                kind="stash", current=None, git_bin=git_bin, mode=mode,
+                extra={"stash_ref": stash_ref},
+            ))
             continue
         shown = subprocess.run(
             [git_bin, "show", f"{stash_ref}^3:{path}"],
             cwd=repo, capture_output=True, check=False, timeout=120,
         )
+        # show returns the blob. For a symlink that is the link text, not the target file.
         current = shown.stdout if shown.returncode == 0 else None
         extra.append(_untracked_file_item(
             repo, upstream, path,
@@ -534,6 +699,7 @@ def _stash_untracked_items(
             kind="stash",
             current=current,
             git_bin=git_bin,
+            mode=mode,
             extra={"stash_ref": stash_ref},
         ))
     return extra
@@ -625,13 +791,13 @@ def _apply_patch(dest: Path, patch: str, *, git_bin: str) -> str:
         return "drop"
     check = subprocess.run(
         [git_bin, "apply", "--check", "-"], cwd=dest, input=patch,
-        capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=120,
+        capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", check=False, timeout=120,
     )
     if check.returncode != 0:
         return "conflict"
     applied = subprocess.run(
         [git_bin, "apply", "-"], cwd=dest, input=patch,
-        capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=120,
+        capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", check=False, timeout=120,
     )
     return "reapply" if applied.returncode == 0 else "conflict"
 
@@ -650,7 +816,7 @@ def apply_in_worktree(
         repo, ["worktree", "add", "-b", branch, str(dest), plan["upstream_sha"]], git_bin=git_bin,
     )
     if added.returncode != 0:
-        raise CarryError(redact((added.stderr or "worktree add failed").strip()))
+        raise CarryError("worktree add failed")
     results = []
     try:
         for item in plan["items"]:
@@ -678,9 +844,11 @@ def apply_in_worktree(
             leftover = _git(dest, ["status", "--porcelain"], git_bin=git_bin).stdout
             if leftover.strip():
                 raise CarryError("replayed edits are not in the integration head")
-    except Exception:
-        logger.exception("carry-reapply worktree replay failed")
+    except CarryError:
         raise
+    except Exception:
+        logger.error("carry-reapply worktree replay failed")
+        raise CarryError("worktree replay failed; integration retained for inspection") from None
     after = _ok(_git(repo, ["rev-parse", "HEAD"], git_bin=git_bin), "rev-parse").strip()
     if after != before:
         raise CarryError("source checkout HEAD changed; refusing to continue")
@@ -831,8 +999,33 @@ def summarize(plan: dict, results: list[dict] | None = None) -> dict:
     return buckets
 
 
+def _safe_report(value: Any, key: str = "") -> Any:
+    """Report opaque refs rather than guessing whether free-form metadata is a secret."""
+    enums = {
+        "action": {"drop", "conflict", "reapply"},
+        "applied": {"drop", "conflict", "reapply"},
+        "kind": {"commit", "stash", "uncommitted"},
+        "reason": {"merged-upstream", "empty", "conflict-left-out", "unknown-left-out",
+                   "still-open", "not-upstream", "duplicate", "merge-commit-left-out", "empty-on-apply"},
+        "apply_check": {"clean", "empty", "unknown", "conflict"},
+        "mode": set(_MODES),
+        "flags": {"no_upstream_pr", "pr_lookup_failed", "pr_closed_unmerged", "apply_check_unknown"},
+    }
+    if isinstance(value, dict):
+        return {k: _safe_report(v, k) for k, v in value.items() if k != "patch"}
+    if isinstance(value, list):
+        return [_safe_report(v, key) for v in value]
+    if not isinstance(value, str) or not value:
+        return value
+    if value in enums.get(key, ()):
+        return value
+    if key in {"sha", "head", "upstream_sha", "tip", "patch_id"} and re.fullmatch(r"[0-9a-f]{40,64}", value):
+        return value
+    return "ref:" + hashlib.sha256(value.encode("utf-8", errors="surrogateescape")).hexdigest()[:16]
+
+
 def format_report(report: dict, *, quiet: bool) -> str:
-    buckets = report.get("buckets") or summarize(report)
+    buckets = _safe_report(report.get("buckets") or summarize(report))
     line = (
         "carry-reapply "
         f"carried={len(buckets['carried'])} "
@@ -898,7 +1091,7 @@ def reapply_after_diverged_reset(git_cmd, cwd, *, pre_pull_sha: str, upstream_re
             return
         _replay_in_place(Path(cwd), plan, git_bin=git_bin)
     except Exception:
-        logger.exception("carry-reapply after diverged reset failed")
+        logger.error("carry-reapply after diverged reset failed")
         print("carry-reapply: skipped; the update result is unchanged")
 
 
@@ -917,7 +1110,7 @@ def reapply_parked_stash(git_cmd, cwd, stash_ref: str) -> None:
             return
         _replay_in_place(Path(cwd), plan, git_bin=git_bin)
     except Exception:
-        logger.exception("carry-reapply parked stash failed")
+        logger.error("carry-reapply parked stash failed")
         print("carry-reapply: stash left parked; nothing was dropped")
 
 
@@ -960,7 +1153,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise CarryError("upstream must look like remote/branch")
             fetched = _git(repo, ["fetch", remote, branch])
             if fetched.returncode != 0:
-                raise CarryError(redact((fetched.stderr or "fetch failed").strip()))
+                raise CarryError("fetch failed")
         plan = plan_repo(
             repo, upstream=args.upstream, tip=args.tip, stashes=tuple(args.stash),
         )
@@ -1004,13 +1197,14 @@ def main(argv: list[str] | None = None) -> int:
                     }), encoding="utf-8")
         text = format_report({"buckets": report["buckets"]}, quiet=args.quiet)
         if args.json:
-            payload = redact(json.dumps(report, indent=2, default=str))
+            payload = json.dumps(_safe_report(report), indent=2, default=str)
             sys.stdout.write(payload + "\n")
         else:
             sys.stdout.write(text + "\n")
         return 0 if report["verification"]["ok"] else 2
-    except CarryError as exc:
-        sys.stderr.write(redact(str(exc)) + "\n")
+    except Exception:
+        # Paths, subprocess arguments and exception messages can contain credentials.
+        sys.stderr.write("carry-reapply failed; source refs and integration are retained\n")
         return 1
 
 
