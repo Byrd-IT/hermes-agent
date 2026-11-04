@@ -156,6 +156,7 @@ import { SidebarCronJobsSection } from './cron-jobs-section'
 import { SidebarFilterMenu } from './filter-menu'
 import { buildGatewaySessionGroups, scopeGatewaySessionGroups, useGatewaySessionGroups } from './gateway-group-model'
 import { SidebarLoadMoreRow } from './load-more-row'
+import { NewSessionProfilePicker } from './new-session-picker'
 import { orderByIds, reconcileOrderIds, resolveManualSessionOrderIds, sameIds } from './order'
 import { filterSessionsByProfileScope } from './profile-scope'
 import { ProfileRail } from './profile-switcher'
@@ -550,6 +551,8 @@ export function ChatSidebar({
   const newSessionKbd = newSessionCombo ? comboTokens(newSessionCombo) : []
   const [searchQuery, setSearchQuery] = useState('')
   const [newSessionKbdFlash, setNewSessionKbdFlash] = useState(false)
+  const [newSessionPickerOpen, setNewSessionPickerOpen] = useState(false)
+  const newSessionRowRef = useRef<HTMLButtonElement>(null)
   const [messagingLoadMorePending, setMessagingLoadMorePending] = useState<Record<string, boolean>>({})
   const [recentsLoadMorePending, setRecentsLoadMorePending] = useState(false)
   const messagingOpenIds = useStore($sidebarMessagingOpenIds)
@@ -585,6 +588,14 @@ export function ChatSidebar({
       clearTimeout(timeout)
     }
   }, [])
+
+  // The profile menu belongs to All profiles; leaving that scope closes it so it cannot
+  // reopen by itself the next time the scope returns.
+  useEffect(() => {
+    if (!showAllProfiles) {
+      setNewSessionPickerOpen(false)
+    }
+  }, [showAllProfiles])
 
   const activeSidebarSessionId = currentView === 'chat' ? selectedSessionId : null
   const profileRailVisible = useStore($profileRailVisible)
@@ -1585,9 +1596,15 @@ export function ChatSidebar({
 
                 const isNewSession = item.id === 'new-session'
 
+                // On All profiles a bare New session has no profile of its own (the live
+                // gateway is just whichever profile was touched last), so the row asks.
+                const asksProfile = isNewSession && showAllProfiles
+
                 const button = (
                   <SidebarMenuButton
                     aria-disabled={!isInteractive}
+                    aria-expanded={asksProfile ? newSessionPickerOpen : undefined}
+                    aria-haspopup={asksProfile ? 'menu' : undefined}
                     className={cn(
                       // no-drag: these rows sit directly under the titlebar's
                       // [-webkit-app-region:drag] strips (app-shell.tsx), with only
@@ -1606,6 +1623,18 @@ export function ChatSidebar({
                     // word; the row is what it's actually about.
                     data-tip-region=""
                     onClick={() => {
+                      // On All profiles the click opens the profile menu; the pick
+                      // starts the draft (newSessionInProfile / newSessionInAgent).
+                      if (asksProfile) {
+                        if (item.keybindActionId) {
+                          recordAction(item.keybindActionId, 'click')
+                        }
+
+                        setNewSessionPickerOpen(true)
+
+                        return
+                      }
+
                       // A plain new session lands in whatever profile the live
                       // gateway is on (= the active switcher context). null →
                       // no swap. The switcher header is the single place to
@@ -1639,6 +1668,7 @@ export function ChatSidebar({
                         onNewSessionSplit(placement.dir, { anchor: placement.anchor, before: placement.before })
                       }, event)
                     }}
+                    ref={isNewSession ? newSessionRowRef : undefined}
                     tooltip={
                       item.keybindActionId
                         ? {
@@ -1696,6 +1726,13 @@ export function ChatSidebar({
                       </ContextMenu>
                     ) : (
                       button
+                    )}
+                    {asksProfile && (
+                      <NewSessionProfilePicker
+                        anchorRef={newSessionRowRef}
+                        onOpenChange={setNewSessionPickerOpen}
+                        open={newSessionPickerOpen}
+                      />
                     )}
                   </SidebarMenuItem>
                 )
