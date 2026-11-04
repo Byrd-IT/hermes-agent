@@ -127,7 +127,7 @@ def _reaper_loop(stop: threading.Event) -> None:
         try:
             reap_idle()
         except Exception:  # health: allow BLE001 -- reaper pass must not die; logged
-            logger.debug("MCP session-env idle reaper pass failed", exc_info=True)
+            logger.debug("MCP session-env idle reaper pass failed")
 
 
 def _ensure_reaper() -> None:
@@ -266,12 +266,12 @@ def _close(keys, *, protect_in_use: bool = False, decided_at: Optional[float] = 
             if server is not None:
                 try:
                     await server.shutdown()
-                except Exception:  # health: allow BLE001 -- best-effort close, logged with traceback
-                    logger.debug("MCP session-env variant shutdown failed", exc_info=True)
+                except Exception:  # health: allow BLE001 -- best-effort close, logged without exception payloads
+                    logger.debug("MCP session-env variant shutdown failed")
     try:
         _loop._run_on_mcp_loop(_shutdown, timeout=20)
     except Exception:  # health: allow BLE001 -- best-effort close, logged
-        logger.debug("MCP session-env variant close could not reach the loop", exc_info=True)
+        logger.debug("MCP session-env variant close could not reach the loop")
     return len(keys)
 
 
@@ -311,7 +311,7 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
                 try:
                     await stale.shutdown()
                 except Exception:  # health: allow BLE001 -- best-effort; the replacement still connects
-                    logger.debug("MCP session-env stale variant shutdown failed", exc_info=True)
+                    logger.debug("MCP session-env stale variant shutdown failed")
             claimed: list = []
             token = _core._connect_server_claim.set(lambda s: (setattr(s, "_session_variant", True),
                                                                claimed.append(s)))
@@ -325,8 +325,8 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
                 if claimed:
                     try:
                         await claimed[0].shutdown()
-                    except Exception:  # health: allow BLE001 -- best-effort cleanup, logged with traceback
-                        logger.debug("MCP session-env variant cleanup after a failed connect failed", exc_info=True)
+                    except Exception:  # health: allow BLE001 -- best-effort cleanup, logged without exception payloads
+                        logger.debug("MCP session-env variant cleanup after a failed connect failed")
                 raise
             finally:
                 _core._connect_server_claim.reset(token)
