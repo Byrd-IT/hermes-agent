@@ -3268,6 +3268,19 @@ _AUTO_RESET_CONTEXT_NOTES = {
 }
 
 
+def _runtime_heartbeat(runner=None) -> None:
+    """Housekeeping heartbeat: re-stamp ``gateway_state.json`` and refresh what only changes silently (a voice
+    session that timed out or dropped), so ``activity`` never ages past one housekeeping interval. Without a
+    runner nothing is counted and nothing is invented: a plain re-stamp."""
+    fields: dict[str, Any] = {}
+    if runner is not None:
+        try:
+            fields["activity"] = runner._runtime_activity()
+        except Exception:
+            fields["activity"] = {"voice_sessions": None}
+    _write_runtime_status_quiet(**fields)
+
+
 def _write_runtime_status_quiet(**fields: Any) -> None:
     """Best-effort status publication; persistence must never abort or block the caller."""
     try:
@@ -4493,7 +4506,7 @@ def _start_gateway_housekeeping(
         # ``hermes gateway status`` / ``/api/status`` warn when it ages past 2x ``interval`` with the
         # PID alive — the thread (or a chore blocked on the loop) wedged (#113372). Runs first so a
         # wedged chore stops the NEXT stamp instead of a slow one delaying this tick's.
-        (1, "Runtime heartbeat", _write_runtime_status_quiet)]
+        (1, "Runtime heartbeat", lambda: _runtime_heartbeat(runner))]
     if adapters is not None or runner is not None:
         # Restart-safe cron workers run outside the gateway cgroup and queue their final send for
         # whichever gateway is live; drained here (not the scheduler tick) so external providers get it too.

@@ -155,6 +155,8 @@ class _RuntimeStatusWriter:
 
 
 _runtime_status_state_lock = threading.RLock()
+# ``gateway_state.json`` keys that are claims about the writing process itself (see ``_merge_over_on_disk``).
+_PROCESS_CLAIM_KEYS = ("capabilities", "capabilities_pid", "activity")
 _runtime_status_state_path: Optional[Path] = None
 _runtime_status_state: Optional[dict[str, Any]] = None
 
@@ -164,7 +166,15 @@ def _merge_over_on_disk(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
     writers (the migration's compensator clearing multiplex-owned status, container_boot
     seeding ``desired_state``) stamp this file directly; the gateway's fields win, theirs survive."""
     existing = _read_json_file(path)
-    return {**existing, **payload} if isinstance(existing, dict) else payload
+    if not isinstance(existing, dict):
+        return payload
+    merged = {**existing, **payload}
+    # What THIS process claims about itself (scoped-ESTOP capability, counted activity) is owned by the gateway
+    # writer alone: when the snapshot omits it, a previous process's value on disk must not resurface as true.
+    for key in _PROCESS_CLAIM_KEYS:
+        if key not in payload:
+            merged.pop(key, None)
+    return merged
 
 
 _runtime_status_writer: Optional[_RuntimeStatusWriter] = None
@@ -814,6 +824,39 @@ def _get_code_identity_fields() -> dict[str, Any]:
         return {}
 
 
+# ``capabilities`` of THIS process: pinned at the first publication. A running process keeps serving the
+# code it imported at startup, so a later on-disk change (a release symlink flip under an old gateway) must
+# never upgrade what it claims. ``_UNSET`` = not computed yet; ``None`` = this runtime has no scoped ESTOP.
+_runtime_capabilities_cache: Any = _UNSET
+
+
+def runtime_capabilities() -> Optional[dict[str, Any]]:
+    """What the running gateway can honestly say about scoped ESTOP (``agent.estop.capabilities()``), published as
+    ``capabilities`` in ``gateway_state.json`` so an updater can judge the RUNNING process (the CLI may be newer
+    than the gateway). ``None`` when this runtime lacks it: the key is then omitted, never invented. Never raises."""
+    global _runtime_capabilities_cache
+    if _runtime_capabilities_cache is _UNSET:
+        try:
+            from agent import estop
+
+            caps = estop.capabilities()
+            _runtime_capabilities_cache = copy.deepcopy(caps) if isinstance(caps, dict) and caps else None
+        except Exception:
+            _runtime_capabilities_cache = None
+    return copy.deepcopy(_runtime_capabilities_cache)
+
+
+def _coerce_activity(raw: Any) -> Optional[dict[str, Any]]:
+    """``activity`` record: ``voice_sessions`` is a counted non-negative int or ``None`` (= could not be
+    counted; a reader must fail closed). Anything else is stored as ``None``, never as a zero."""
+    if not isinstance(raw, dict):
+        return None
+    voice = raw.get("voice_sessions")
+    if type(voice) is not int or voice < 0:
+        voice = None
+    return {"voice_sessions": voice, "updated_at": _utc_now_iso()}
+
+
 def _pid_record_belongs_to_current_profile(record: Optional[dict[str, Any]]) -> bool:
     """True when the record's ``hermes_home`` matches the current process (legacy records: True);
     another HERMES_HOME's record must be ignored or the default gateway assumes its identity."""
@@ -1091,7 +1134,7 @@ def _prepare_runtime_status_update(
     error_code: Any = _UNSET, error_message: Any = _UNSET, needs_attention: Any = _UNSET,
     retrying_since: Any = _UNSET, served_profiles: Any = _UNSET, session_store: Any = _UNSET,
     parked_profiles: Any = _UNSET, multiplex_standalone_reason: Any = _UNSET,
-    platform_metrics: Any = _UNSET,
+    platform_metrics: Any = _UNSET, activity: Any = _UNSET,
     ingress_url: Any = _UNSET, listener_base: Any = _UNSET, clear_profile_platforms: bool = False,
     drop_profile_platforms: Optional[str] = None, keep_platforms: Iterable[str] = (),
     load_existing: bool = True, reload_existing: bool = False,
@@ -1119,9 +1162,25 @@ def _prepare_runtime_status_update(
                 if not isinstance(k, str) or ":" not in k
                 or (drop_prefix is not None and not k.startswith(drop_prefix)) or k in keep_platforms
             }
+        if payload.get("pid") != current_record["pid"]:
+            # A record loaded from a previous process: what that process counted is not true of this one.
+            payload.pop("activity", None)
         payload.update({key: current_record[key] for key in ("kind", "pid", "argv", "start_time")})
         payload["updated_at"] = _utc_now_iso()
         payload.update(_get_code_identity_fields())
+        capabilities = runtime_capabilities()
+        if capabilities is None:
+            payload.pop("capabilities", None)   # an older process's claim is never inherited
+        else:
+            # The pid stamp lets a reader reject a claim that outlived its process (an older runtime that
+            # does not know these keys leaves them on disk after a rollback).
+            payload["capabilities"], payload["capabilities_pid"] = capabilities, current_record["pid"]
+        if activity is not _UNSET:
+            record = _coerce_activity(activity)
+            if record is None:
+                payload.pop("activity", None)
+            else:
+                payload["activity"] = {**record, "pid": current_record["pid"]}
         _apply_set_fields(payload, (
             ("gateway_state", gateway_state, None), ("exit_reason", exit_reason, None),
             ("restart_requested", restart_requested, bool),

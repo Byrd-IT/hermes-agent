@@ -286,11 +286,14 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if is_internal:
             return None
         try:
-            from agent.estop import paused_reply as _estop_paused_reply
+            from agent.estop import is_held as _estop_is_held, paused_reply as _estop_paused_reply
         except ImportError:
             return None
         _paused_notice = _estop_paused_reply()
-        if _paused_notice is None or self._hm_estop_turn_allowed(event, source):
+        # A scoped hold may name "heartbeat" without "turns": real user turns keep flowing but a
+        # heartbeat-provenance turn that slipped past the poller's own check is still held.
+        _heartbeat_held = bool(getattr(event, "_heartbeat_session_id", None)) and _estop_is_held("heartbeat")
+        if (_paused_notice is None and not _heartbeat_held) or self._hm_estop_turn_allowed(event, source):
             return None
         if getattr(event, "_heartbeat_session_id", None):
             logger.debug("Heartbeat turn dropped by global emergency stop")

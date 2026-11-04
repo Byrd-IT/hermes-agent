@@ -154,6 +154,13 @@ class GatewayGoalsMixin:
             return
         if local and viewer_driven(adapter.authority, source.chat_id, "viewer_heartbeat"):
             return  # the classic CLI's watchdog fires it: that CLI paints only the turns it submits
+        # `hermes pause` / a scoped "heartbeat" hold: leave the tick unclaimed so it fires after the hold
+        # lifts. Checked BEFORE the authority branch: admit_heartbeat builds an internal event that the
+        # inbound estop gate never sees, so this poller is the only gate that path has.
+        from agent.estop import check_paused
+
+        if check_paused("heartbeat", logger):
+            return
         if getattr(self, 'session_authority', None) is not None:
             from gateway.run_heartbeat_acceptance import admit_heartbeat
             await admit_heartbeat(self, adapter, source, session_id, quick_key)
@@ -164,10 +171,6 @@ class GatewayGoalsMixin:
             or self._queue_depth(quick_key, adapter=adapter) > 0
         ):
             return  # keep missed intervals due until user work has drained
-        from agent.estop import check_paused
-
-        if check_paused("heartbeat", logger):
-            return  # `hermes pause`: leave the tick unclaimed so it fires after `hermes resume`
         from hermes_cli.heartbeat import HeartbeatManager
 
         mgr = HeartbeatManager(session_id=session_id)

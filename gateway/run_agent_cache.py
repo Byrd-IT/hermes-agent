@@ -300,7 +300,11 @@ class GatewayAgentCacheMixin:
         would clobber it). Best-effort: a failed write must never disrupt a turn. The running-turn
         set also feeds the day's peak of chats running at once (in memory, see shared_metrics_busy)."""
         from gateway.run import _write_runtime_status_quiet
-        _write_runtime_status_quiet(active_agents=self._active_work_count())
+        try:
+            activity = self._runtime_activity()
+        except Exception:
+            activity = {"voice_sessions": None}   # cannot be counted: unknown (null), never a stale or invented value
+        _write_runtime_status_quiet(active_agents=self._active_work_count(), activity=activity)
         observe_running_chats(key for key, _ in self._running_agent_items())
 
     def _release_running_agent_state(
