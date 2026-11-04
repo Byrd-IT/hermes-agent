@@ -106,6 +106,15 @@ def test_omitting_capabilities_drops_every_stamp_that_vouched_for_them(home, mon
     assert not ({"capabilities", "capabilities_pid", "capabilities_start_time"} & set(rec))
 
 
+def test_no_process_start_time_means_no_capability_claim_at_all(home, monkeypatch):
+    """Without /proc the stamp would be null on both sides and 'match' a reused pid's: publish nothing."""
+    monkeypatch.setattr(status, "_get_process_start_time", lambda pid: None)
+    status.write_runtime_status(gateway_state="running", wait_timeout=10)
+    rec = _state(home)
+    assert rec["start_time"] is None
+    assert not ({"capabilities", "capabilities_pid", "capabilities_start_time"} & set(rec))
+
+
 def test_stale_pid_stamps_on_disk_are_not_resurrected(home, monkeypatch):
     path = home / "gateway_state.json"
     path.write_text(json.dumps({"pid": 1, "gateway_state": "running", "capabilities": {"scoped_estop": 1},

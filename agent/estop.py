@@ -77,6 +77,9 @@ except ImportError:
 # Windows has no blocking flock: poll a 1-byte lock up to this long, then fail the write.
 _LOCK_TIMEOUT_S = 30.0
 _LOCK_POLL_S = 0.05
+# errnos msvcrt.locking raises while another process holds the byte (EACCES; EDEADLOCK after its own 10 tries).
+_LOCK_CONTENTION_ERRNOS = frozenset(
+    e for e in (errno.EACCES, errno.EAGAIN, getattr(errno, "EDEADLK", None), getattr(errno, "EDEADLOCK", None)) if e)
 
 SENTINEL_NAME = "ESTOP"
 LOCK_NAME = "ESTOP.lock"
@@ -340,14 +343,20 @@ def _locked(directory: Path) -> Iterator[None]:
             def unlock() -> None:
                 fcntl.flock(fd, fcntl.LOCK_UN)
         else:
+            # msvcrt locks a byte range and fails on an empty file: seed one byte first (the same
+            # convention as gateway/status.py::_try_acquire_file_lock and agent/vault_store.py).
+            if os.fstat(fd).st_size == 0:
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.write(fd, b"\n")
             deadline = time.monotonic() + _LOCK_TIMEOUT_S
             while True:
                 os.lseek(fd, 0, os.SEEK_SET)
                 try:
                     msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
                     break
-                except OSError:
-                    if time.monotonic() >= deadline:
+                except OSError as exc:
+                    # Only contention is retried; any other failure (bad handle, unusable file) is real.
+                    if exc.errno not in _LOCK_CONTENTION_ERRNOS or time.monotonic() >= deadline:
                         raise
                     time.sleep(_LOCK_POLL_S)
 
