@@ -783,3 +783,19 @@ def test_a_clean_claim_leaves_nothing_behind_and_a_second_claim_finds_nothing(ho
     assert rii.claim_request(home)[0] is not None
     assert rii.claim_request(home) is None
     assert not [p for p in home.iterdir() if "restart_if_idle" in p.name]
+
+
+def test_a_profile_gateway_authenticates_against_the_hold_the_updater_keeps_at_the_fleet_root(tmp_path, monkeypatch):
+    """The updater's hold lives at the fleet root; a profile gateway (HERMES_HOME=<root>/profiles/<n>) sees it
+    through the same union every other estop gate uses, and its own request files live in ITS home."""
+    root = tmp_path / "fleet"
+    prof = root / "profiles" / "ops"
+    prof.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(prof))
+    monkeypatch.setattr(status, "_runtime_status_state", None)
+    monkeypatch.setattr(status, "_runtime_status_state_path", None)
+    h = estop.engage_scoped(BG + [estop.SCOPE_TURNS], owner=OWNER, ttl_s=120, reason="t", home=root)
+    pid, start = _me()
+    body = _request(prof, h)
+    assert rii.validate_request(json.dumps(body).encode(), pid=pid, start_time=start, now=time.time())[1] is None
+    assert rii._home() == prof
