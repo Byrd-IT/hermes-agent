@@ -844,7 +844,17 @@ def runtime_capabilities() -> Optional[dict[str, Any]]:
             _runtime_capabilities_cache = copy.deepcopy(caps) if isinstance(caps, dict) and caps else None
         except Exception:
             _runtime_capabilities_cache = None
-    return copy.deepcopy(_runtime_capabilities_cache)
+    caps = copy.deepcopy(_runtime_capabilities_cache)
+    if caps is not None:
+        # Conditional restart (``gateway/restart_if_idle.py``) is claimed only while THIS process's request poller is
+        # alive: being able to import the code is not listening for requests. Never pinned in the cache above.
+        try:
+            from gateway import restart_if_idle
+            if restart_if_idle.is_active():
+                caps["restart_if_idle"] = restart_if_idle.PROTOCOL_VERSION
+        except Exception:
+            pass
+    return caps
 
 
 def _coerce_activity(raw: Any) -> Optional[dict[str, Any]]:
