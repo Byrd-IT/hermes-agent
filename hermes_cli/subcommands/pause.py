@@ -8,7 +8,7 @@ notice. ``resume`` removes it and operation resumes on the next tick — no rest
 ``pause --scope …`` is the *scoped* form used by maintenance tooling: an owned, deadman-bounded hold
 on only the named scopes (e.g. ``background``: kanban, cron, cron-misfire, cron-webhook, heartbeat,
 loop) that leaves user turns running. See ``agent.estop`` for the semantics; this module is the same
-operations for callers that shell out (``--json`` replies; exit codes 0 ok, 2 conflict, 3 lost, 4 invalid).
+operations for callers that shell out (``--json`` replies; exit codes 0 ok, 1 could not write the pause, 2 conflict, 3 lost, 4 invalid).
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import json
 import math
 import time
 
-EXIT_OK, EXIT_CONFLICT, EXIT_LOST, EXIT_INVALID = 0, 2, 3, 4
+EXIT_OK, EXIT_FAILED, EXIT_CONFLICT, EXIT_LOST, EXIT_INVALID = 0, 1, 2, 3, 4
 
 _SCOPE_ALIASES = {"background": "BACKGROUND_SCOPES", "all": "ALL_SCOPES"}
 
@@ -142,7 +142,11 @@ def cmd_pause(args: argparse.Namespace) -> int:
 
     reason = getattr(args, "reason", None)
     already = is_engaged()
-    path = engage(reason=reason)
+    try:
+        path = engage(reason=reason)
+    except OSError as exc:
+        # Never claim a pause that is not in place.
+        return _fail(args, EXIT_FAILED, "failed", f"could not engage the pause — Hermes is NOT paused ({exc})")
     state = get_state() or {}
     verb = "Still paused" if already else "Hermes paused"
     detail = f" — reason: {state['reason']}" if state.get("reason") else ""
@@ -204,7 +208,7 @@ def build_pause_parser(subparsers) -> None:
                               help="Use the fleet-root sentinel (honored by every profile gateway) instead of this profile's")
     pause_parser.add_argument("--status", action="store_true", help="Print the effective hold(s) and exit")
     pause_parser.add_argument("--capabilities", action="store_true",
-                              help="Print the runtime's scoped-pause capabilities and exit (updaters gate on this)")
+                              help="Print THIS CLI's scoped-pause capabilities and exit. Not proof about the running gateway: updaters read the 'capabilities' claim in the gateway's gateway_state.json (pid-stamped)")
     pause_parser.add_argument("--json", action="store_true", help="Machine-readable output for scoped/status/capabilities")
     pause_parser.set_defaults(func=cmd_pause)
 

@@ -1157,7 +1157,11 @@ class GatewayBusySessionMixin:
         if state is not None and not args:
             suffix = t("gateway.pause.reason_suffix", reason=state.get("reason")) if state.get("reason") else ""
             return t("gateway.pause.already_paused", suffix=suffix)
-        estop.engage(reason=args or None)
+        try:
+            estop.engage(reason=args or None)
+        except OSError as exc:
+            # Never claim a pause that is not in place (disk full / unwritable home).
+            return f"⚠️ Could not pause: Hermes is NOT paused ({exc})."
         suffix = t("gateway.pause.reason_suffix", reason=args) if args else ""
         return t("gateway.pause.paused", suffix=suffix)
 
