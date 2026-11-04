@@ -47,8 +47,8 @@ _reaper: Optional[threading.Thread] = None
 def reset() -> None:
     """Forget all variant bookkeeping and stop the reaper (``shutdown_mcp_servers`` wildcard)."""
     global _reaper
-    _reaper_stop.set()
     with _guard:
+        _reaper_stop.set()
         _pending.clear()
         _last_used.clear()
         _connect_locks.clear()
@@ -131,11 +131,12 @@ def _reaper_loop(stop: threading.Event) -> None:
 
 
 def _ensure_reaper() -> None:
-    global _reaper
+    global _reaper, _reaper_stop
     with _guard:
         if _reaper is not None and _reaper.is_alive():
             return
-        _reaper_stop.clear()
+        # Never clear the event an older thread still observes after reset.
+        _reaper_stop = threading.Event()
         # health: allow HX012 -- the reaper must NOT inherit a request's bound client env or profile scope
         _reaper = threading.Thread(target=_reaper_loop, args=(_reaper_stop,),
                                    name="mcp-session-env-reaper", daemon=True)
@@ -241,38 +242,35 @@ def _close(keys, *, protect_in_use: bool = False, decided_at: Optional[float] = 
     """
     if not keys:
         return 0
-    if protect_in_use:
-        with _guard:
-            keys = [k for k in keys
-                    if not _variant_busy(k)
-                    and (decided_at is None or _last_used.get(k, 0) <= decided_at)]
-    if not keys:
-        return 0
-    with _core._lock:
-        servers = [(k, _core._servers.pop(k, None)) for k in keys]
-        for k in keys:
-            _core._server_scope_keys.pop(k, None)
-    for k in keys:
-        with _guard:
-            _pending.pop(k, None)
-            _last_used.pop(k, None)
-            _connect_locks.pop(k, None)
-        _core._tool_read_only_hints.pop(k, None)
-        _forget_ledgers(k)
     from tools import mcp_tool_loop as _loop
 
     async def _shutdown():
+        # RPC tasks and teardown run on the same loop. Re-check here, not on
+        # the reaper thread before scheduling, or a call may start in between.
+        with _core._lock, _guard:
+            selected = [k for k in keys if not protect_in_use or (
+                not _variant_busy(k)
+                and (decided_at is None or _last_used.get(k, 0) <= decided_at))]
+            servers = [(k, _core._servers.pop(k, None)) for k in selected]
+            for k in selected:
+                _core._server_scope_keys.pop(k, None)
+                _pending.pop(k, None)
+                _last_used.pop(k, None)
+                _connect_locks.pop(k, None)
+                _core._tool_read_only_hints.pop(k, None)
+                _forget_ledgers(k)
         for _, server in servers:
             if server is not None:
                 try:
                     await server.shutdown()
                 except Exception:  # health: allow BLE001 -- best-effort close, logged without exception payloads
                     logger.debug("MCP session-env variant shutdown failed")
+        return len(selected)
     try:
-        _loop._run_on_mcp_loop(_shutdown, timeout=20)
+        return _loop._run_on_mcp_loop(_shutdown, timeout=20)
     except Exception:  # health: allow BLE001 -- best-effort close, logged
         logger.debug("MCP session-env variant close could not reach the loop")
-    return len(keys)
+        return 0
 
 
 def ensure_connected(server_name: str, key) -> Optional[object]:
