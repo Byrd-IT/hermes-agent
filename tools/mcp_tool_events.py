@@ -460,13 +460,17 @@ def _make_events_handler(op: str, label: str, rpc, *, needs_name: bool = True, n
 
             async def _call():
                 async with server._rpc_lock:
+                    from tools.mcp_tool_session_env import call_is_current
+                    if not call_is_current(server_name, server):
+                        return tool_error("MCP server is not connected")
                     result = await rpc(server.session, args, server_name)
                 return json.dumps(result, ensure_ascii=False)
             return _handlers._dispatch(
                 server_name, server, op, _call, tool_timeout,
                 (_handlers._handle_auth_error_and_retry, _handlers._handle_session_expired_and_retry),
                 lambda exc: logger.error("MCP %s/%s failed: %s", server_name, label, exc))
-        return _handler
+        from tools.mcp_tool_session_env import protect_call
+        return protect_call(server_name, _handler)
     return _factory
 
 

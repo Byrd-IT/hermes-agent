@@ -145,7 +145,7 @@ def _running_loop() -> Optional[asyncio.AbstractEventLoop]:
     return loop if loop is not None and loop.is_running() else None
 
 
-def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
+def _run_on_mcp_loop(coro_or_factory, timeout: float = 30, *, on_discard=None):
     """Schedule a coroutine (or zero-arg factory — avoids leaking a never-awaited coroutine when the
     loop is down) on the MCP loop and block until done, polling so user interrupts are honored."""
     from tools.interrupt import is_interrupted
@@ -165,13 +165,20 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
         raise RuntimeError("MCP event loop unavailable (failed to schedule)")
     start_time = time.monotonic()
     deadline = None if timeout is None else start_time + timeout
+    def abandon():
+        # cancel() loses the race when a resource-producing task already completed.
+        if not future.cancel() and on_discard is not None and not future.cancelled():
+            if future.exception() is None:
+                safe_schedule_threadsafe(on_discard(future.result()), loop, logger=logger,
+                                         log_message="MCP discarded-result cleanup scheduling failed")
+
     while True:
         if is_interrupted():
-            future.cancel()
+            abandon()
             raise InterruptedError("User sent a new message")
         remaining = 0.1 if deadline is None else deadline - time.monotonic()
         if remaining <= 0:
-            future.cancel()
+            abandon()
             raise TimeoutError(f"MCP call timed out after {time.monotonic() - start_time:.1f}s "
                                f"(configured timeout: {float(timeout):.1f}s)")
         try:

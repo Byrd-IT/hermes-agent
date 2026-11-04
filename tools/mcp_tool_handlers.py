@@ -725,6 +725,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
 
         async def _call():
             async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):
+                from tools.mcp_tool_session_env import call_is_current
+                if not call_is_current(server_name, server):
+                    return tool_error("MCP server is not connected")
                 server._pending_call_context = contextvars.copy_context()  # for the elicitation callback
                 try:
                     result = await _call_tool_racing_stdio_death(
@@ -746,7 +749,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
             _on_failure, record_outcome=True)
         # Off the MCP loop on purpose: image prep is CPU work (bounded vision pool) that must not stall other servers' I/O.
         return _mcp_result_with_native_images(text, image_paths) if native_images and not _result_is_error(text) else text
-    return _handler
+    from tools.mcp_tool_session_env import protect_call
+    return protect_call(server_name, _handler)
 
 
 def _make_utility_handler(op: str, log_label: str, rpc, render, required: Optional[str] = None):
@@ -764,13 +768,17 @@ def _make_utility_handler(op: str, log_label: str, rpc, render, required: Option
 
             async def _call():
                 async with server._rpc_lock:
+                    from tools.mcp_tool_session_env import call_is_current
+                    if not call_is_current(server_name, server):
+                        return tool_error("MCP server is not connected")
                     result = await rpc(server.session, args, server_name)
                 return json.dumps(render(result, server_name), ensure_ascii=False)
             return _dispatch(
                 server_name, server, op, _call, tool_timeout,
                 (_handle_auth_error_and_retry, _handle_session_expired_and_retry),
                 lambda exc: logger.error("MCP %s/%s failed: %s", server_name, log_label, exc))
-        return _handler
+        from tools.mcp_tool_session_env import protect_call
+        return protect_call(server_name, _handler)
     return _factory
 
 

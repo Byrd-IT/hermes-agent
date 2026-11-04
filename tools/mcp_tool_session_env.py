@@ -15,7 +15,12 @@ idle (``_IDLE_TTL_SEC``) or past ``_MAX_VARIANTS`` (least recently used first).
 """
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import hashlib
+import itertools
+from contextvars import ContextVar
+from functools import wraps
 import hmac
 import json
 import os
@@ -35,6 +40,10 @@ _MAX_VARIANTS = 16
 _pending: dict = {}      # variant key -> (base key, {name: value}); values stay in memory only
 _last_used: dict = {}    # variant key -> monotonic time
 _connect_locks: dict = {}
+_call_leases: dict = {}
+_base_epochs: dict = {}
+_epoch_sequence = itertools.count()
+_bound_keys: ContextVar[dict] = ContextVar("mcp_variant_call_keys", default={})
 _retry_after: dict = {}  # variant key -> monotonic deadline after a failed connect (no respawn storm)
 _CONNECT_RETRY_COOLDOWN_SEC = 30.0
 _guard = threading.Lock()
@@ -47,7 +56,8 @@ _reaper: Optional[threading.Thread] = None
 def reset() -> None:
     """Forget all variant bookkeeping and stop the reaper (``shutdown_mcp_servers`` wildcard)."""
     global _reaper
-    with _guard:
+    with _core._lock, _guard:
+        _base_epochs.clear()
         _reaper_stop.set()
         _pending.clear()
         _last_used.clear()
@@ -80,19 +90,13 @@ def close_for_bases(base_keys) -> int:
     bases = set(base_keys)
     if not bases:
         return 0
-    with _guard:
-        doomed = [k for k, (b, _) in _pending.items() if b in bases]
-    _close([k for k in doomed if k in _core._servers])
-    with _guard:
-        for k in doomed:
-            _pending.pop(k, None)
-            _last_used.pop(k, None)
-            _connect_locks.pop(k, None)
-    return len(doomed)
+    return _close((), base_keys=bases)
 
 
 def _variant_busy(key) -> bool:
     """True when a call is in flight. Eviction and the idle reaper must not close it."""
+    if _call_leases.get(key, 0):
+        return True
     server = _core._servers.get(key)
     if server is None:
         return False
@@ -113,9 +117,10 @@ def reap_idle(now: Optional[float] = None) -> int:
         idle = [k for k, t in _last_used.items() if now - t > _IDLE_TTL_SEC]
     connected = [k for k in idle if k in _core._servers]
     live = [k for k in connected if not _variant_busy(k)]
-    with _guard:
+    with _core._lock, _guard:
         for k in idle:
-            if k not in connected:
+            if (k not in _core._servers and not _variant_busy(k)
+                    and now - _last_used.get(k, now) > _IDLE_TTL_SEC):
                 _pending.pop(k, None)
                 _last_used.pop(k, None)
                 _connect_locks.pop(k, None)
@@ -178,6 +183,9 @@ def _base_config(base_key):
 def variant_key(base_key):
     """The variant key a call from the bound session must use for *base_key*, else None (not
     opted in, no bound client env, or the client sent none of the declared names)."""
+    bound = _bound_keys.get()
+    if base_key in bound:
+        return bound[base_key]
     from agent.session_client_env import bound_client_env
     env = bound_client_env()
     if not env or is_variant_key(base_key):
@@ -192,11 +200,13 @@ def variant_key(base_key):
     # The base config's identity is part of the digest: editing the server's command/args/env makes
     # the next call use a fresh variant instead of the one still running the old config.
     ident = json.dumps([values, _plain(_base_config(base_key))], sort_keys=True, default=str)
-    digest = hashlib.sha256(ident.encode()).hexdigest()[:16]
     scope, name = (base_key if isinstance(base_key, tuple) else (None, base_key))
-    key = (f"{scope or ''}{MARK}{digest}", name)
     with _guard:
-        _pending[key] = (base_key, values)
+        if base_key not in _base_epochs:
+            _base_epochs[base_key] = next(_epoch_sequence)
+        digest = hashlib.sha256(f"{_base_epochs[base_key]}:{ident}".encode()).hexdigest()[:16]
+        key = (f"{scope or ''}{MARK}{digest}", name)
+        _pending.setdefault(key, (base_key, values))
         _last_used[key] = time.monotonic()
     return key
 
@@ -235,12 +245,12 @@ def _evict(now: float, keep=None) -> list:
         return stale + rest[:extra]
 
 
-def _close(keys, *, protect_in_use: bool = False, decided_at: Optional[float] = None) -> int:
+def _close(keys, *, base_keys=None, protect_in_use: bool = False, decided_at: Optional[float] = None) -> int:
     """Close variant servers. With ``protect_in_use``, skip a key that became busy or was
     touched after ``decided_at`` (a call resolved it between the snapshot and this close).
     Returns how many were closed. Shutdown passes neither flag and always closes.
     """
-    if not keys:
+    if not keys and not base_keys:
         return 0
     from tools import mcp_tool_loop as _loop
 
@@ -248,7 +258,11 @@ def _close(keys, *, protect_in_use: bool = False, decided_at: Optional[float] = 
         # RPC tasks and teardown run on the same loop. Re-check here, not on
         # the reaper thread before scheduling, or a call may start in between.
         with _core._lock, _guard:
-            selected = [k for k in keys if not protect_in_use or (
+            candidates = ([k for k, (base, _) in _pending.items() if base in base_keys]
+                          if base_keys else keys)
+            for base in base_keys or ():
+                _base_epochs.pop(base, None)
+            selected = [k for k in candidates if not protect_in_use or (
                 not _variant_busy(k)
                 and (decided_at is None or _last_used.get(k, 0) <= decided_at))]
             servers = [(k, _core._servers.pop(k, None)) for k in selected]
@@ -259,18 +273,71 @@ def _close(keys, *, protect_in_use: bool = False, decided_at: Optional[float] = 
                 _connect_locks.pop(k, None)
                 _core._tool_read_only_hints.pop(k, None)
                 _forget_ledgers(k)
+        cancelled = None
         for _, server in servers:
             if server is not None:
                 try:
                     await server.shutdown()
+                except asyncio.CancelledError as exc:
+                    cancelled = exc
                 except Exception:  # health: allow BLE001 -- best-effort close, logged without exception payloads
                     logger.debug("MCP session-env variant shutdown failed")
-        return len(selected)
+        if cancelled is not None:
+            raise cancelled
+        return sum(server is not None for _, server in servers)
     try:
         return _loop._run_on_mcp_loop(_shutdown, timeout=20)
+    except concurrent.futures.CancelledError:
+        raise
     except Exception:  # health: allow BLE001 -- best-effort close, logged
         logger.debug("MCP session-env variant close could not reach the loop")
         return 0
+
+
+def call_is_current(server_name, server) -> bool:
+    """A queued variant RPC cannot use a connection removed by explicit teardown."""
+    from tools.mcp_tool_scope import _resolve_shared_key
+    with _core._lock:
+        key = _bound_keys.get().get(_resolve_shared_key(server_name))
+        with _guard:
+            return key is None or (key in _pending and _core._servers.get(key) is server)
+
+
+async def _shutdown_discarded(server):
+    if server is not None:
+        try:
+            await server.shutdown()
+        except Exception:  # health: allow BLE001 -- cleanup is best-effort, without payloads
+            logger.debug("MCP session-env discarded connection shutdown failed")
+
+
+def protect_call(server_name, handler):
+    """Lease a variant before lookup and pin its identity until the call returns."""
+    @wraps(handler)
+    def call(*args, **kwargs):
+        from tools.mcp_tool_scope import _resolve_server_key
+        with _core._lock:
+            key = _resolve_server_key(server_name)
+            with _guard:
+                leased = is_variant_key(key) and key in _pending
+                if leased:
+                    _call_leases[key] = _call_leases.get(key, 0) + 1
+                    base = _pending[key][0]
+                    token = _bound_keys.set({**_bound_keys.get(), base: key})
+        try:
+            return handler(*args, **kwargs)
+        finally:
+            if leased:
+                _bound_keys.reset(token)
+                with _guard:
+                    remaining = _call_leases[key] - 1
+                    if remaining:
+                        _call_leases[key] = remaining
+                    else:
+                        _call_leases.pop(key)
+                    if key in _pending:
+                        _last_used[key] = time.monotonic()
+    return call
 
 
 def ensure_connected(server_name: str, key) -> Optional[object]:
@@ -279,6 +346,8 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
     from tools.mcp_tool_discovery import _connect_server
 
     with _guard:
+        if key not in _pending:
+            return None
         _last_used[key] = time.monotonic()
         lock = _connect_locks.setdefault(key, threading.Lock())
     with lock:
@@ -305,6 +374,9 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
         stale = server  # a variant whose session dropped (recycle, backoff): replaced, never orphaned
 
         async def _go():
+            with _guard:
+                if _pending.get(key) is not pending:
+                    return None
             if stale is not None:
                 try:
                     await stale.shutdown()
@@ -330,21 +402,28 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
                 _core._connect_server_claim.reset(token)
         try:
             server = _loop._run_on_mcp_loop(
-                _go, timeout=float(config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT)) + 30.0)
-        except BaseException as exc:  # health: allow BLE001 -- a failed variant connect must not break the call; logged
-            logger.warning("MCP server '%s': per-session connection failed (%s)", server_name, type(exc).__name__)
+                _go, timeout=float(config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT)) + 30.0,
+                on_discard=_shutdown_discarded)
+        except InterruptedError:
+            raise
+        except Exception:  # health: allow BLE001 -- failed connects cool down without exposing payloads
+            logger.warning("MCP per-session connection failed")
             with _guard:
-                _pending.pop(key, None)
-                _last_used.pop(key, None)
-                _connect_locks.pop(key, None)
-            _forget_ledgers(key)
-            with _guard:
-                _retry_after[key] = time.monotonic() + _CONNECT_RETRY_COOLDOWN_SEC
+                if _pending.get(key) is pending:
+                    _forget_ledgers(key)
+                    _retry_after[key] = time.monotonic() + _CONNECT_RETRY_COOLDOWN_SEC
+            _ensure_reaper()
             return None
-        _forget_ledgers(key)  # a fresh handshake starts the variant's own breaker clean
-        with _core._lock:
-            _core._servers[key] = server
-            _core._server_scope_keys[key] = key[0]
+        with _core._lock, _guard:
+            current = server is not None and _pending.get(key) is pending
+            if current:
+                _forget_ledgers(key)
+                _core._servers[key] = server
+                _core._server_scope_keys[key] = key[0]
+        if not current:
+            if server is not None:
+                _loop._run_on_mcp_loop(lambda: _shutdown_discarded(server), timeout=20)
+            return None
         _ensure_reaper()
         return server
 
