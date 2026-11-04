@@ -740,3 +740,46 @@ def test_after_expiry_no_late_decision_can_accept(home, hold, monkeypatch):
     t["now"] = body["expires_at"]                    # the loop only got to it at the very expiry
     runner.handle_restart_if_idle_request()
     assert _ack(home)["result"] == "refused_invalid" and runner._restart_task_started is False
+
+
+# ── the real runner, unmodified; the bootstrap wiring; the poller's behaviour on a request it cannot consume ─────
+
+
+def test_an_unmodified_runner_reads_as_idle_with_every_source_readable():
+    """No test double for any work source: the real counting methods all work on a real runner (a source that raised
+    would make every conditional restart on a real gateway 'unknown activity', i.e. never accepted)."""
+    runner, _ = make_restart_runner()
+    assert rii.idle_probe(runner) == {"busy": {}, "unknown": []}
+
+
+def test_bootstrap_starts_the_poller_only_once_ready_and_stops_it_on_every_exit():
+    import inspect
+    from gateway import run_bootstrap
+    src = inspect.getsource(run_bootstrap)
+    ready = src.index("publish_gateway_runtime_ready(runner)")
+    attach = src.index("restart_if_idle.attach_watcher(runner, loop)")
+    watchdog = src.index("runner._start_systemd_watchdog()", ready)
+    assert ready < attach < watchdog                      # the claim appears only after READY
+    assert src.count("restart_if_idle.detach_watcher(runner)") >= 2      # normal shutdown tail AND the error exit
+
+
+@pytest.mark.asyncio
+async def test_a_request_that_cannot_be_consumed_is_retried_with_a_growing_pause_not_every_poll(home, hold, monkeypatch):
+    runner = _runner()
+    calls = []
+    runner.handle_restart_if_idle_request = lambda: calls.append(time.monotonic())     # consumes nothing
+    _put(home, _request(home, hold))
+    stop, thread = rii.start_watcher(runner, asyncio.get_running_loop(), poll_interval=0.02)
+    try:
+        await asyncio.sleep(1.0)
+    finally:
+        stop.set()
+        thread.join(2)
+    assert 2 <= len(calls) <= 8                           # 0.05, 0.1, 0.2, 0.4 ... not 50
+
+
+def test_a_clean_claim_leaves_nothing_behind_and_a_second_claim_finds_nothing(home, hold):
+    _put(home, _request(home, hold))
+    assert rii.claim_request(home)[0] is not None
+    assert rii.claim_request(home) is None
+    assert not [p for p in home.iterdir() if "restart_if_idle" in p.name]
