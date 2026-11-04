@@ -1,5 +1,7 @@
 """Carry diagnostics never echo arbitrary repository or child-process data."""
 import logging
+import base64
+from urllib.parse import quote
 import subprocess
 
 import pytest
@@ -37,7 +39,13 @@ def test_diagnostics_omit_untrusted_values(value, tmp_path, monkeypatch, capsys,
     monkeypatch.setattr(carry, "plan_repo", fail)
     assert carry.main(["--repo", str(tmp_path)]) == 1
     outputs.append(capsys.readouterr().err)
+    with pytest.raises(SystemExit) as invalid:
+        carry.main(["--unknown", value])
+    assert invalid.value.code == 2
+    outputs.append(capsys.readouterr().err)
     for output in outputs:
+        assert quote(value, safe="") not in output
+        assert base64.b64encode(value.encode()).decode().rstrip("=") not in output
         assert value not in output
         assert "ABC123" not in output
         assert "synthetic-user" not in output

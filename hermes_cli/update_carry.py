@@ -132,7 +132,7 @@ def _updates_section() -> dict:
     try:
         from hermes_cli.update_cmd import _updates_config
         return _updates_config()
-    except Exception:
+    except Exception:  # health: allow BLE001 -- boundary omits credential-bearing exception text
         logger.error("carry-reapply could not read config; using dry-run")
         return {}
 
@@ -846,7 +846,7 @@ def apply_in_worktree(
                 raise CarryError("replayed edits are not in the integration head")
     except CarryError:
         raise
-    except Exception:
+    except Exception:  # health: allow BLE001 -- boundary omits credential-bearing exception text
         logger.error("carry-reapply worktree replay failed")
         raise CarryError("worktree replay failed; integration retained for inspection") from None
     after = _ok(_git(repo, ["rev-parse", "HEAD"], git_bin=git_bin), "rev-parse").strip()
@@ -1090,7 +1090,7 @@ def reapply_after_diverged_reset(git_cmd, cwd, *, pre_pull_sha: str, upstream_re
             print(format_report(plan, quiet=False))
             return
         _replay_in_place(Path(cwd), plan, git_bin=git_bin)
-    except Exception:
+    except Exception:  # health: allow BLE001 -- boundary omits credential-bearing exception text
         logger.error("carry-reapply after diverged reset failed")
         print("carry-reapply: skipped; the update result is unchanged")
 
@@ -1109,7 +1109,7 @@ def reapply_parked_stash(git_cmd, cwd, stash_ref: str) -> None:
             print(format_report(plan, quiet=False))
             return
         _replay_in_place(Path(cwd), plan, git_bin=git_bin)
-    except Exception:
+    except Exception:  # health: allow BLE001 -- boundary omits credential-bearing exception text
         logger.error("carry-reapply parked stash failed")
         print("carry-reapply: stash left parked; nothing was dropped")
 
@@ -1126,8 +1126,14 @@ def _replay_in_place(cwd: Path, plan: dict, *, git_bin: str = "git") -> None:
     print(format_report(plan, quiet=False))
 
 
+class _CarryParser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(2, "carry-reapply: invalid arguments; use --help\n")
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="hermes_cli.update_carry")
+    parser = _CarryParser(prog="hermes_cli.update_carry")
     parser.add_argument("--repo", default=".", help="Checkout to read. Not modified unless --in-place.")
     parser.add_argument("--upstream", default="origin/main")
     parser.add_argument("--tip", default=None, help="Classify this commit (a rescue ref) instead of HEAD.")
@@ -1202,7 +1208,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             sys.stdout.write(text + "\n")
         return 0 if report["verification"]["ok"] else 2
-    except Exception:
+    except Exception:  # health: allow BLE001 -- boundary omits credential-bearing exception text
         # Paths, subprocess arguments and exception messages can contain credentials.
         sys.stderr.write("carry-reapply failed; source refs and integration are retained\n")
         return 1
