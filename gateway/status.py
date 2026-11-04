@@ -156,7 +156,8 @@ class _RuntimeStatusWriter:
 
 _runtime_status_state_lock = threading.RLock()
 # ``gateway_state.json`` keys that are claims about the writing process itself (see ``_merge_over_on_disk``).
-_PROCESS_CLAIM_KEYS = ("capabilities", "capabilities_pid", "activity")
+_CAPABILITY_CLAIM_KEYS = ("capabilities", "capabilities_pid", "capabilities_start_time")
+_PROCESS_CLAIM_KEYS = (*_CAPABILITY_CLAIM_KEYS, "activity")
 _runtime_status_state_path: Optional[Path] = None
 _runtime_status_state: Optional[dict[str, Any]] = None
 
@@ -1170,11 +1171,14 @@ def _prepare_runtime_status_update(
         payload.update(_get_code_identity_fields())
         capabilities = runtime_capabilities()
         if capabilities is None:
-            payload.pop("capabilities", None)   # an older process's claim is never inherited
+            # An older process's claim is never inherited — neither the claim nor the stamps that vouch for it.
+            for key in _CAPABILITY_CLAIM_KEYS:
+                payload.pop(key, None)
         else:
-            # The pid stamp lets a reader reject a claim that outlived its process (an older runtime that
-            # does not know these keys leaves them on disk after a rollback).
+            # The pid + start_time stamps let a reader reject a claim that outlived its process (an older
+            # runtime that does not know these keys leaves them on disk after a rollback, and a pid can be reused).
             payload["capabilities"], payload["capabilities_pid"] = capabilities, current_record["pid"]
+            payload["capabilities_start_time"] = current_record["start_time"]
         if activity is not _UNSET:
             record = _coerce_activity(activity)
             if record is None:

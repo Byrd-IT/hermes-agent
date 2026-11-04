@@ -82,6 +82,44 @@ def test_stale_capabilities_from_a_previous_process_are_not_inherited(home, monk
     assert "capabilities" not in _state(home)
 
 
+def test_capability_claim_is_stamped_with_pid_and_start_time_of_its_process(home):
+    """A pid can be reused after a rollback: the start time vouches for the claim as well."""
+    status.write_runtime_status(gateway_state="running", wait_timeout=10)
+    rec = _state(home)
+    assert rec["capabilities_start_time"] == rec["start_time"]
+    assert rec["capabilities_pid"] == rec["pid"]
+
+
+def test_omitting_capabilities_drops_every_stamp_that_vouched_for_them(home, monkeypatch):
+    """A claim that is no longer made must not leave a pid/start_time stamp behind: after a rollback to a
+    runtime without scoped ESTOP a reused pid would otherwise make a stale claim look current."""
+    status.write_runtime_status(gateway_state="running", wait_timeout=10)
+    assert {"capabilities", "capabilities_pid", "capabilities_start_time"} <= set(_state(home))
+    # A new process (this one, as far as the writer can tell, but with no capability API) reloads the record.
+    def boom():
+        raise AttributeError("old runtime")
+
+    monkeypatch.setattr(estop, "capabilities", boom)
+    monkeypatch.setattr(status, "_runtime_capabilities_cache", status._UNSET)
+    status.write_runtime_status(active_agents=1, reload_existing=True, wait_timeout=10)
+    rec = _state(home)
+    assert not ({"capabilities", "capabilities_pid", "capabilities_start_time"} & set(rec))
+
+
+def test_stale_pid_stamps_on_disk_are_not_resurrected(home, monkeypatch):
+    path = home / "gateway_state.json"
+    path.write_text(json.dumps({"pid": 1, "gateway_state": "running", "capabilities": {"scoped_estop": 1},
+                                "capabilities_pid": 1, "capabilities_start_time": 5}))
+
+    def boom():
+        raise AttributeError("old runtime")
+
+    monkeypatch.setattr(estop, "capabilities", boom)
+    status.write_runtime_status(gateway_state="running", reload_existing=True, wait_timeout=10)
+    rec = _state(home)
+    assert "capabilities_pid" not in rec and "capabilities_start_time" not in rec
+
+
 def test_capabilities_are_pinned_at_first_publication_not_recomputed_after_files_change(home, monkeypatch):
     """A process keeps serving the code it started with; a later on-disk change must not upgrade its claim."""
     status.write_runtime_status(gateway_state="running", wait_timeout=10)
