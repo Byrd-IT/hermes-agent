@@ -23,7 +23,17 @@ def test_connect_cannot_publish_after_teardown_or_swallow_interrupt(
     base = "lifetime"
     _core._lazy_server_configs[base] = {"command": "unused", "session_env": ["RUN_PIN"]}
     server = SimpleNamespace(session=object(), shutdown=AsyncMock())
-    loop._ensure_mcp_loop()
+
+    def close_fenced(server):
+        import asyncio
+        import threading
+        asyncio.run(se._shutdown_discarded(server))
+        finished = threading.Event()
+        finished.set()
+        return finished
+
+    monkeypatch.setattr(se, "_schedule_fenced_close", close_fenced)
+    monkeypatch.setattr(loop, "_ensure_mcp_loop", lambda: None)
     monkeypatch.setattr(se, "_ensure_reaper", lambda: None)
     monkeypatch.setattr(se, "_render", lambda config, values: config)
 
