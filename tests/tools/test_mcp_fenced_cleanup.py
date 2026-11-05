@@ -1,10 +1,9 @@
 """A timed-out fenced close must still shut the server down.
 
 ``ensure_connected`` waits for that close on the MCP loop. The wait's cancel
-must not leave the server half-closed: the close hands the server to
-``on_discard``, which finishes shutdown in its own task. A cancel before that
-coroutine is stepped, and loop stop or drain dropping the discard task, are
-deferred.
+must not leave the server half-closed: once started the shielded task continues
+independently. A cancel before that coroutine is stepped, and loop stop or drain
+dropping the cleanup task, are deferred.
 """
 import asyncio
 import threading
@@ -143,6 +142,7 @@ def test_fenced_cleanup_finishes_after_waiter_cancels_in_progress_close(mcp_loop
         assert not finished.is_set()
         mcp_loop.call_soon_threadsafe(release.set)
         assert finished.wait(5), "close did not finish after the waiter cancelled it"
+        assert calls["n"] == 1, "shutdown must not be restarted after cancellation"
         assert key_box[0] not in _core._servers
     finally:
         caller_done.set()

@@ -328,19 +328,19 @@ _FENCED_CLEANUP_TIMEOUT = 20.0
 def _schedule_fenced_close(server) -> None:
     """Close *server*. A timed-out wait must not cancel the shutdown.
 
-    The waited coroutine hands *server* back if it is cancelled, and
-    ``on_discard`` finishes the close in its own task. A cancel before that
-    coroutine is stepped, and loop stop or drain dropping the discard task,
-    are deferred.
+    Once started, shutdown runs in a shielded task held by the MCP loop.
+    Cancellation before the wrapper starts, and loop stop or drain dropping
+    the cleanup task, are deferred.
     """
     from tools import mcp_tool_loop as _loop
 
     async def _close_or_hand_back():
-        try:
-            await _shutdown_discarded(server)
-        except asyncio.CancelledError:
-            return server
-        return None
+        # Keep one shutdown alive if the synchronous waiter abandons this task.
+        # Retrying shutdown after cancellation can cancel the server's own task.
+        cleanup = asyncio.create_task(_shutdown_discarded(server))
+        _loop._DISCARD_TASKS.add(cleanup)
+        cleanup.add_done_callback(_loop._DISCARD_TASKS.discard)
+        await asyncio.shield(cleanup)
 
     try:
         _loop._run_on_mcp_loop(
