@@ -77,7 +77,7 @@ def test_fenced_cleanup_finishes_after_waiter_cancels_in_progress_close(mcp_loop
 
     base = "fenced-on-discard"
     key_box, server_box = _unpublished_connect(monkeypatch, base)
-    monkeypatch.setattr(se, "_FENCED_CLEANUP_TIMEOUT", 0)
+    monkeypatch.setattr(se, "_FENCED_CLEANUP_TIMEOUT", 0, raising=False)
 
     started = threading.Event()
     release = asyncio.Event()
