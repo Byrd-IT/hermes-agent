@@ -383,7 +383,8 @@ def fire_overdue_jobs(
 
             def _fire(claimed_job=claimed, held=span):
                 try:
-                    provider.fire_claimed(claimed_job, adapters=adapters, loop=loop)
+                    with held.adopt():      # this thread works INSIDE the span: its own cron_run/cron_register nest
+                        provider.fire_claimed(claimed_job, adapters=adapters, loop=loop)
                 finally:
                     held.exit()
 
