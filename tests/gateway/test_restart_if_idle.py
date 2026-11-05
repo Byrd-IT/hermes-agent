@@ -398,7 +398,8 @@ def test_unknown_voice_count_refuses(home, hold):
     assert ack["result"] == "refused_unknown_activity" and "voice_sessions" in ack["unknown"]
 
 
-def test_admission_is_frozen_BEFORE_the_idle_count_is_taken(home, hold):
+@pytest.mark.asyncio
+async def test_admission_is_frozen_BEFORE_the_idle_count_is_taken(home, hold):
     """Freeze first, then count: anything admitted after the count would already have been refused."""
     runner = _runner()
     observed = []
@@ -414,6 +415,8 @@ def test_admission_is_frozen_BEFORE_the_idle_count_is_taken(home, hold):
         assert _decide(runner, home, _request(home, hold))["result"] == "accepted"
     finally:
         rii.idle_probe = rii_probe
+        if runner._restart_task is not None:
+            await runner._restart_task
     assert observed == [True]
 
 
@@ -486,7 +489,8 @@ def test_a_request_that_expires_between_claim_and_decision_is_refused(home, hold
     """Time passes while the loop is busy: the decision re-reads the clock after the idle count."""
     runner = _runner()
     body = _request(home, hold, now=time.time(), ttl=5)
-    clock = iter([body["issued_at"] + 1, body["expires_at"] + 1, body["expires_at"] + 1, body["expires_at"] + 1])
+    import itertools
+    clock = itertools.chain([body["issued_at"] + 1], itertools.repeat(body["expires_at"] + 1))
     monkeypatch.setattr(rii, "_now", lambda: next(clock))
     ack = _decide(runner, home, body)
     assert ack["result"] == "refused_invalid" and "expired" in ack["reason"]
