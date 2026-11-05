@@ -9,7 +9,6 @@ shutdown still awaits the others; the coroutine re-raises, the sync boundary log
 
 import asyncio
 import concurrent.futures
-import itertools
 import threading
 from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
@@ -48,10 +47,6 @@ def isolated_ledgers(monkeypatch):
         call_leases={},
         reaper=None,
         reaper_stop=threading.Event(),
-        loop_generations={},
-        loop_generation_seq=itertools.count(1),
-        fenced_closes=[],
-        fenced_cleanups=set(),
     )
     monkeypatch.setattr(core, "_servers", state.servers)
     monkeypatch.setattr(core, "_server_scope_keys", state.scope_keys)
@@ -73,10 +68,6 @@ def isolated_ledgers(monkeypatch):
     monkeypatch.setattr(se, "_call_leases", state.call_leases)
     monkeypatch.setattr(se, "_reaper", state.reaper)
     monkeypatch.setattr(se, "_reaper_stop", state.reaper_stop)
-    monkeypatch.setattr(se, "_LOOP_GENERATIONS", state.loop_generations)
-    monkeypatch.setattr(se, "_LOOP_GENERATION_SEQ", state.loop_generation_seq)
-    monkeypatch.setattr(se, "_FENCED_CLOSES", state.fenced_closes)
-    monkeypatch.setattr(se, "_FENCED_CLEANUPS", state.fenced_cleanups)
     monkeypatch.setattr(se, "_ensure_reaper", lambda: None)
     return state
 

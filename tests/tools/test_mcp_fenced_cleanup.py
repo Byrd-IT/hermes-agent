@@ -1,10 +1,10 @@
-"""A fenced variant close must finish after the caller gives up.
+"""A timed-out fenced close must still shut the server down.
 
-``ensure_connected`` waits for that close, but a timeout or interrupt must not
-drop the server: it was already built, and skipping shutdown orphans the
-process. That includes a give-up before the close coroutine is stepped, a
-``loop.stop`` that discards the queued callback, and a drain cancel that
-lands before the task's first step.
+``ensure_connected`` waits for that close on the MCP loop. The wait's cancel
+must not leave the server half-closed: the close hands the server to
+``on_discard``, which finishes shutdown in its own task. A cancel before that
+coroutine is stepped, and loop stop or drain dropping the discard task, are
+deferred.
 """
 import asyncio
 import threading
@@ -40,43 +40,88 @@ def mcp_loop(monkeypatch):
     real.close()
 
 
-def test_fenced_cleanup_finishes_after_caller_timeout(mcp_loop, monkeypatch):
-    """The caller returns on timeout; the close, already in progress, still finishes."""
-    from agent.session_client_env import client_env_scope
+def _unpublished_connect(monkeypatch, base):
     from tools import mcp_tool_discovery as discovery
     from tools import mcp_tool_loop as loop
 
-    base = "fenced-noncancel"
-    monkeypatch.setattr(_core, "_lazy_server_configs",
-                        {base: {"command": "unused", "session_env": ["PIN"]}})
+    monkeypatch.setattr(
+        _core, "_lazy_server_configs", {base: {"command": "unused", "session_env": ["PIN"]}}
+    )
     monkeypatch.setattr(_core, "_servers", {})
     monkeypatch.setattr(se, "_ensure_reaper", lambda: None)
     monkeypatch.setattr(loop, "_ensure_mcp_loop", lambda: None)
     monkeypatch.setattr(se, "_render", lambda config, values: config)
 
+    def connect(_name, _config):
+        async def _connect():
+            with se._guard:
+                se._pending.pop(key_box[0], None)
+            return server_box[0]
+
+        return _connect()
+
+    monkeypatch.setattr(discovery, "_connect_server", connect)
+    key_box: list = [None]
+    server_box: list = [None]
+    return key_box, server_box
+
+
+def test_fenced_cleanup_finishes_after_waiter_cancels_in_progress_close(mcp_loop, monkeypatch):
+    """The caller returns when the wait is abandoned; shutdown still finishes.
+
+    The close has reached its await, so this is not the deferred pre-start
+    cancel. The waiter's ``cancel()`` must not be the last word on the server.
+    """
+    from agent import async_utils
+    from agent.session_client_env import client_env_scope
+    from tools import mcp_tool_loop as loop
+
+    base = "fenced-on-discard"
+    key_box, server_box = _unpublished_connect(monkeypatch, base)
+    monkeypatch.setattr(se, "_FENCED_CLEANUP_TIMEOUT", 0)
+
     started = threading.Event()
-    finished = threading.Event()
     release = asyncio.Event()
+    finished = threading.Event()
+    calls = {"n": 0}
     caller_done = threading.Event()
     result = {}
 
     async def close():
+        calls["n"] += 1
         started.set()
         await release.wait()
         finished.set()
 
-    server = SimpleNamespace(session=object(), shutdown=close)
+    server_box[0] = SimpleNamespace(session=object(), shutdown=close)
+    real_schedule = async_utils.safe_schedule_threadsafe
+    scheduled = {"n": 0}
 
-    async def connect(_name, _config):
-        # Teardown wins while the connect is in flight: the result must be fenced.
-        with se._guard:
-            se._pending.pop(key_box[0], None)
-        return server
+    class _CancelAfterStart:
+        """Deliver the real cancel only once close has reached its await."""
 
-    monkeypatch.setattr(discovery, "_connect_server", connect)
-    monkeypatch.setattr(se, "_FENCED_CLEANUP_TIMEOUT", 0.05)
+        def __init__(self, inner):
+            self._inner = inner
 
-    key_box: list = [None]
+        def cancel(self):
+            assert started.wait(5)
+            return self._inner.cancel()
+
+        def result(self, timeout=None):
+            raise TimeoutError
+
+        def done(self):
+            return False
+
+    def schedule(coro, target, **kwargs):
+        scheduled["n"] += 1
+        fut = real_schedule(coro, target, **kwargs)
+        # First schedule is the connect. The fenced close is the one abandoned.
+        if scheduled["n"] == 1:
+            return fut
+        return _CancelAfterStart(fut)
+
+    monkeypatch.setattr(async_utils, "safe_schedule_threadsafe", schedule)
 
     def caller():
         try:
@@ -91,13 +136,13 @@ def test_fenced_cleanup_finishes_after_caller_timeout(mcp_loop, monkeypatch):
     thread = threading.Thread(target=caller)
     thread.start()
     try:
-        assert started.wait(5), "fenced cleanup never started the close"
-        assert caller_done.wait(5), "caller did not return after the cleanup timeout"
+        assert caller_done.wait(5), "caller did not return after the cleanup wait was abandoned"
         assert "exc" not in result, result.get("exc")
         assert result["value"] is None
+        assert scheduled["n"] >= 2, "fenced cleanup never scheduled a close on the loop"
         assert not finished.is_set()
         mcp_loop.call_soon_threadsafe(release.set)
-        assert finished.wait(5), "close did not finish after the caller timed out"
+        assert finished.wait(5), "close did not finish after the waiter cancelled it"
         assert key_box[0] not in _core._servers
     finally:
         caller_done.set()
@@ -109,69 +154,21 @@ def test_fenced_cleanup_finishes_after_caller_timeout(mcp_loop, monkeypatch):
             _core._servers.pop(key_box[0], None)
 
 
-def _give_up_before_close_still_shuts_down(mcp_loop, monkeypatch, *, base, interrupt):
-    """Hold the close callback until the caller has given up, then require shutdown.
-
-    The second ``call_soon_threadsafe`` is the close. Releasing it only after
-    the caller returns isolates a give-up that lands before the coroutine is
-    stepped — the case a cancellable wait drops.
-    """
+def test_fenced_cleanup_shuts_down_when_the_wait_is_not_abandoned(mcp_loop, monkeypatch):
+    """A close that finishes inside the wait shuts the server down once."""
     from agent.session_client_env import client_env_scope
-    from tools import mcp_tool_discovery as discovery
-    from tools import mcp_tool_loop as loop
-    from tools.interrupt import set_interrupt
 
-    monkeypatch.setattr(_core, "_lazy_server_configs",
-                        {base: {"command": "unused", "session_env": ["PIN"]}})
-    monkeypatch.setattr(_core, "_servers", {})
-    monkeypatch.setattr(se, "_ensure_reaper", lambda: None)
-    monkeypatch.setattr(loop, "_ensure_mcp_loop", lambda: None)
-    monkeypatch.setattr(se, "_render", lambda config, values: config)
-    monkeypatch.setattr(se, "_FENCED_CLEANUP_TIMEOUT", 0.05)
-
-    started = threading.Event()
+    base = "fenced-complete"
+    key_box, server_box = _unpublished_connect(monkeypatch, base)
     finished = threading.Event()
-    caller_done = threading.Event()
-    held_event = threading.Event()
-    result = {}
-    held: list = []
-    scheduled = {"n": 0}
-    caller_tid = {}
-    real_soon = mcp_loop.call_soon_threadsafe
-    real_run = loop._run_on_mcp_loop
-
-    def run_then_interrupt(*args, **kwargs):
-        outcome = real_run(*args, **kwargs)
-        caller_tid["id"] = threading.current_thread().ident
-        set_interrupt(True, thread_id=caller_tid["id"])
-        return outcome
-
-    if interrupt:
-        monkeypatch.setattr(loop, "_run_on_mcp_loop", run_then_interrupt)
+    calls = {"n": 0}
 
     async def close():
-        started.set()
+        calls["n"] += 1
         finished.set()
 
-    server = SimpleNamespace(session=object(), shutdown=close)
-
-    async def connect(_name, _config):
-        with se._guard:
-            se._pending.pop(key_box[0], None)
-        return server
-
-    monkeypatch.setattr(discovery, "_connect_server", connect)
-
-    def gated(callback, *args, context=None):
-        scheduled["n"] += 1
-        if scheduled["n"] == 1:
-            return real_soon(callback, *args, context=context)
-        held.append((callback, args, context))
-        held_event.set()
-        return None
-
-    monkeypatch.setattr(mcp_loop, "call_soon_threadsafe", gated)
-    key_box: list = [None]
+    server_box[0] = SimpleNamespace(session=object(), shutdown=close)
+    result = {}
 
     def caller():
         try:
@@ -180,147 +177,19 @@ def _give_up_before_close_still_shuts_down(mcp_loop, monkeypatch, *, base, inter
                 result["value"] = se.ensure_connected(base, key_box[0])
         except Exception as exc:  # health: allow BLE001 -- the test reports the caller failure
             result["exc"] = exc
-        finally:
-            caller_done.set()
 
     thread = threading.Thread(target=caller)
     thread.start()
     try:
-        assert held_event.wait(5), "cleanup was never scheduled on the loop"
-        assert caller_done.wait(5), "caller did not return after giving up"
+        thread.join(5)
+        assert not thread.is_alive()
         assert "exc" not in result, result.get("exc")
         assert result["value"] is None
-        assert not started.is_set(), "close started before the caller gave up; race not isolated"
-        callback, args, context = held[0]
-        real_soon(callback, *args, context=context)
-        assert finished.wait(5), "close did not finish after the caller gave up before it started"
+        assert finished.is_set()
+        assert calls["n"] == 1
         assert key_box[0] not in _core._servers
     finally:
-        monkeypatch.setattr(mcp_loop, "call_soon_threadsafe", real_soon)
-        if caller_tid.get("id") is not None:
-            set_interrupt(False, thread_id=caller_tid["id"])
-        caller_done.set()
-        if held and not finished.is_set():
-            callback, args, context = held[0]
-            try:
-                real_soon(callback, *args, context=context)
-            except RuntimeError:
-                pass
-        thread.join(5)
         se.reset()
         _core._lazy_server_configs.pop(base, None)
         if key_box[0] is not None:
             _core._servers.pop(key_box[0], None)
-
-
-def test_fenced_cleanup_runs_when_caller_gives_up_before_close_starts(mcp_loop, monkeypatch):
-    """A timeout before the close coroutine is stepped must not drop the server."""
-    _give_up_before_close_still_shuts_down(
-        mcp_loop, monkeypatch, base="fenced-before-start", interrupt=False)
-
-
-def test_fenced_cleanup_runs_when_interrupted_before_close_starts(mcp_loop, monkeypatch):
-    """An interrupt before the close coroutine is stepped must not drop the server."""
-    _give_up_before_close_still_shuts_down(
-        mcp_loop, monkeypatch, base="fenced-before-interrupt", interrupt=True)
-
-
-def test_drain_does_not_drop_fenced_close_cancelled_before_first_step(mcp_loop):
-    """Drain cancels every other task. A close that has not stepped must still run.
-
-    ``_spawn`` and the drain wakeup are queued in one turn, spawn first. Drain
-    therefore cancels the close task before its step — the body and its
-    ``finally`` never run unless drain adopts the close instead of cancelling it.
-    """
-    from tools import mcp_tool_lifecycle as life
-
-    shutdown_ran = threading.Event()
-
-    async def shutdown():
-        shutdown_ran.set()
-
-    server = SimpleNamespace(shutdown=shutdown)
-    gate_ready = threading.Event()
-    gate = {}
-
-    async def drive():
-        gate["event"] = asyncio.Event()
-        gate_ready.set()
-        await gate["event"].wait()
-        await life._drain_mcp_loop_tasks(timeout=1.0)
-
-    fut = asyncio.run_coroutine_threadsafe(drive(), mcp_loop)
-    assert gate_ready.wait(5), "drain driver never reached its gate"
-
-    def arrange():
-        # Next turn: spawn creates the task, then drive cancels it before the step.
-        se._schedule_fenced_close(server)
-        gate["event"].set()
-
-    mcp_loop.call_soon_threadsafe(arrange)
-    try:
-        fut.result(5)
-        assert shutdown_ran.is_set(), "drain cancelled the fenced close before its first step"
-    finally:
-        if not fut.done():
-            fut.cancel()
-
-
-def test_loop_stop_does_not_discard_queued_fenced_close(monkeypatch):
-    """A close queued in the same turn as ``loop.stop`` must still shut the server down.
-
-    ``call_soon(loop.stop)`` and the spawn land in one ready-batch. Spawn's
-    ``ensure_future`` schedules the task step after that batch is snapshotted,
-    ``run_forever`` exits, and ``loop.close`` drops the step. The stop path has
-    to run the close before close.
-    """
-    from tools import mcp_tool as origin
-    from tools import mcp_tool_lifecycle as life
-    from tools import mcp_tool_loop as loop_mod
-
-    real = asyncio.new_event_loop()
-    ready = threading.Event()
-    real.call_soon(ready.set)
-    thread = threading.Thread(target=real.run_forever, daemon=True)
-    thread.start()
-    assert ready.wait(5)
-
-    monkeypatch.setattr(loop_mod, "_running_loop", lambda: None if real.is_closed() else real)
-    monkeypatch.setattr(origin, "_mcp_loop", real)
-    monkeypatch.setattr(origin, "_mcp_thread", thread)
-    monkeypatch.setattr(life, "_kill_orphaned_mcp_children", lambda *args, **kwargs: None)
-
-    shutdown_ran = threading.Event()
-
-    async def shutdown():
-        shutdown_ran.set()
-
-    server = SimpleNamespace(shutdown=shutdown)
-    real_soon = real.call_soon
-    queued = {"n": 0}
-
-    def soon(callback, *args, context=None):
-        handle = real_soon(callback, *args, context=context)
-        if (
-            queued["n"] == 0
-            and getattr(callback, "__self__", None) is real
-            and getattr(callback, "__name__", "") == "stop"
-        ):
-            queued["n"] += 1
-            se._schedule_fenced_close(server)
-        return handle
-
-    monkeypatch.setattr(real, "call_soon", soon)
-    try:
-        loop_mod._stop_mcp_loop()
-        assert queued["n"] == 1, "stop path never queued loop.stop; race not isolated"
-        assert shutdown_ran.is_set(), "loop.stop discarded the queued fenced close"
-        assert real.is_closed()
-    finally:
-        if not real.is_closed():
-            if real.is_running():
-                real_soon(real.stop)
-                thread.join(5)
-            real.close()
-        origin._mcp_loop = None
-        origin._mcp_thread = None

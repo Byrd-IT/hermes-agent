@@ -1,12 +1,9 @@
 """Regression tests for HERMES_HOME override propagation onto the MCP loop.
 
-Tasks scheduled via run_coroutine_threadsafe are created inside the MCP
-event-loop thread, so they copy THAT thread's context — not the scheduling
-thread's. A per-request profile scope (dashboard ?profile= endpoints, e.g.
-the MCP "Test server" probe) would silently vanish for anything resolving
-get_hermes_home() inside the coroutine, most visibly OAuth token-store
-paths. _run_on_mcp_loop now wraps scheduled coroutines with the caller's
-override (mcp_tool_loop._wrap_with_home_override).
+Tasks scheduled via run_coroutine_threadsafe inherit the submitting thread's
+context through call_soon_threadsafe. These tests check that a per-request
+HERMES_HOME override remains isolated on the MCP loop, including the explicit
+profile wrapper used by _run_on_mcp_loop.
 """
 import os
 

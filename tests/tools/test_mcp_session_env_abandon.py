@@ -127,25 +127,22 @@ def test_fenced_connect_cleanup_failure_does_not_escape(monkeypatch):
     monkeypatch.setattr(loop, "_ensure_mcp_loop", lambda: None)
     server = SimpleNamespace(session=object(), shutdown=AsyncMock())
     monkeypatch.setattr(discovery, "_connect_server", AsyncMock(return_value=server))
-    scheduled = []
+    calls = []
 
-    def run(fn, **kwargs):
-        result = asyncio.run(fn())
-        se.reset()  # teardown while the connect was in flight
-        return result
-
-    def schedule(server):
-        scheduled.append(server)
-        return threading.Event()  # cleanup does not finish within the wait budget
+    def run(fn, timeout=30, on_discard=None):
+        calls.append(on_discard)
+        if len(calls) == 1:
+            result = asyncio.run(fn())
+            se.reset()  # teardown while the connect was in flight
+            return result
+        raise TimeoutError
 
     monkeypatch.setattr(loop, "_run_on_mcp_loop", run)
-    monkeypatch.setattr(se, "_schedule_fenced_close", schedule)
-    monkeypatch.setattr(se, "_FENCED_CLEANUP_TIMEOUT", 0)
     try:
         with client_env_scope({"PIN": "a"}):
             key = se.variant_key(base)
             assert se.ensure_connected(base, key) is None
-        assert scheduled == [server]
+        assert calls[1] is se._shutdown_discarded
     finally:
         se.reset()
 

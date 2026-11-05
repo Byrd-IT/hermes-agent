@@ -72,11 +72,6 @@ def reset() -> None:
         if isinstance(ledger, dict):
             for k in [k for k in ledger if is_variant_key(k)]:
                 ledger.pop(k, None)
-    with _FENCED_LOCK:
-        # Wildcard shutdown resets before it stops the loop. Dropping every
-        # record here lets that drain cancel an in-flight close, and erases a
-        # newer loop's close before its own stop can recover a discarded callback.
-        _retain_fenced_locked()
 
 
 def _forget_ledgers(key) -> None:
@@ -327,273 +322,36 @@ async def _shutdown_discarded(server):
             logger.debug("MCP session-env discarded connection shutdown failed")
 
 
-# Strong refs: the loop keeps only weak ones, and a timed-out waiter must not drop the close.
-_FENCED_CLEANUPS: set = set()
 _FENCED_CLEANUP_TIMEOUT = 20.0
-_FENCED_LOCK = threading.Lock()
-_FENCED_CLOSES: list = []
-# Loop object -> generation that accepted its closes. Stable for that loop's
-# life: reset must not bump it, or this loop's stop would skip closes it still
-# has to run. A replacement loop is a new object, so it gets a new id.
-_LOOP_GENERATIONS: dict = {}
-_LOOP_GENERATION_SEQ = itertools.count(1)
 
 
-def _release_fenced(task) -> None:
-    _FENCED_CLEANUPS.discard(task)
-    if not task.cancelled():
-        task.exception()  # retrieved; the close already logged its own failure
+def _schedule_fenced_close(server) -> None:
+    """Close *server*. A timed-out wait must not cancel the shutdown.
 
-
-class _FencedClose:
-    """A server shutdown owned by the loop generation that accepted it."""
-
-    __slots__ = ("finished", "generation", "loop", "scope", "server", "started", "task")
-
-    def __init__(self, server, finished, scope, loop, generation):
-        self.server = server
-        self.finished = finished
-        self.scope = scope
-        self.loop = loop
-        self.generation = generation
-        self.task = None
-        self.started = False
-
-
-def _generation_for_locked(loop) -> int:
-    generation = _LOOP_GENERATIONS.get(loop)
-    if generation is None:
-        generation = next(_LOOP_GENERATION_SEQ)
-        _LOOP_GENERATIONS[loop] = generation
-    return generation
-
-
-def _owns_locked(record, loop) -> bool:
-    """True when *loop* is the generation that accepted *record*."""
-    return (
-        loop is not None
-        and record.loop is loop
-        and record.generation == _LOOP_GENERATIONS.get(loop)
-    )
-
-
-def _prune_generations_locked() -> None:
-    live = {record.loop for record in _FENCED_CLOSES}
-    closed = [
-        loop for loop in _LOOP_GENERATIONS
-        if loop not in live and loop.is_closed()
-    ]
-    for loop in closed:
-        _LOOP_GENERATIONS.pop(loop, None)
-
-
-def _retain_fenced_locked() -> None:
-    """Keep closes a not-yet-closed loop must still finish; unblock the rest."""
-    kept = []
-    for record in _FENCED_CLOSES:
-        loop = record.loop
-        if loop is not None and not loop.is_closed():
-            kept.append(record)
-            continue
-        record.finished.set()
-    _FENCED_CLOSES[:] = kept
-    _prune_generations_locked()
-
-
-def _forget_locked(record) -> None:
-    try:
-        _FENCED_CLOSES.remove(record)
-    except ValueError:
-        pass
-    _prune_generations_locked()
-
-
-def _drop_fenced(record) -> None:
-    with _FENCED_LOCK:
-        _forget_locked(record)
-
-
-def _fail_fenced(record) -> None:
-    record.finished.set()
-    _drop_fenced(record)
-
-
-def _fenced_tasks() -> set:
-    """Tasks this loop's drain must not cancel: their close has not finished."""
-    try:
-        current = asyncio.get_running_loop()
-    except RuntimeError:
-        return set()
-    with _FENCED_LOCK:
-        return {
-            record.task
-            for record in _FENCED_CLOSES
-            if _owns_locked(record, current)
-            and record.task is not None
-            and not record.task.done()
-        }
-
-
-def _close_coro(record):
-    from tools import mcp_tool_loop as _loop
-
-    async def _close():
-        record.started = True
-        try:
-            await _shutdown_discarded(record.server)
-        finally:
-            record.finished.set()
-            _drop_fenced(record)
-
-    return _loop._apply_fenced_scope(_close(), record.scope)
-
-
-def _arm_fenced(record) -> Optional[asyncio.Task]:
-    """Start *record*'s close on the loop that accepted it, or return that task.
-
-    Loop thread only. A task cancelled before its first step never sets
-    ``started`` and its coro is dead, so that one is replaced. Drain must
-    not be able to drop the server.
-
-    Ownership and task publish share ``_FENCED_LOCK``. An older loop's drain
-    or post-stop finish must not ``ensure_future`` a close a newer loop
-    accepted: that binds shutdown to a loop about to close and steals the
-    record from the loop that can still run it.
-    """
-    try:
-        current = asyncio.get_running_loop()
-    except RuntimeError:
-        return None
-    with _FENCED_LOCK:
-        if not _owns_locked(record, current):
-            return None
-        running = record.task
-        if running is not None and not running.done():
-            return running
-        if record.finished.is_set() or record.started:
-            return None
-        coro = _close_coro(record)
-        try:
-            task = asyncio.ensure_future(coro)
-        except RuntimeError:
-            coro.close()
-            record.finished.set()
-            _forget_locked(record)
-            logger.debug("MCP session-env fenced connection cleanup failed")
-            return None
-        record.task = task
-    _FENCED_CLEANUPS.add(task)
-    task.add_done_callback(_release_fenced)
-    return task
-
-
-async def _finish_pending_fenced(*, timeout: float) -> None:
-    """Run this loop's closes that stop discarded or drain cancelled early."""
-    try:
-        current = asyncio.get_running_loop()
-    except RuntimeError:
-        return
-    with _FENCED_LOCK:
-        pending = [
-            record for record in _FENCED_CLOSES
-            if not record.finished.is_set() and _owns_locked(record, current)
-        ]
-    tasks = []
-    for record in pending:
-        task = _arm_fenced(record)
-        if task is not None:
-            tasks.append(task)
-    if not tasks:
-        return
-    done, _still = await asyncio.wait(tasks, timeout=timeout)
-    for task in done:
-        if not task.cancelled():
-            task.exception()
-
-
-def _creator_loop(server) -> Optional[asyncio.AbstractEventLoop]:
-    """Loop that built *server*'s run task, if that binding is known.
-
-    The task, transport, and anyio cancel scopes live on that loop. The MCP
-    loop registered now may already be a replacement; shutdown must not follow
-    it. A closed creator is still returned so the caller does not retarget.
-    """
-    task = getattr(server, "_task", None)
-    get_loop = getattr(task, "get_loop", None)
-    if not callable(get_loop):
-        return None
-    try:
-        loop = get_loop()
-    except RuntimeError:
-        return None
-    return loop if isinstance(loop, asyncio.AbstractEventLoop) else None
-
-
-def _schedule_fenced_close(server) -> threading.Event:
-    """Queue *server*'s close before any cancellable wait.
-
-    ``_run_on_mcp_loop`` cancels its future on timeout or interrupt. A cancel
-    that lands before that coroutine is stepped never runs the body, so the
-    close cannot live only there. The spawn callback is not that future: once
-    queued, giving up on the wait cannot drop it.
-
-    The record is owned by the loop that built the server, not by whichever
-    MCP loop is current when the waiter returns. A connect can finish on the
-    loop that accepted it after that loop has been replaced; scheduling the
-    close on the replacement attaches shutdown to the wrong loop and lets the
-    creator's stop drop the server. A known creator that is already closed is
-    not retargeted. Servers with no task binding (tests, a close before
-    ``start``) still use the current loop.
-
-    The record is registered before the callback is queued, owned by the loop
-    generation that accepted it. ``loop.stop`` drops a callback that missed
-    the final ready-batch, and drain's ``Task.cancel`` drops a task that has
-    not stepped. Either way that same loop can still start the close. A
-    different loop's drain, timeout, or stop must not: the list used to be
-    global, so an older finish ran the newer loop's shutdown.
+    The waited coroutine hands *server* back if it is cancelled, and
+    ``on_discard`` finishes the close in its own task. A cancel before that
+    coroutine is stepped, and loop stop or drain dropping the discard task,
+    are deferred.
     """
     from tools import mcp_tool_loop as _loop
 
-    finished = threading.Event()
-    scope = _loop._capture_fenced_scope()
-    creator = _creator_loop(server)
-    if creator is not None:
-        loop = None if creator.is_closed() else creator
-    else:
-        loop = _loop._running_loop()
-    if loop is None:
-        logger.debug("MCP session-env fenced connection cleanup failed")
-        finished.set()
-        return finished
-
-    with _FENCED_LOCK:
-        record = _FencedClose(
-            server, finished, scope, loop, _generation_for_locked(loop))
-        _FENCED_CLOSES.append(record)
-
-    def _spawn():
-        _arm_fenced(record)
+    async def _close_or_hand_back():
+        try:
+            await _shutdown_discarded(server)
+        except asyncio.CancelledError:
+            return server
+        return None
 
     try:
-        loop.call_soon_threadsafe(_spawn)
-    except RuntimeError:
-        _fail_fenced(record)
+        _loop._run_on_mcp_loop(
+            _close_or_hand_back,
+            timeout=_FENCED_CLEANUP_TIMEOUT,
+            on_discard=_shutdown_discarded,
+        )
+    except (TimeoutError, InterruptedError):
+        return
+    except Exception:  # health: allow BLE001 -- fenced cleanup is best-effort, without payloads
         logger.debug("MCP session-env fenced connection cleanup failed")
-    return finished
-
-
-def _wait_fenced(finished: threading.Event) -> None:
-    """Wait for a close already queued. Timeout and interrupt do not cancel it."""
-    from tools.interrupt import is_interrupted
-
-    deadline = time.monotonic() + _FENCED_CLEANUP_TIMEOUT
-    while not finished.is_set():
-        if is_interrupted():
-            return
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return
-        finished.wait(min(0.1, remaining))
 
 
 def protect_call(server_name, handler):
@@ -708,7 +466,7 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
         if not current:
             if server is not None:
                 try:
-                    _wait_fenced(_schedule_fenced_close(server))
+                    _schedule_fenced_close(server)
                 except Exception:  # health: allow BLE001 -- fenced cleanup is best-effort, without payloads
                     logger.debug("MCP session-env fenced connection cleanup failed")
             return None
