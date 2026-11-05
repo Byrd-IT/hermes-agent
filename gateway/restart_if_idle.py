@@ -1,6 +1,6 @@
 """Conditional gateway restart: "restart only if you are idle", decided by the gateway itself.
 
-Protocol ``restart-if-idle/1`` -- for an out-of-process maintenance updater that owns a live scoped ESTOP hold
+Protocol ``restart-if-idle/2`` -- for an out-of-process maintenance updater that owns a live scoped ESTOP hold
 (``agent/estop.py``) and wants the gateway to restart ONLY IF no work would be interrupted, without a window in
 which work can start after its look and before the restart.
 
@@ -64,7 +64,7 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger("gateway.restart_if_idle")
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 REQUEST_NAME = "restart_if_idle.request.json"
 ACK_NAME = "restart_if_idle.ack.json"
 _CLAIMED_SUFFIX = ".claimed"

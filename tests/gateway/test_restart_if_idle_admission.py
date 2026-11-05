@@ -659,3 +659,15 @@ def test_a_stale_marker_from_a_crashed_gateway_is_replaced_by_the_next_claim(hom
     assert json.loads(rii.claimed_path(home).read_text())["request_id"] == body["request_id"]
     rii.release_claim(home)
     assert not rii.claimed_path(home).exists()
+
+
+def test_the_protocol_is_version_2_so_a_client_of_the_unmarked_version_1_is_refused_and_never_trusts_a_vanished_claim(
+        home, hold):
+    """Version 1 unlinked the claim before deciding, so "claim gone, no ack" proved nothing there. A requester
+    that relies on the marker must only ever talk to a gateway that keeps it: the version is the gate, both ways."""
+    assert rii.PROTOCOL_VERSION == 2
+    runner = _threaded_runner()
+    _put(home, _request(home, hold, schema=1))
+    runner.handle_restart_if_idle_request()
+    ack = _ack(home)
+    assert ack["result"] == "refused_invalid" and runner._restart_task_started is False
