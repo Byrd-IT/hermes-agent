@@ -365,22 +365,39 @@ def fire_overdue_jobs(
             next_run_at,
             overdue_seconds / 60,
         )
+        # Conditional restart (gateway/restart_if_idle.py): claim -> thread -> run is work admitted by THIS thread
+        # and finished by another, so its admission span spans both. It is entered BEFORE the claim: refused
+        # (the gateway accepted a restart) means nothing is claimed and the job stays overdue for the next
+        # gateway's sweep; admitted means an idle decision counts it until the fire ends.
+        from agent.admission_gate import gate as _admission_gate
+        span = _admission_gate().enter("cron_misfire")
+        if span is None:
+            logger.info("Misfire catch-up stopped: the gateway accepted a conditional restart")
+            break
+        started = False
         try:
             # Claim synchronously (CAS loss = external retry beat us), run off-thread: never block.
             claimed = provider.claim_fire(job_id)
             if claimed is None:
                 continue
-            threading.Thread(
-                target=provider.fire_claimed, args=(claimed,),
-                kwargs={"adapters": adapters, "loop": loop}, daemon=True,
-                name=f"cron-misfire-{job_id[:12]}",
-            ).start()
+
+            def _fire(claimed_job=claimed, held=span):
+                try:
+                    provider.fire_claimed(claimed_job, adapters=adapters, loop=loop)
+                finally:
+                    held.exit()
+
+            threading.Thread(target=_fire, daemon=True, name=f"cron-misfire-{job_id[:12]}").start()
+            started = True
             fired += 1
         except Exception as exc:
             logger.warning(
                 "Misfire catch-up failed for job %s: %s: %s",
                 job_id, type(exc).__name__, exc,
             )
+        finally:
+            if not started:
+                span.exit()
     return fired
 
 
