@@ -2,8 +2,9 @@
 
 ``ensure_connected`` waits for that close, but a timeout or interrupt must not
 drop the server: it was already built, and skipping shutdown orphans the
-process. That includes a give-up that lands before the close coroutine is
-stepped.
+process. That includes a give-up before the close coroutine is stepped, a
+``loop.stop`` that discards the queued callback, and a drain cancel that
+lands before the task's first step.
 """
 import asyncio
 import threading
@@ -222,3 +223,104 @@ def test_fenced_cleanup_runs_when_interrupted_before_close_starts(mcp_loop, monk
     """An interrupt before the close coroutine is stepped must not drop the server."""
     _give_up_before_close_still_shuts_down(
         mcp_loop, monkeypatch, base="fenced-before-interrupt", interrupt=True)
+
+
+def test_drain_does_not_drop_fenced_close_cancelled_before_first_step(mcp_loop):
+    """Drain cancels every other task. A close that has not stepped must still run.
+
+    ``_spawn`` and the drain wakeup are queued in one turn, spawn first. Drain
+    therefore cancels the close task before its step — the body and its
+    ``finally`` never run unless drain adopts the close instead of cancelling it.
+    """
+    from tools import mcp_tool_lifecycle as life
+
+    shutdown_ran = threading.Event()
+
+    async def shutdown():
+        shutdown_ran.set()
+
+    server = SimpleNamespace(shutdown=shutdown)
+    gate_ready = threading.Event()
+    gate = {}
+
+    async def drive():
+        gate["event"] = asyncio.Event()
+        gate_ready.set()
+        await gate["event"].wait()
+        await life._drain_mcp_loop_tasks(timeout=1.0)
+
+    fut = asyncio.run_coroutine_threadsafe(drive(), mcp_loop)
+    assert gate_ready.wait(5), "drain driver never reached its gate"
+
+    def arrange():
+        # Next turn: spawn creates the task, then drive cancels it before the step.
+        se._schedule_fenced_close(server)
+        gate["event"].set()
+
+    mcp_loop.call_soon_threadsafe(arrange)
+    try:
+        fut.result(5)
+        assert shutdown_ran.is_set(), "drain cancelled the fenced close before its first step"
+    finally:
+        if not fut.done():
+            fut.cancel()
+
+
+def test_loop_stop_does_not_discard_queued_fenced_close(monkeypatch):
+    """A close queued in the same turn as ``loop.stop`` must still shut the server down.
+
+    ``call_soon(loop.stop)`` and the spawn land in one ready-batch. Spawn's
+    ``ensure_future`` schedules the task step after that batch is snapshotted,
+    ``run_forever`` exits, and ``loop.close`` drops the step. The stop path has
+    to run the close before close.
+    """
+    from tools import mcp_tool as origin
+    from tools import mcp_tool_lifecycle as life
+    from tools import mcp_tool_loop as loop_mod
+
+    real = asyncio.new_event_loop()
+    ready = threading.Event()
+    real.call_soon(ready.set)
+    thread = threading.Thread(target=real.run_forever, daemon=True)
+    thread.start()
+    assert ready.wait(5)
+
+    monkeypatch.setattr(loop_mod, "_running_loop", lambda: None if real.is_closed() else real)
+    monkeypatch.setattr(origin, "_mcp_loop", real)
+    monkeypatch.setattr(origin, "_mcp_thread", thread)
+    monkeypatch.setattr(life, "_kill_orphaned_mcp_children", lambda *args, **kwargs: None)
+
+    shutdown_ran = threading.Event()
+
+    async def shutdown():
+        shutdown_ran.set()
+
+    server = SimpleNamespace(shutdown=shutdown)
+    real_soon = real.call_soon
+    queued = {"n": 0}
+
+    def soon(callback, *args, context=None):
+        handle = real_soon(callback, *args, context=context)
+        if (
+            queued["n"] == 0
+            and getattr(callback, "__self__", None) is real
+            and getattr(callback, "__name__", "") == "stop"
+        ):
+            queued["n"] += 1
+            se._schedule_fenced_close(server)
+        return handle
+
+    monkeypatch.setattr(real, "call_soon", soon)
+    try:
+        loop_mod._stop_mcp_loop()
+        assert queued["n"] == 1, "stop path never queued loop.stop; race not isolated"
+        assert shutdown_ran.is_set(), "loop.stop discarded the queued fenced close"
+        assert real.is_closed()
+    finally:
+        if not real.is_closed():
+            if real.is_running():
+                real_soon(real.stop)
+                thread.join(5)
+            real.close()
+        origin._mcp_loop = None
+        origin._mcp_thread = None

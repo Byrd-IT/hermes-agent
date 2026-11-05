@@ -414,22 +414,53 @@ async def _drain_mcp_loop_tasks(*, timeout: Optional[float] = None) -> None:
     """Cancel every task still pending on the MCP loop and reap it. ``Task.cancel()`` only
     schedules the throw, so tasks need a cancellation cycle before the loop goes away; wait
     for them here, on their owning loop, bounded so a task that suppresses cancellation
-    cannot hang process exit."""
+    cannot hang process exit.
+
+    Fenced session-env closes are not in that set. A cancel that lands before the close
+    coroutine is stepped never runs its body, and ``loop.stop`` can discard the callback
+    that would have started it. Settle those closes instead of cancelling them.
+    """
     if timeout is None:
-        timeout = _core._MCP_LOOP_DRAIN_TIMEOUT
+        budget = float(_core._MCP_LOOP_DRAIN_TIMEOUT)
+    else:
+        budget = timeout
+    from tools import mcp_tool_session_env as se
+
+    deadline = time.monotonic() + budget
+    await se._finish_pending_fenced(timeout=max(0.0, deadline - time.monotonic()))
     current = asyncio.current_task()
-    pending = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
-    if not pending:
+    protected = se._fenced_tasks()
+    pending = [
+        t for t in asyncio.all_tasks()
+        if t is not current and not t.done() and t not in protected
+    ]
+    if pending:
+        logger.debug("Draining %d pending task(s) from the MCP loop", len(pending))
+        for task in pending:
+            task.cancel()
+        done, still_pending = await asyncio.wait(
+            pending, timeout=max(0.0, deadline - time.monotonic()))
+        for task in done:
+            if not task.cancelled():
+                task.exception()  # mark retrieved so asyncio doesn't warn "exception was never retrieved"
+        if still_pending:
+            logger.warning(
+                "%d MCP loop task(s) still pending after %.1fs drain", len(still_pending), budget)
+    # A close queued while the cancel-wait ran is not in ``protected`` yet.
+    await se._finish_pending_fenced(timeout=max(0.0, deadline - time.monotonic()))
+
+
+def _finish_fenced_before_close(loop) -> None:
+    """Run fenced closes ``loop.stop`` left in the ready queue. Caller has joined the loop thread."""
+    if loop.is_running() or loop.is_closed():
         return
-    logger.debug("Draining %d pending task(s) from the MCP loop", len(pending))
-    for task in pending:
-        task.cancel()
-    done, still_pending = await asyncio.wait(pending, timeout=timeout)
-    for task in done:
-        if not task.cancelled():
-            task.exception()  # mark retrieved so asyncio doesn't warn "exception was never retrieved"
-    if still_pending:
-        logger.warning("%d MCP loop task(s) still pending after %.1fs drain", len(still_pending), timeout)
+    from tools import mcp_tool_session_env as se
+
+    try:
+        loop.run_until_complete(
+            se._finish_pending_fenced(timeout=_core._MCP_LOOP_DRAIN_TIMEOUT))
+    except Exception:  # health: allow BLE001 -- stop must still close the loop; no payloads
+        logger.debug("MCP fenced close after loop stop failed")
 
 
 async def _drain_and_stop_mcp_loop() -> None:

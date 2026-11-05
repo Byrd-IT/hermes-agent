@@ -100,16 +100,21 @@ def _mcp_loop_exception_handler(loop, context):
         loop.default_exception_handler(context)
 
 
-def _wrap_with_home_override(coro: Coroutine) -> Coroutine:
+def _wrap_with_home_override(
+    coro: Coroutine, home_override: Optional[str] = None, *, captured: bool = False,
+) -> Coroutine:
     """Carry the caller's context-local HERMES_HOME override into ``coro`` (task-local on the MCP
-    loop, so concurrent scopes don't interfere)."""
-    try:
-        from hermes_constants import get_hermes_home_override, reset_hermes_home_override, set_hermes_home_override
-        home_override = get_hermes_home_override()
-    except Exception:
-        home_override = None
+    loop, so concurrent scopes don't interfere). ``captured`` uses the value taken on the
+    caller thread when the close is rebuilt after that thread is gone."""
+    if not captured:
+        try:
+            from hermes_constants import get_hermes_home_override
+            home_override = get_hermes_home_override()
+        except Exception:
+            home_override = None
     if not home_override:
         return coro
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
     async def _scoped():
         token = set_hermes_home_override(home_override)
@@ -121,21 +126,46 @@ def _wrap_with_home_override(coro: Coroutine) -> Coroutine:
     return _scoped()
 
 
-def _wrap_with_dashboard_oauth_flow(coro):
+def _wrap_with_dashboard_oauth_flow(coro, flow: Any = None, *, captured: bool = False):
     """Propagate a dashboard OAuth flow onto the dedicated MCP loop task."""
-    try:
-        from tools.mcp_dashboard_oauth import dashboard_oauth_flow, get_dashboard_oauth_flow
-        flow = get_dashboard_oauth_flow()
-    except Exception:
-        flow = None
+    if not captured:
+        try:
+            from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
+            flow = get_dashboard_oauth_flow()
+        except Exception:
+            flow = None
     if flow is None:
         return coro
+    from tools.mcp_dashboard_oauth import dashboard_oauth_flow
 
     async def _scoped():
         with dashboard_oauth_flow(flow):
             return await coro
 
     return _scoped()
+
+
+def _capture_fenced_scope():
+    """Home and OAuth values a fenced close must keep even if its callback is discarded."""
+    home = None
+    flow = None
+    try:
+        from hermes_constants import get_hermes_home_override
+        home = get_hermes_home_override()
+    except Exception:
+        home = None
+    try:
+        from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
+        flow = get_dashboard_oauth_flow()
+    except Exception:
+        flow = None
+    return home, flow
+
+
+def _apply_fenced_scope(coro, scope):
+    home, flow = scope
+    return _wrap_with_dashboard_oauth_flow(
+        _wrap_with_home_override(coro, home, captured=True), flow, captured=True)
 
 
 def _running_loop() -> Optional[asyncio.AbstractEventLoop]:
@@ -375,6 +405,9 @@ def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
         thread.join(timeout=5)
         if thread.is_alive():
             logger.warning("MCP event loop thread did not stop within 5.0s")
+    # loop.stop drops callbacks queued after the final ready-batch snapshot, including a
+    # fenced close's task step. Run those before close() clears the queue.
+    _lifecycle._finish_fenced_before_close(loop)
     try:
         loop.close()
     except Exception as exc:
