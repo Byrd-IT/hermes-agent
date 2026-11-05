@@ -1,4 +1,4 @@
-"""Conditional restart ("restart if idle") decided INSIDE the running gateway (protocol ``restart-if-idle/1``).
+"""Conditional restart ("restart if idle") decided INSIDE the running gateway (protocol ``restart-if-idle/2``).
 
 An out-of-process updater cannot recall a SIGUSR1 and cannot see every kind of work, so the question "is the
 gateway idle?" and the admission freeze must be one synchronous step on the gateway's own loop thread. The
@@ -55,7 +55,7 @@ def _me():
 def _request(home, hold_, *, now=None, ttl=10.0, **over):
     pid, start = _me()
     now = time.time() if now is None else now
-    body = {"schema": 1, "kind": "restart_if_idle", "request_id": "r" + os.urandom(6).hex(), "owner": OWNER,
+    body = {"schema": rii.PROTOCOL_VERSION, "kind": "restart_if_idle", "request_id": "r" + os.urandom(6).hex(), "owner": OWNER,
             "token_sha256": rii.token_digest(hold_["token"]), "pid": pid, "start_time": start,
             "issued_at": now, "expires_at": now + ttl}
     body.update(over)
@@ -179,7 +179,7 @@ def test_malformed_requests_are_refused(home, hold, raw):
 
 
 @pytest.mark.parametrize("field,value", [
-    ("schema", 2), ("schema", True), ("schema", "1"), ("kind", "restart"), ("request_id", ""), ("request_id", 5),
+    ("schema", 1), ("schema", 3), ("schema", True), ("schema", "1"), ("kind", "restart"), ("request_id", ""), ("request_id", 5),
     ("request_id", "x" * 200), ("owner", ""), ("owner", None), ("token_sha256", "abc"), ("token_sha256", None),
     ("pid", 1), ("pid", True), ("pid", "1"), ("start_time", 12345), ("start_time", None),
     ("issued_at", "now"), ("expires_at", float("inf")), ("expires_at", None),
@@ -453,7 +453,7 @@ def test_an_invalid_request_is_acknowledged_as_refused_and_nothing_restarts(home
     assert runner._draining is False and runner._restart_task_started is False
 
 
-@pytest.mark.parametrize("raw", ["", "garbage{", "[]", json.dumps({"schema": 1, "kind": "restart_if_idle"})])
+@pytest.mark.parametrize("raw", ["", "garbage{", "[]", json.dumps({"schema": rii.PROTOCOL_VERSION, "kind": "restart_if_idle"})])
 def test_malformed_marker_is_a_refusal_never_an_unconditional_restart(home, hold, raw):
     runner = _runner()
     _put(home, None, raw=raw)
