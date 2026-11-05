@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from hermes_platform import declaration
+from agent.async_utils import safe_exception_type
 from tools.registry import invalidate_check_fn_cache, tool_error
 from tools.ansi_strip import strip_unicode_tags
 from tools.mcp_tool_common import _exc_str, _sanitize_error, mcp_field, _core
@@ -744,10 +745,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
 
         def _on_failure(exc):
             _core._bump_server_error(server_name)
-            # Exception text can embed credentials; the type name is enough.
+            # Exception messages and arbitrary class names can embed credentials.
             logger.error(
                 "MCP tool %s/%s call failed: %s",
-                server_name, tool_name, type(exc).__name__)
+                server_name, tool_name, safe_exception_type(exc))
         session_expired = partial(_handle_session_expired_and_retry, call_may_have_side_effects=not read_only)
         text = _dispatch(
             server_name, server, op, _call, tool_timeout,
@@ -779,12 +780,12 @@ def _make_utility_handler(op: str, log_label: str, rpc, render, required: Option
                         return fenced_error()
                     result = await rpc(server.session, args, server_name)
                 return json.dumps(render(result, server_name), ensure_ascii=False)
-            # Exception text can embed credentials; the type name is enough.
+            # Exception messages and arbitrary class names can embed credentials.
             return _dispatch(
                 server_name, server, op, _call, tool_timeout,
                 (_handle_auth_error_and_retry, _handle_session_expired_and_retry),
                 lambda exc: logger.error(
-                    "MCP %s/%s failed: %s", server_name, log_label, type(exc).__name__))
+                    "MCP %s/%s failed: %s", server_name, log_label, safe_exception_type(exc)))
         from tools.mcp_tool_session_env import protect_call
         return protect_call(server_name, _handler)
     return _factory

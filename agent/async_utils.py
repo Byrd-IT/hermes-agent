@@ -17,6 +17,11 @@ from typing import Any, Coroutine, Optional
 _DEFAULT_LOGGER = logging.getLogger(__name__)
 
 
+def safe_exception_type(exc: BaseException) -> str:
+    """Return a fixed diagnostic label, never an attacker-controlled class name."""
+    return "RuntimeError" if type(exc) is RuntimeError else "Exception"
+
+
 def safe_schedule_threadsafe(
     coro: Coroutine[Any, Any, Any], loop: Optional[asyncio.AbstractEventLoop], *,
     logger: Optional[logging.Logger] = None,
@@ -36,8 +41,8 @@ def safe_schedule_threadsafe(
     except Exception as exc:
         if asyncio.iscoroutine(coro):
             coro.close()
-        # Exception text can embed credentials; the type name is enough.
-        log.log(log_level, "%s: %s", log_message, type(exc).__name__)
+        # Both exception messages and arbitrary class names can embed credentials.
+        log.log(log_level, "%s: %s", log_message, safe_exception_type(exc))
         return None
 
 

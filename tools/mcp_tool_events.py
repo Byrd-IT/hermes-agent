@@ -22,6 +22,7 @@ import time
 from datetime import datetime
 from typing import Any, Optional
 
+from agent.async_utils import safe_exception_type
 from tools.mcp_tool_common import _parse_boolish
 from tools.registry import tool_error
 
@@ -465,12 +466,12 @@ def _make_events_handler(op: str, label: str, rpc, *, needs_name: bool = True, n
                         return fenced_error()
                     result = await rpc(server.session, args, server_name)
                 return json.dumps(result, ensure_ascii=False)
-            # Exception text can embed credentials; the type name is enough.
+            # Exception messages and arbitrary class names can embed credentials.
             return _handlers._dispatch(
                 server_name, server, op, _call, tool_timeout,
                 (_handlers._handle_auth_error_and_retry, _handlers._handle_session_expired_and_retry),
                 lambda exc: logger.error(
-                    "MCP %s/%s failed: %s", server_name, label, type(exc).__name__))
+                    "MCP %s/%s failed: %s", server_name, label, safe_exception_type(exc)))
         from tools.mcp_tool_session_env import protect_call
         return protect_call(server_name, _handler)
     return _factory

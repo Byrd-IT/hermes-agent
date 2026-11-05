@@ -32,10 +32,11 @@ def _run_on_loop(server):
     return _run
 
 
+@pytest.mark.parametrize("secret_class", [False, True])
 @pytest.mark.parametrize("payload", _PAYLOADS)
 @pytest.mark.parametrize("kind", ["tool", "utility", "events"])
 def test_final_failure_log_omits_exception_payload(
-    monkeypatch, caplog, payload, kind, isolated_ledgers,
+    monkeypatch, caplog, payload, kind, isolated_ledgers, secret_class,
 ):
     from tools import mcp_tool_events as events
     from tools import mcp_tool_handlers as handlers
@@ -45,15 +46,17 @@ def test_final_failure_log_omits_exception_payload(
     key = _resolve_server_key(name)
     server = SimpleNamespace(session=SimpleNamespace(), _rpc_lock=None)
 
+    error = type("synthetic_secret_class_ABC123", (Exception,), {})("benign") if secret_class else RuntimeError(payload)
+
     async def boom(*_args, **_kwargs):
-        raise RuntimeError(payload)
+        raise error
 
     server.session.call_tool = boom
     isolated_ledgers.servers[key] = server
     monkeypatch.setattr(handlers._loop, "_run_on_mcp_loop", _run_on_loop(server))
 
     async def rpc(_session, _args, _server_name):
-        raise RuntimeError(payload)
+        raise error
 
     with caplog.at_level(logging.ERROR, logger="tools.mcp_tool"):
         if kind == "tool":
@@ -75,7 +78,9 @@ def test_final_failure_log_omits_exception_payload(
     assert "error" in parsed, parsed
     failed = [record.getMessage() for record in caplog.records]
     assert any(needle in message for message in failed), caplog.text
-    assert "RuntimeError" in caplog.text
+    if not secret_class:
+        assert "RuntimeError" in caplog.text
+    assert "synthetic_secret_class_ABC123" not in caplog.text
     assert payload not in caplog.text
     assert "ABC123" not in caplog.text
     assert "user:pass" not in caplog.text

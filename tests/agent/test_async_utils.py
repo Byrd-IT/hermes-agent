@@ -135,6 +135,20 @@ class TestSafeScheduleThreadsafe:
         finally:
             loop.close()
 
+    def test_scheduling_failure_omits_exception_class_name(self, caplog):
+        secret = "synthetic_secret_class_ABC123"
+        loop = asyncio.new_event_loop()
+        try:
+            async def sample():
+                return None
+            with caplog.at_level(logging.DEBUG, logger="agent.async_utils"):
+                with patch("agent.async_utils.asyncio.run_coroutine_threadsafe",
+                           side_effect=type(secret, (Exception,), {})("benign")):
+                    assert safe_schedule_threadsafe(sample(), loop) is None
+            assert secret not in caplog.text
+        finally:
+            loop.close()
+
     def test_missing_loop_log_omits_exception_message(self, caplog):
         """A missing loop is logged by type, not by the raised message."""
         async def _sample():
