@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from agent import estop
+from agent import admission_gate, estop
 from gateway import restart_if_idle as rii
 from gateway import status
 from gateway.config import Platform
@@ -525,6 +525,7 @@ async def test_admission_and_the_decision_never_interleave_on_the_loop(home, hol
     loop = asyncio.get_running_loop()
     for i in range(200):
         runner = _runner()
+        admission_gate.reset_for_tests()           # one gateway per round: an accepted restart closes its gate for good
         body = _request(home, hold)
         admitted = []
 
@@ -778,10 +779,12 @@ async def test_a_request_that_cannot_be_consumed_is_retried_with_a_growing_pause
     assert 2 <= len(calls) <= 8                           # 0.05, 0.1, 0.2, 0.4 ... not 50
 
 
-def test_a_clean_claim_leaves_nothing_behind_and_a_second_claim_finds_nothing(home, hold):
+def test_a_clean_claim_leaves_only_the_marker_until_released_and_a_second_claim_finds_nothing(home, hold):
     _put(home, _request(home, hold))
     assert rii.claim_request(home)[0] is not None
     assert rii.claim_request(home) is None
+    assert [p.name for p in home.iterdir() if "restart_if_idle" in p.name] == [rii.claimed_path(home).name]
+    rii.release_claim(home)
     assert not [p for p in home.iterdir() if "restart_if_idle" in p.name]
 
 

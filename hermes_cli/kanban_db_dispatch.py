@@ -2058,6 +2058,33 @@ def _dispatch_lane_task(
     row: sqlite3.Row,
     assignee: str,
     result: DispatchResult,
+    **kwargs: Any,
+) -> bool:
+    """Guard, claim and spawn one ready/review row inside an admission span (``_dispatch_lane_task_admitted``).
+
+    Conditional restart (``gateway/restart_if_idle.py``): the embedded dispatcher reads the gateway's availability
+    in one thread hop and claims/spawns in another, so the availability read proves nothing by the time a card is
+    claimed. The span is the proof: a claim that begins before an idle decision is counted by it (and the decision
+    refuses), one that begins after an accepted decision is refused before the card is touched -- it stays ready
+    for the replacement gateway's dispatcher. A dry run changes nothing and needs no span."""
+    if kwargs.get("dry_run"):
+        return _dispatch_lane_task_admitted(conn, row, assignee, result, **kwargs)
+    from agent.admission_gate import gate as _admission_gate
+
+    span = _admission_gate().enter("kanban_spawn")
+    if span is None:
+        return False
+    try:
+        return _dispatch_lane_task_admitted(conn, row, assignee, result, **kwargs)
+    finally:
+        span.exit()
+
+
+def _dispatch_lane_task_admitted(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    assignee: str,
+    result: DispatchResult,
     *,
     lane: str,
     dry_run: bool,

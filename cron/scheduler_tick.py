@@ -111,6 +111,7 @@ def _tick_admitted(
     if lock_fd is None:
         return 0
 
+    _span = None
     try:
         # `hermes pause` ESTOP: skip dispatch, never touch in-flight runs; check_paused logs once.
         with contextlib.suppress(ImportError):
@@ -129,6 +130,16 @@ def _tick_admitted(
         except Exception as _wt_exc:
             _sched.logger.debug("Worktree maintenance dispatch failed: %s", _wt_exc)
 
+        # Conditional restart (gateway/restart_if_idle.py): ``can_dispatch`` above is read BEFORE this point and a
+        # stalled scan (jobs flock, slow disk) can sit between it and the registration of a job. From the scan to
+        # the last submit the tick is ONE admission span: counted by an idle decision that began before it, and
+        # refused -- before the scan stamps a one-shot's run claim or advances a recurring job, so nothing is
+        # dropped -- by one that was accepted.
+        from agent.admission_gate import gate as _admission_gate
+        _span = _admission_gate().enter("cron_tick")
+        if _span is None:
+            _sched.logger.debug("Cron dispatch skipped: the gateway accepted a conditional restart")
+            return 0
         due_jobs = _sched.get_due_jobs()
         _sched._sweep_stale_inflight_for_tick(due_jobs)
         if headless:
@@ -187,6 +198,7 @@ def _tick_admitted(
             _all_futures.append(fut)
             if not sync:
                 _results.append(True)  # optimistically counted
+        _span.exit()                   # every due job is registered (or refused) now; a sync wait is not a dispatch
 
         if sync:
             for f in concurrent.futures.as_completed(_all_futures):
@@ -201,4 +213,6 @@ def _tick_admitted(
         _sched._sweep_mcp_orphans_when_all_done(_all_futures)
         return sum(_results)
     finally:
+        if _span is not None:
+            _span.exit()               # idempotent: early returns and errors
         _sched._release_tick_lock(lock_fd)

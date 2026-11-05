@@ -287,11 +287,17 @@ class _KanbanDispatcher:
     @staticmethod
     def _decompose_one(_decomp: Any, slug: str, tid: str) -> int:
         """Decompose one triage task; returns 1 on success, 0 otherwise."""
-        try:
-            outcome = _decomp.decompose_task(tid, author="auto-decomposer")
-        except Exception:
-            logger.exception("kanban auto-decompose: decompose_task crashed on %s", tid)
-            return 0
+        # Conditional restart (gateway/restart_if_idle.py): an aux-LLM decomposition that starts after the gateway
+        # accepted a restart would be cut off by it, and one in progress is work an idle decision must see.
+        from agent.admission_gate import gate as _admission_gate
+        with _admission_gate().admit("kanban_decompose") as admitted:
+            if not admitted:
+                return 0
+            try:
+                outcome = _decomp.decompose_task(tid, author="auto-decomposer")
+            except Exception:
+                logger.exception("kanban auto-decompose: decompose_task crashed on %s", tid)
+                return 0
         if not outcome.ok:
             # Common no-op reasons (no aux client) must not spam logs every tick.
             logger.debug("kanban auto-decompose [%s]: %s skipped: %s", slug, tid, outcome.reason)

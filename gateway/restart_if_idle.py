@@ -25,10 +25,26 @@ signal, so an absent / unreadable / stale request can NEVER turn into an uncondi
   (not running / already restarting or draining) or ``refused_invalid`` (the request failed validation).
   No acknowledgement, no restart: an unwritable ack file refuses and reopens admission.
 
-The decision is a function of the request's lifetime: it is made (and acknowledged) at or before
-``expires_at`` or it is a refusal. After ``expires_at`` the requester therefore knows, without guessing, that
-this request can no longer restart anything. The requester can also withdraw a request it has not seen
-acknowledged by unlinking it: the gateway claims by an atomic rename, so exactly one of the two wins.
+The claimed marker (what makes "unknown" distinguishable from "withdrawn"): the gateway claims a request by an
+atomic rename to ``restart_if_idle.request.json.claimed`` and KEEPS that marker until its decision is durable:
+it is removed only AFTER the acknowledgement was written (accepted or any refusal) or after the gateway decided
+not to restart and could not write an acknowledgement (admission is reopened, nothing restarted). So a requester
+that reads the marker first and the acknowledgement second can conclude: marker gone + no ack -> the gateway
+did not accept (proven); ack accepted -> restarting; marker present + no ack -> UNDECIDED (an ack write can
+stall on a slow disk well past ``expires_at``: the expiry is checked before it, so a request is never ACCEPTED
+after it expires, but it can still be accepted after the requester stopped waiting). A requester that
+withdraws by unlinking the request proves nothing restarts only when the unlink succeeds; if the file is
+already gone it was claimed and the requester must wait for the marker, never assume a refusal. A crashed
+gateway can leave a stale marker; it carries the request_id, so a requester ignores one that is not its own.
+
+Admission freeze, completely: ``_draining`` plus ``agent/admission_gate.py``. ``_draining`` excludes everything
+on the loop thread; worker threads that passed their own gate earlier (cron ticker scan -> registration, a
+manual/external cron fire, the misfire sweep, the kanban dispatcher's claim -> spawn, the kanban decomposer)
+run inside admission SPANS. The decision raises the gate (``begin_decision``) BEFORE it counts, counts every
+span that already entered as work (``admission:<name>`` in ``active``), and a span that enters after it waits
+for the outcome: refused and idle -> admitted; accepted -> refused before it touched any state (a due job stays
+due, a ready card stays ready: they belong to the replacement gateway). The decision never waits for a span, a
+span never holds a lock while waiting, and a span nested in its own thread's span never waits.
 
 Everything else is unchanged: SIGUSR1, ``hermes gateway restart`` and ``/restart`` stay unconditional drains.
 """
@@ -98,11 +114,31 @@ def ack_path(home: Any) -> Any:
 # ── claiming ─────────────────────────────────────────────────────────────────
 
 
-def claim_request(home: Any) -> Optional[tuple[Optional[bytes], Optional[str]]]:
-    """Atomically take the request out of its slot. ``None``: there was none (or the requester withdrew it first).
-    Otherwise ``(raw, None)`` for a trusted file, or ``(None, reason)`` for one that is consumed but not trusted."""
+def claimed_path(home: Any) -> Any:
+    """The marker a claimed request becomes (``restart_if_idle.request.json.claimed``). It is the requester's proof
+    that the gateway took the request and has NOT yet made its decision durable: it stays until the
+    acknowledgement is written (or the gateway decided not to restart and could not say so)."""
     src = request_path(home)
-    mine = src.with_name(src.name + _CLAIMED_SUFFIX)
+    return src.with_name(src.name + _CLAIMED_SUFFIX)
+
+
+def release_claim(home: Any) -> None:
+    """Remove the claimed marker. Called ONLY after the decision is durable (the ack was written) or the gateway
+    decided not to restart; the requester reads the marker BEFORE the ack, so a marker that is gone with no ack
+    proves the request was not accepted."""
+    try:
+        os.unlink(claimed_path(home))
+    except OSError:
+        pass
+
+
+def claim_request(home: Any) -> Optional[tuple[Optional[bytes], Optional[str]]]:
+    """Atomically take the request out of its slot and leave it as the claimed marker (see :func:`claimed_path`;
+    the caller removes it with :func:`release_claim` once its decision is durable). ``None``: there was none (or
+    the requester withdrew it first). Otherwise ``(raw, None)`` for a trusted file, or ``(None, reason)`` for one
+    that is consumed but not trusted."""
+    src = request_path(home)
+    mine = claimed_path(home)
     try:
         os.replace(src, mine)                    # atomic: either we or the requester's unlink gets it
     except FileNotFoundError:
@@ -111,34 +147,28 @@ def claim_request(home: Any) -> Optional[tuple[Optional[bytes], Optional[str]]]:
         logger.warning("restart-if-idle: cannot claim the request (%s)", exc)
         return None, f"cannot claim the request: {exc}"
     try:
-        try:
-            st = os.lstat(mine)
-        except OSError as exc:
-            return None, f"cannot inspect the request: {exc}"
-        if not stat.S_ISREG(st.st_mode):
-            return None, "the request is not a regular file"
-        if os.name != "nt":
-            if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
-                return None, "the request is not owned by the gateway's user"
-            if st.st_mode & 0o022:
-                return None, "the request is group- or world-writable"
-        if st.st_size > MAX_REQUEST_BYTES:
-            return None, "the request is too large"
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            fd = os.open(mine, flags)
-            with os.fdopen(fd, "rb") as fh:
-                raw = fh.read(MAX_REQUEST_BYTES + 1)
-        except OSError as exc:
-            return None, f"cannot read the request: {exc}"
-        if len(raw) > MAX_REQUEST_BYTES:
-            return None, "the request is too large"
-        return raw, None
-    finally:
-        try:
-            os.unlink(mine)
-        except OSError:
-            pass
+        st = os.lstat(mine)
+    except OSError as exc:
+        return None, f"cannot inspect the request: {exc}"
+    if not stat.S_ISREG(st.st_mode):
+        return None, "the request is not a regular file"
+    if os.name != "nt":
+        if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+            return None, "the request is not owned by the gateway's user"
+        if st.st_mode & 0o022:
+            return None, "the request is group- or world-writable"
+    if st.st_size > MAX_REQUEST_BYTES:
+        return None, "the request is too large"
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(mine, flags)
+        with os.fdopen(fd, "rb") as fh:
+            raw = fh.read(MAX_REQUEST_BYTES + 1)
+    except OSError as exc:
+        return None, f"cannot read the request: {exc}"
+    if len(raw) > MAX_REQUEST_BYTES:
+        return None, "the request is too large"
+    return raw, None
 
 
 # ── validation ───────────────────────────────────────────────────────────────
@@ -277,8 +307,21 @@ def _delegations() -> int:
     return int(active_count())
 
 
+def _admission_spans() -> list[tuple[str, Callable[[], Any]]]:
+    """Worker threads that are between their gate and the registration of their work (cron tick / registration /
+    run / misfire fire, kanban claim+spawn, kanban decomposition: ``agent/admission_gate.py``). Read AFTER the
+    gate began deciding, so a span that exists is one that entered before it: work admitted but not yet visible
+    to any other count. Nothing is excluded."""
+    from agent.admission_gate import gate
+    return [(f"admission:{name}", (lambda n=n: n)) for name, n in sorted(gate().spans().items())]
+
+
 def _sources(runner: Any) -> list[tuple[str, Callable[[], Any]]]:
     from gateway import run_runtime
+    return _base_sources(runner, run_runtime) + _admission_spans()
+
+
+def _base_sources(runner: Any, run_runtime: Any) -> list[tuple[str, Callable[[], Any]]]:
     return [
         ("agents", lambda: len(runner._running_agents)),                       # includes pending-start sentinels
         ("managed_turns", lambda: run_runtime.managed_turn_count(runner)),     # managed workers, side agents, ...
@@ -355,6 +398,16 @@ def _decide(runner: Any) -> None:
     claimed = claim_request(home)
     if claimed is None:
         return
+    try:
+        _decide_claimed(runner, home, claimed)
+    finally:
+        # The claimed marker is the requester's proof that a decision is still pending. It goes only now: every
+        # path above has written its acknowledgement (accepted or a refusal) or decided NOT to restart and could
+        # not say so, so "marker gone and no ack" proves nothing was accepted, and "marker present" is "undecided".
+        release_claim(home)
+
+
+def _decide_claimed(runner: Any, home: Any, claimed: tuple[Optional[bytes], Optional[str]]) -> None:
     raw, problem = claimed
     pid, start = _own_identity()
     ack: dict = {"schema": PROTOCOL_VERSION, "pid": pid, "start_time": start, "request_id": None}
@@ -392,10 +445,19 @@ def _decide(runner: Any) -> None:
         return refuse(RESULT_NOT_READY, "the gateway is already draining")
 
     # ---- the one synchronous step: freeze, count, decide, acknowledge, start the restart --------
+    # Two freezes, one order. ``_draining`` excludes everything that runs on this (loop) thread; the admission gate
+    # excludes the WORKER threads that passed their own gate earlier and register later (cron, kanban): spans that
+    # entered before ``begin_decision`` are counted below, spans after it wait for the outcome. Both are raised
+    # BEFORE the count, never after: a count taken first would leave a window in which work is admitted unseen.
+    from agent.admission_gate import gate
+    admission = gate()
     previous = runner._draining                          # False here (checked above)
+    if not admission.begin_decision():
+        return refuse(RESULT_NOT_READY, "another conditional restart decision is in progress")
     runner._draining = True                              # 1. freeze admission (inbound, cron, API, WS gates)
+    accepted = False
     try:
-        probe = idle_probe(runner)                       # 2. count everything
+        probe = idle_probe(runner)                       # 2. count everything (incl. worker threads' spans)
         if _now() >= req["expires_at"]:
             runner._draining = previous
             return refuse(RESULT_INVALID, "the request expired before the decision")
@@ -413,12 +475,20 @@ def _decide(runner: Any) -> None:
             runner._draining = previous
             logger.warning("restart-if-idle: cannot acknowledge (%s); not restarting", exc)
             return
+        # The acknowledgement is durable: this is the commit point. Workers waiting on the outcome are refused from
+        # here on (the restart is under way), never admitted into a gateway that was counted as idle.
+        admission.end_decision(True)
+        accepted = True
         if not runner.request_restart(detached=False, via_service=True):     # 4. the normal graceful restart
             logger.error("restart-if-idle: accepted but request_restart declined (already started?)")
     except BaseException:
         if not getattr(runner, "_restart_task_started", False):
             runner._draining = previous
+            admission.reopen()
         raise
+    finally:
+        if not accepted:
+            admission.end_decision(False)                # every refusal reopens admission: workers go on
 
 
 # ── the poller ───────────────────────────────────────────────────────────────
