@@ -565,6 +565,37 @@ def _untracked_file_item(
     return item
 
 
+def _rename_pairs(repo: Path, refs: list[str], *, git_bin: str) -> list[tuple[str, str]]:
+    """Read Git's rename identities without splitting or unquoting filenames."""
+    proc = _git(repo, ["diff", "--name-status", "-z", "--find-renames", "--diff-filter=R", *refs], git_bin=git_bin)
+    fields = _ok(proc, "rename scan").split("\0")
+    return [(fields[i + 1], fields[i + 2]) for i in range(0, len(fields) - 2, 3)
+            if fields[i].startswith("R")]
+
+
+def _atomic_renames(repo: Path, upstream: str, items: list[dict], pairs: list[tuple[str, str]], *, git_bin: str) -> list[dict]:
+    """A rename's deletion and addition must succeed together, including at replay time."""
+    for old, new in dict.fromkeys(pairs):
+        rows = [item for item in items if old in item["files"] or new in item["files"]]
+        if not rows:
+            continue
+        files = list(dict.fromkeys(path for row in rows for path in row["files"]))
+        patch = "".join(row["patch"] for row in rows if not row["patch_equivalent"])
+        complete = old in files and new in files
+        equivalent = complete and all(row["patch_equivalent"] for row in rows)
+        check = "unknown"
+        if complete and all(row["patch"] or row["patch_equivalent"] for row in rows):
+            check = "clean" if equivalent else _file_apply_check(repo, patch, files, upstream, git_bin=git_bin)
+        merged = {**rows[0], "files": files, "patch": patch,
+                  "patch_id": _patch_id(patch, git_bin=git_bin),
+                  "patch_equivalent": equivalent, "apply_check": check}
+        merged.update(decide(merged))
+        first = items.index(rows[0])
+        items = [row for row in items if row not in rows]
+        items.insert(first, merged)
+    return items
+
+
 def _worktree_items(repo: Path, upstream: str, *, git_bin: str) -> list[dict]:
     items = []
     for xy, path in _status_entries(repo, git_bin=git_bin):
@@ -611,7 +642,9 @@ def _worktree_items(repo: Path, upstream: str, *, git_bin: str) -> list[dict]:
         }
         item.update(decide(item))
         items.append(item)
-    return items
+    pairs = _rename_pairs(repo, ["HEAD"], git_bin=git_bin)
+    pairs.extend(_rename_pairs(repo, ["--cached"], git_bin=git_bin))
+    return _atomic_renames(repo, upstream, items, pairs, git_bin=git_bin)
 
 
 def _stash_items(repo: Path, stash_ref: str, upstream: str, *, git_bin: str) -> list[dict]:
@@ -662,7 +695,8 @@ def _stash_items(repo: Path, stash_ref: str, upstream: str, *, git_bin: str) -> 
         repo, stash_ref, upstream, git_bin=git_bin,
         seen={row["files"][0] for row in items if row.get("files")},
     ))
-    return items
+    pairs = _rename_pairs(repo, [f"{stash_ref}^1", stash_ref], git_bin=git_bin)
+    return _atomic_renames(repo, upstream, items, pairs, git_bin=git_bin)
 
 
 def _stash_untracked_items(
@@ -790,14 +824,14 @@ def _apply_patch(dest: Path, patch: str, *, git_bin: str) -> str:
     if not patch.strip():
         return "drop"
     check = subprocess.run(
-        [git_bin, "apply", "--check", "-"], cwd=dest, input=patch,
-        capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", check=False, timeout=120,
+        [git_bin, "apply", "--check", "-"], cwd=dest, input=patch.encode("utf-8", errors="surrogateescape"),
+        capture_output=True, check=False, timeout=120,
     )
     if check.returncode != 0:
         return "conflict"
     applied = subprocess.run(
-        [git_bin, "apply", "-"], cwd=dest, input=patch,
-        capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", check=False, timeout=120,
+        [git_bin, "apply", "-"], cwd=dest, input=patch.encode("utf-8", errors="surrogateescape"),
+        capture_output=True, check=False, timeout=120,
     )
     return "reapply" if applied.returncode == 0 else "conflict"
 
@@ -1151,8 +1185,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    repo = Path(args.repo).resolve()
     try:
+        repo = Path(args.repo).resolve()
         if args.fetch:
             remote, _, branch = args.upstream.partition("/")
             if not branch:
