@@ -254,10 +254,10 @@ def test_a_ticker_arriving_while_the_decision_is_writing_its_ack_waits_and_is_th
     in_write, let_write = threading.Event(), threading.Event()
     real_write = rii.write_ack
 
-    def slow_write(h, payload):
+    def slow_write(h, payload, **kw):
         in_write.set()
         assert let_write.wait(20)
-        return real_write(h, payload)
+        return real_write(h, payload, **kw)
     monkeypatch.setattr(rii, "write_ack", slow_write)
     t, out = _start_tick(tick_mod, runner)
     assert at_housekeeping.wait(20)
@@ -595,11 +595,11 @@ def test_the_claimed_marker_stays_while_the_ack_write_is_stalled_and_goes_after_
     real_write = rii.write_ack
     order = []
 
-    def slow_write(h, payload):
+    def slow_write(h, payload, **kw):
         order.append("write-begin")
         in_write.set()
         assert let_write.wait(20)
-        real_write(h, payload)
+        real_write(h, payload, **kw)
         order.append("write-done")
     real_release = rii.release_claim
 

@@ -14,7 +14,7 @@ The exchange (two small files in the gateway's own home, next to ``gateway_state
 signal, so an absent / unreadable / stale request can NEVER turn into an unconditional restart):
 
 * request ``restart_if_idle.request.json`` -- written by the requester (mode 0600, atomic rename):
-  ``{"schema": 1, "kind": "restart_if_idle", "request_id", "owner", "token_sha256", "pid", "start_time",
+  ``{"schema": 2, "kind": "restart_if_idle", "request_id", "owner", "token_sha256", "pid", "start_time",
   "issued_at", "expires_at"}``. Bound to ONE process (``pid`` + ``start_time``), short-lived (at most
   :data:`MAX_REQUEST_TTL_S`), and authenticated by the live scoped hold it owns: ``token_sha256`` must be the
   digest of the token of a live scoped hold that includes the ``turns`` scope, and ``owner`` must be that hold's
@@ -36,6 +36,18 @@ after it expires, but it can still be accepted after the requester stopped waiti
 withdraws by unlinking the request proves nothing restarts only when the unlink succeeds; if the file is
 already gone it was claimed and the requester must wait for the marker, never assume a refusal. A crashed
 gateway can leave a stale marker; it carries the request_id, so a requester ignores one that is not its own.
+
+The decision is BOUNDED, because from the freeze to the durable acknowledgement the whole gateway is closed to new
+work (``_draining``) and the requester's chat pause is running: ``accepted`` is the commit point and it is published
+only if that happens before the request's ``expires_at`` (the end of the requester's final window). The acknowledgement
+is first STAGED (written and fsynced to a private temporary file, off the loop thread, so a stalled disk cannot hold the
+loop for longer than the bound) and then PUBLISHED by one atomic rename on the loop thread, after a last look at the
+clock. If staging has not finished at ``expires_at`` the decision is ABANDONED, never accepted: nothing was published
+(the late stage deletes its own file), admission reopens exactly as it was, nothing restarts and the claimed marker is
+removed with no acknowledgement -- which a requester reads as "proven not accepted". An accepted acknowledgement that
+was published cannot be revoked: the restart is under way. Refusals reopen admission BEFORE their acknowledgement is
+written (a refusal is already decided, so a slow disk must not keep the gateway closed or make admission spans wait) and
+their write is bounded by the requester's own give-up instant (``expires_at`` + :data:`ACK_MARGIN_S`).
 
 Admission freeze, completely: ``_draining`` plus ``agent/admission_gate.py``. ``_draining`` excludes everything
 on the loop thread; worker threads that passed their own gate earlier (cron ticker scan -> registration, a
@@ -71,6 +83,10 @@ _CLAIMED_SUFFIX = ".claimed"
 MAX_REQUEST_BYTES = 4096
 MAX_REQUEST_TTL_S = 60.0
 _FUTURE_SKEW_S = 5.0
+# How long after ``expires_at`` a requester still reads for an answer (the plugin's ``conditional.ACK_MARGIN_S``; the
+# coupling tests assert they are equal). The core publishes ``accepted`` strictly BEFORE ``expires_at``; this margin
+# only bounds how long a REFUSAL's write may hold the loop, because a later answer would be read by nobody.
+ACK_MARGIN_S = 3.0
 POLL_S = 0.25
 _SEEN_MAX = 64
 
@@ -79,6 +95,7 @@ RESULT_BUSY = "refused_busy"
 RESULT_UNKNOWN = "refused_unknown_activity"
 RESULT_NOT_READY = "refused_not_ready"
 RESULT_INVALID = "refused_invalid"
+RESULT_RESTART_FAILED = "restart_failed"   # superseding answer: ``accepted`` was published but the restart could not start
 
 # Set while the poller of THIS process is alive: the only thing that makes the capability claim true.
 _ACTIVE = False
@@ -234,8 +251,14 @@ def validate_request(raw: bytes, *, pid: int, start_time: Optional[int], now: fl
 # ── acknowledgement ──────────────────────────────────────────────────────────
 
 
-def write_ack(home: Any, payload: dict) -> None:
-    """Atomic, private. Raises OSError (the caller then refuses: no ack, no restart)."""
+class AckAbandoned(TimeoutError):
+    """The acknowledgement was not durable by its deadline and was NOT published (an ``OSError``: callers that treat
+    an unwritable acknowledgement as "refuse and reopen" treat this the same way)."""
+
+
+def _stage_ack(home: Any, payload: dict) -> Any:
+    """Write and fsync the acknowledgement to a private temporary file next to its final name; return that path. This is
+    the part that can stall (slow fsync on a contended disk); nothing is visible to the requester yet."""
     path = ack_path(home)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{os.urandom(4).hex()}.tmp")
     try:
@@ -247,13 +270,76 @@ def write_ack(home: Any, payload: dict) -> None:
                 os.fsync(fh.fileno())
             except OSError:
                 pass
-        os.replace(tmp, path)
     except BaseException:
         try:
             tmp.unlink()
         except OSError:
             pass
         raise
+    return tmp
+
+
+def _publish_ack(home: Any, tmp: Any) -> None:
+    """The commit: one atomic rename. A failed rename leaves no stray temporary file."""
+    try:
+        os.replace(tmp, ack_path(home))
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def write_ack(home: Any, payload: dict, *, deadline: Optional[float] = None) -> None:
+    """Atomic, private. Raises OSError (the caller then refuses: no ack, no restart).
+
+    With ``deadline`` (absolute, ``time.time()``) the write is BOUNDED: staging runs on a helper thread and is waited
+    for until the deadline; if it is not finished the acknowledgement is abandoned (:class:`AckAbandoned`) and the
+    helper deletes its own temporary file when it finally returns, so a late stage can never publish. The decisive
+    clock reading is taken right before the publishing rename, after staging: an acknowledgement is published only
+    while ``now < deadline``. Without ``deadline`` the write is synchronous (callers that must not bound it)."""
+    if deadline is None:
+        _publish_ack(home, _stage_ack(home, payload))
+        return
+    lock = threading.Lock()
+    state: dict = {"abandoned": False, "tmp": None, "error": None}
+    done = threading.Event()
+
+    def stage() -> None:
+        try:
+            tmp = _stage_ack(home, payload)
+        except BaseException as exc:                 # reported to the waiting decision
+            state["error"] = exc
+            done.set()
+            return
+        with lock:
+            if state["abandoned"]:                    # nobody is waiting any more: never publish, clean up
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                return
+            state["tmp"] = tmp
+        done.set()
+
+    threading.Thread(target=stage, name="restart-if-idle-ack-stage", daemon=True).start()
+    done.wait(max(deadline - _now(), 0.0))
+    with lock:
+        tmp = state["tmp"]
+        if tmp is None and state["error"] is None:
+            state["abandoned"] = True                 # staging is still running: it will delete its file
+    if state["error"] is not None:
+        raise state["error"]
+    if tmp is None:
+        raise AckAbandoned("the acknowledgement was not durable before its deadline; not published")
+    if _now() >= deadline:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise AckAbandoned("the acknowledgement's deadline passed before it could be published; not published")
+    _publish_ack(home, tmp)
 
 
 # ── what counts as work ──────────────────────────────────────────────────────
@@ -411,16 +497,20 @@ def _decide_claimed(runner: Any, home: Any, claimed: tuple[Optional[bytes], Opti
     raw, problem = claimed
     pid, start = _own_identity()
     ack: dict = {"schema": PROTOCOL_VERSION, "pid": pid, "start_time": start, "request_id": None}
+    asked_until: dict = {}                               # the requester's expires_at once the request was parsed
 
-    def finish(result: str, reason: str = "", **extra: Any) -> None:
+    def finish(result: str, reason: str = "", *, deadline: Optional[float] = None, **extra: Any) -> None:
         ack.update(result=result, reason=reason, at=time.time(), **extra)
-        write_ack(home, ack)
+        write_ack(home, ack, deadline=deadline)
         logger.info("restart-if-idle: %s%s", result, f" ({reason})" if reason else "")
 
     def refuse(result: str, reason: str, **extra: Any) -> None:
+        # A refusal restarts nothing; its acknowledgement is only worth writing while the requester still reads for
+        # it (its own give-up instant), so a stalled disk cannot hold the loop for longer than that.
+        until = max(asked_until.get("expires_at", 0.0), _now()) + ACK_MARGIN_S
         try:
-            finish(result, reason, **extra)
-        except OSError as exc:
+            finish(result, reason, deadline=until, **extra)
+        except OSError as exc:                           # includes AckAbandoned: marker gone + no ack = not accepted
             logger.warning("restart-if-idle: refusal could not be acknowledged (%s)", exc)
 
     if raw is None:
@@ -431,10 +521,13 @@ def _decide_claimed(runner: Any, home: Any, claimed: tuple[Optional[bytes], Opti
             parsed = json.loads(raw.decode("utf-8", "replace"))
             if isinstance(parsed, dict) and isinstance(parsed.get("request_id"), str):
                 ack["request_id"] = parsed["request_id"][:64]
+            if isinstance(parsed, dict) and _real(parsed.get("expires_at")):
+                asked_until["expires_at"] = min(float(parsed["expires_at"]), _now() + MAX_REQUEST_TTL_S)
         except ValueError:
             pass
         return refuse(RESULT_INVALID, why or "invalid request")
     ack["request_id"] = req["request_id"]
+    asked_until["expires_at"] = req["expires_at"]
     if not _remember(runner, req["request_id"]):
         return refuse(RESULT_INVALID, "replayed request_id")
     if not getattr(runner, "_running", False):
@@ -455,40 +548,91 @@ def _decide_claimed(runner: Any, home: Any, claimed: tuple[Optional[bytes], Opti
     if not admission.begin_decision():
         return refuse(RESULT_NOT_READY, "another conditional restart decision is in progress")
     runner._draining = True                              # 1. freeze admission (inbound, cron, API, WS gates)
+    reopened = False
+
+    def reopen() -> None:
+        """Admission exactly as it was before the decision. Every outcome that restarts nothing calls this BEFORE it
+        writes anything: a decided refusal must not keep the gateway closed (or its workers waiting) behind a slow
+        acknowledgement write."""
+        nonlocal reopened
+        if not reopened:
+            reopened = True
+            runner._draining = previous
+            admission.end_decision(False)
+
     accepted = False
     try:
         probe = idle_probe(runner)                       # 2. count everything (incl. worker threads' spans)
         if _now() >= req["expires_at"]:
-            runner._draining = previous
+            reopen()
             return refuse(RESULT_INVALID, "the request expired before the decision")
         if probe["busy"]:
-            runner._draining = previous                  # 3a. work exists: reopen, restart nothing
+            reopen()                                     # 3a. work exists: reopen, restart nothing
             return refuse(RESULT_BUSY, "work is active: " + ", ".join(f"{k}={v}" for k, v in probe["busy"].items()),
                           active=probe["busy"], unknown=probe["unknown"])
         if probe["unknown"]:
-            runner._draining = previous
+            reopen()
             return refuse(RESULT_UNKNOWN, "could not read: " + ", ".join(probe["unknown"]),
                           active=probe["busy"], unknown=probe["unknown"])
         try:
-            finish(RESULT_ACCEPTED, "idle at the decision; admission frozen", active={}, unknown=[])   # 3b. ack FIRST
+            # 3b. ack FIRST, and only while the requester's window is open: the published acknowledgement is the commit
+            # point and cannot be revoked, so it must never land after ``expires_at`` (the end of the requester's final
+            # window). A stalled write is ABANDONED at that instant: nothing was published, nothing restarts.
+            finish(RESULT_ACCEPTED, "idle at the decision; admission frozen", deadline=req["expires_at"],
+                   active={}, unknown=[])
+        except AckAbandoned as exc:
+            reopen()
+            logger.warning("restart-if-idle: ABANDONED, not accepted (%s); admission reopened, nothing restarted", exc)
+            return
         except OSError as exc:
-            runner._draining = previous
+            reopen()
             logger.warning("restart-if-idle: cannot acknowledge (%s); not restarting", exc)
             return
         # The acknowledgement is durable: this is the commit point. Workers waiting on the outcome are refused from
         # here on (the restart is under way), never admitted into a gateway that was counted as idle.
         admission.end_decision(True)
         accepted = True
-        if not runner.request_restart(detached=False, via_service=True):     # 4. the normal graceful restart
+        try:
+            started = runner.request_restart(detached=False, via_service=True)     # 4. the normal graceful restart
+        except BaseException:
+            _restart_failed(runner, home, ack, previous, admission)
+            raise
+        if not started:
             logger.error("restart-if-idle: accepted but request_restart declined (already started?)")
     except BaseException:
-        if not getattr(runner, "_restart_task_started", False):
-            runner._draining = previous
-            admission.reopen()
+        if not accepted:
+            reopen()
         raise
     finally:
         if not accepted:
-            admission.end_decision(False)                # every refusal reopens admission: workers go on
+            reopen()                                     # every refusal reopens admission: workers go on
+
+
+def _restart_failed(runner: Any, home: Any, ack: dict, previous: bool, admission: Any) -> None:
+    """``request_restart`` RAISED after ``accepted`` was published. The acknowledgement cannot be revoked, but leaving
+    the gateway frozen with no restart task would close it for good: if no restart task exists nothing is restarting,
+    so the half-set restart flags are cleared, admission reopens, and a SUPERSEDING acknowledgement says the accepted
+    restart did not happen (a requester that has not yet consumed ``accepted`` reads the truth; one that has, finds the
+    process unchanged at its own verification and decides from that). If a restart task exists the restart is under way
+    and is left alone."""
+    if getattr(runner, "_restart_task", None) is not None:
+        logger.error("restart-if-idle: request_restart raised but a restart task exists; the restart is under way")
+        return
+    logger.error("restart-if-idle: ACCEPTED but request_restart failed and no restart is under way; "
+                 "reopening admission (the accepted restart did NOT happen)")
+    for flag in ("_restart_requested", "_restart_task_started"):
+        try:
+            setattr(runner, flag, False)
+        except Exception:
+            pass
+    runner._draining = previous
+    admission.reopen()
+    try:
+        ack.update(result=RESULT_RESTART_FAILED, reason="accepted, but the restart could not be started; "
+                   "admission was reopened and nothing restarted", at=time.time())
+        write_ack(home, ack, deadline=_now() + ACK_MARGIN_S)
+    except OSError as exc:
+        logger.warning("restart-if-idle: the restart failure could not be acknowledged (%s)", exc)
 
 
 # ── the poller ───────────────────────────────────────────────────────────────
