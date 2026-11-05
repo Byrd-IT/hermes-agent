@@ -41,7 +41,7 @@ def test_cancel_swallowed_by_the_task_still_discards_the_result(mcp_loop):
 
     async def connect():
         try:
-            await asyncio.sleep(3600)
+            await asyncio.Event().wait()  # hangs until the caller abandons it
         except asyncio.CancelledError:
             return server  # swallow the cancel and hand back a live connection
 
