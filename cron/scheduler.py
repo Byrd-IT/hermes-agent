@@ -808,19 +808,26 @@ def try_register_running_job(job_id: str, *, owner=None, future=_FUTURE_PENDING)
     and ``mark_running_jobs_interrupted``. Dedupe is per PROFILE: the key carries the active cron
     scope's home, so one multiplexing process never treats two profiles' same-named jobs as one.
     """
+    from agent.admission_gate import gate as _admission_gate
     from hermes_cli.backend_retirement import retirement
 
     key = _inflight_key(job_id, _remember_inflight_home(_get_hermes_home()))
-    with retirement.work() as admitted, _running_lock:
-        if not admitted or key in _running_job_ids:
+    # Conditional restart (gateway/restart_if_idle.py): registration is one admission span. A registration that
+    # starts before an idle decision is counted by it (the span, then ``get_running_job_ids``); one that starts
+    # after it waits for the outcome and is refused if the restart was accepted. No lock is held while waiting.
+    with _admission_gate().admit("cron_register") as gate_open:
+        if not gate_open:
             return False
-        _running_job_ids.add(key)
-        # Same critical section as the add: no window where an in-flight id lacks an age the sweep
-        # can bound. Sentinel is replaced by the real future once ``pool.submit`` returns.
-        _running_since[key] = time.time()
-        _running_futures[key] = future
-        _running_registration_owners[key] = owner
-        return True
+        with retirement.work() as admitted, _running_lock:
+            if not admitted or key in _running_job_ids:
+                return False
+            _running_job_ids.add(key)
+            # Same critical section as the add: no window where an in-flight id lacks an age the sweep
+            # can bound. Sentinel is replaced by the real future once ``pool.submit`` returns.
+            _running_since[key] = time.time()
+            _running_futures[key] = future
+            _running_registration_owners[key] = owner
+            return True
 
 
 def release_running_job(
@@ -2795,6 +2802,29 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
 
 
 def run_one_job(
+    job: dict, *, adapters=None, loop=None, verbose: bool = False,
+    extra_prompt: Optional[str] = None, cancel_event: Optional[_CancelEventLike] = None,
+) -> bool:
+    """Run ONE due job end-to-end (see ``_run_one_job_admitted``), inside an admission span.
+
+    Every fire that reaches here -- the ticker's pool worker, an external provider's fire, a manual run -- is
+    counted by a conditional-restart decision for as long as it runs, and one that starts after the restart was
+    accepted is refused (``False``; its claim, if any, lapses at its TTL) instead of adding a drain to a
+    gateway that was frozen as idle. Callers that reserve earlier (the ticker's registration, the API's
+    reservation, the misfire sweep's span) are already counted; this is the net under any other caller."""
+    from agent.admission_gate import gate as _admission_gate
+
+    with _admission_gate().admit("cron_run") as gate_open:
+        if not gate_open:
+            logger.warning("Job '%s' not started: the gateway is restarting (conditional restart accepted)",
+                           job.get("id"))
+            return False
+        return _run_one_job_admitted(
+            job, adapters=adapters, loop=loop, verbose=verbose, extra_prompt=extra_prompt,
+            cancel_event=cancel_event)
+
+
+def _run_one_job_admitted(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, cancel_event: Optional[_CancelEventLike] = None,
 ) -> bool:

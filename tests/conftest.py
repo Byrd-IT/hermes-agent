@@ -458,6 +458,16 @@ def _reset_foreground_exit_fence():
 
 
 @pytest.fixture(autouse=True)
+def _fresh_admission_gate():
+    """The conditional-restart admission gate is process-wide (an accepted restart closes it for good); a test that
+    accepts one must not close admission for the next."""
+    from agent import admission_gate
+    admission_gate.reset_for_tests()
+    yield
+    admission_gate.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_kanban_memory_guard(request, monkeypatch):
     """Pin the kanban dispatcher's memory guard to "no data" for every test.
 
