@@ -169,8 +169,12 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30, *, on_discard=None):
         # cancel() loses the race when a resource-producing task already completed.
         if not future.cancel() and on_discard is not None and not future.cancelled():
             if future.exception() is None:
-                safe_schedule_threadsafe(on_discard(future.result()), loop, logger=logger,
-                                         log_message="MCP discarded-result cleanup scheduling failed")
+                cleanup = on_discard(future.result())
+                try:
+                    asyncio.run_coroutine_threadsafe(cleanup, loop)
+                except Exception:  # health: allow BLE001 -- close unsubmitted coroutine; never log payloads
+                    cleanup.close()
+                    logger.debug("MCP discarded-result cleanup scheduling failed")
 
     while True:
         if is_interrupted():

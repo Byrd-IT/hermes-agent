@@ -77,6 +77,7 @@ def test_completed_connection_is_cleaned_when_waiter_abandons(monkeypatch, inter
         return future
 
     monkeypatch.setattr(async_utils, "safe_schedule_threadsafe", schedule)
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", schedule)
     if not interrupted:
         run = loop._run_on_mcp_loop
         monkeypatch.setattr(loop, "_run_on_mcp_loop", lambda fn, **kw: run(fn, **{**kw, "timeout": -1}))
