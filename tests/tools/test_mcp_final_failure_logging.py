@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 
+pytest_plugins = ["tests.tools.test_mcp_session_env_close_failures"]
+
 _PAYLOADS = [
     "Authorization: Bearer synthe...C123",
     "https://user:pass@host.invalid/path",
@@ -32,8 +34,9 @@ def _run_on_loop(server):
 
 @pytest.mark.parametrize("payload", _PAYLOADS)
 @pytest.mark.parametrize("kind", ["tool", "utility", "events"])
-def test_final_failure_log_omits_exception_payload(monkeypatch, caplog, payload, kind):
-    from tools import mcp_tool as core
+def test_final_failure_log_omits_exception_payload(
+    monkeypatch, caplog, payload, kind, isolated_ledgers,
+):
     from tools import mcp_tool_events as events
     from tools import mcp_tool_handlers as handlers
     from tools.mcp_tool_scope import _resolve_server_key
@@ -46,39 +49,34 @@ def test_final_failure_log_omits_exception_payload(monkeypatch, caplog, payload,
         raise RuntimeError(payload)
 
     server.session.call_tool = boom
-    monkeypatch.setitem(core._servers, key, server)
+    isolated_ledgers.servers[key] = server
     monkeypatch.setattr(handlers._loop, "_run_on_mcp_loop", _run_on_loop(server))
 
     async def rpc(_session, _args, _server_name):
         raise RuntimeError(payload)
 
-    try:
-        with caplog.at_level(logging.ERROR, logger="tools.mcp_tool"):
-            if kind == "tool":
-                result = handlers._make_tool_handler(name, "probe", 5.0)({})
-                needle = "call failed"
-            elif kind == "utility":
-                factory = handlers._make_utility_handler(
-                    "resources/list", "list_resources", rpc, lambda *_a: {},
-                )
-                result = factory(name, 5.0)({})
-                needle = "list_resources failed"
-            else:
-                factory = events._make_events_handler(
-                    "events/list", "list_event_types", rpc, needs_name=False,
-                )
-                result = factory(name, 5.0)({})
-                needle = "list_event_types failed"
-        parsed = json.loads(result)
-        assert "error" in parsed, parsed
-        failed = [record.getMessage() for record in caplog.records]
-        assert any(needle in message for message in failed), caplog.text
-        assert "RuntimeError" in caplog.text
-        assert payload not in caplog.text
-        assert "ABC123" not in caplog.text
-        assert "user:pass" not in caplog.text
-        assert all(record.exc_info is None for record in caplog.records)
-    finally:
-        core._server_error_counts.pop(key, None)
-        core._server_breaker_opened_at.pop(key, None)
-        core._server_errors_all_application.pop(key, None)
+    with caplog.at_level(logging.ERROR, logger="tools.mcp_tool"):
+        if kind == "tool":
+            result = handlers._make_tool_handler(name, "probe", 5.0)({})
+            needle = "call failed"
+        elif kind == "utility":
+            factory = handlers._make_utility_handler(
+                "resources/list", "list_resources", rpc, lambda *_a: {},
+            )
+            result = factory(name, 5.0)({})
+            needle = "list_resources failed"
+        else:
+            factory = events._make_events_handler(
+                "events/list", "list_event_types", rpc, needs_name=False,
+            )
+            result = factory(name, 5.0)({})
+            needle = "list_event_types failed"
+    parsed = json.loads(result)
+    assert "error" in parsed, parsed
+    failed = [record.getMessage() for record in caplog.records]
+    assert any(needle in message for message in failed), caplog.text
+    assert "RuntimeError" in caplog.text
+    assert payload not in caplog.text
+    assert "ABC123" not in caplog.text
+    assert "user:pass" not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)

@@ -13,13 +13,6 @@ from tools.mcp_tool_common import _core
 pytest_plugins = ["tests.tools.test_mcp_session_env_close_failures"]
 
 
-def _isolate_uncovered_maps(isolated_ledgers, monkeypatch):
-    """Lazy configs, epochs, and call leases are outside isolated_ledgers."""
-    monkeypatch.setattr(isolated_ledgers.core, "_lazy_server_configs", {})
-    monkeypatch.setattr(isolated_ledgers.se, "_base_epochs", {})
-    monkeypatch.setattr(isolated_ledgers.se, "_call_leases", {})
-
-
 @pytest.mark.parametrize("interrupt", [False, True])
 def test_connect_cannot_publish_after_teardown_or_swallow_interrupt(
     monkeypatch, interrupt, isolated_ledgers,
@@ -27,11 +20,10 @@ def test_connect_cannot_publish_after_teardown_or_swallow_interrupt(
     from agent.session_client_env import client_env_scope
     from tools import mcp_tool_loop as loop
 
-    _isolate_uncovered_maps(isolated_ledgers, monkeypatch)
     base = "lifetime"
     _core._lazy_server_configs[base] = {"command": "unused", "session_env": ["RUN_PIN"]}
     server = SimpleNamespace(session=object(), shutdown=AsyncMock())
-    monkeypatch.setattr(loop, "_ensure_mcp_loop", lambda: None)
+    loop._ensure_mcp_loop()
     monkeypatch.setattr(se, "_ensure_reaper", lambda: None)
     monkeypatch.setattr(se, "_render", lambda config, values: config)
 
@@ -68,7 +60,6 @@ def test_handler_lease_prevents_eviction_before_rpc_starts(
     from tools import mcp_tool_discovery as discovery
     from tools import mcp_tool_handlers as handlers
 
-    _isolate_uncovered_maps(isolated_ledgers, monkeypatch)
     base = "leased"
     _core._lazy_server_configs[base] = {"command": "unused", "session_env": ["RUN_PIN"]}
     monkeypatch.setattr(handlers, "_trust_gate_check", lambda *args: None)
@@ -105,7 +96,6 @@ def test_shutdown_invalidates_a_call_queued_after_lease(
     from tools import mcp_tool_loop as loop
     from tools.mcp_tool_scope import _resolve_server_key
 
-    _isolate_uncovered_maps(isolated_ledgers, monkeypatch)
     base = "queued-shutdown"
     _core._lazy_server_configs[base] = {"command": "unused", "session_env": ["RUN_PIN"]}
     keys = []
@@ -149,7 +139,6 @@ def test_scoped_close_selects_variants_atomically(monkeypatch, isolated_ledgers)
     from agent.session_client_env import client_env_scope
     from tools import mcp_tool_loop as loop
 
-    _isolate_uncovered_maps(isolated_ledgers, monkeypatch)
     monkeypatch.setattr(loop, "_run_on_mcp_loop", lambda fn, **kw: asyncio.run(fn()))
 
     base = "atomic-close"

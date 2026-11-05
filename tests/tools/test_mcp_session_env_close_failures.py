@@ -19,7 +19,12 @@ import pytest
 
 @pytest.fixture
 def isolated_ledgers(monkeypatch):
-    """Swap process-global MCP ledgers so a test cannot leak into another."""
+    """Swap process-global MCP ledgers so a test cannot leak into another.
+
+    ``variant_key`` also writes lazy configs, epochs, and leases, which the
+    close tests do not plant. ``reset()`` signals the process reaper; that
+    pair is swapped too so a test cannot stop a reaper it does not own.
+    """
     from tools import mcp_tool as core
     from tools import mcp_tool_session_env as se
 
@@ -33,10 +38,15 @@ def isolated_ledgers(monkeypatch):
         breaker_opened_at={},
         errors_all_application={},
         connect_errors={},
+        lazy_configs={},
         pending={},
         last_used={},
         connect_locks={},
         retry_after={},
+        base_epochs={},
+        call_leases={},
+        reaper=None,
+        reaper_stop=threading.Event(),
     )
     monkeypatch.setattr(core, "_servers", state.servers)
     monkeypatch.setattr(core, "_server_scope_keys", state.scope_keys)
@@ -49,10 +59,15 @@ def isolated_ledgers(monkeypatch):
         core, "_server_errors_all_application", state.errors_all_application
     )
     monkeypatch.setattr(core, "_server_connect_errors", state.connect_errors)
+    monkeypatch.setattr(core, "_lazy_server_configs", state.lazy_configs)
     monkeypatch.setattr(se, "_pending", state.pending)
     monkeypatch.setattr(se, "_last_used", state.last_used)
     monkeypatch.setattr(se, "_connect_locks", state.connect_locks)
     monkeypatch.setattr(se, "_retry_after", state.retry_after)
+    monkeypatch.setattr(se, "_base_epochs", state.base_epochs)
+    monkeypatch.setattr(se, "_call_leases", state.call_leases)
+    monkeypatch.setattr(se, "_reaper", state.reaper)
+    monkeypatch.setattr(se, "_reaper_stop", state.reaper_stop)
     return state
 
 

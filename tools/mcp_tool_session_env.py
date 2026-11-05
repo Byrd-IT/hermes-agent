@@ -333,22 +333,65 @@ def _release_fenced(task) -> None:
         task.exception()  # retrieved; the close already logged its own failure
 
 
-async def _shutdown_fenced(server):
-    """Close *server* in a task the caller's timeout cannot cancel.
+def _schedule_fenced_close(server) -> threading.Event:
+    """Queue *server*'s close before any cancellable wait.
 
-    ``_run_on_mcp_loop`` cancels its future when the wait expires. Awaiting the
-    close in that future lets the cancel cut it short. ``on_discard`` cannot
-    repair that: it runs only after the wrapped coroutine returns, and a cancel
-    that lands during close never produces a result to hand off. The close
-    therefore runs shielded, in its own task.
+    ``_run_on_mcp_loop`` cancels its future on timeout or interrupt. A cancel
+    that lands before that coroutine is stepped never runs the body, so the
+    close cannot live only there. The spawn callback is not that future: once
+    queued, giving up on the wait cannot drop it.
     """
-    task = asyncio.ensure_future(_shutdown_discarded(server))
-    _FENCED_CLEANUPS.add(task)
-    task.add_done_callback(_release_fenced)
+    from tools import mcp_tool_loop as _loop
+
+    finished = threading.Event()
+    loop = _loop._running_loop()
+    if loop is None:
+        logger.debug("MCP session-env fenced connection cleanup failed")
+        finished.set()
+        return finished
+
+    async def _close():
+        try:
+            await _shutdown_discarded(server)
+        finally:
+            finished.set()
+
+    # Capture the caller's home and OAuth scope here, as ``_run_on_mcp_loop`` does,
+    # then hand the close to a callback the wait cannot cancel.
+    coro = _loop._wrap_with_dashboard_oauth_flow(_loop._wrap_with_home_override(_close()))
+
+    def _spawn():
+        try:
+            task = asyncio.ensure_future(coro)
+        except RuntimeError:
+            coro.close()
+            finished.set()
+            logger.debug("MCP session-env fenced connection cleanup failed")
+            return
+        _FENCED_CLEANUPS.add(task)
+        task.add_done_callback(_release_fenced)
+
     try:
-        await asyncio.shield(task)
-    except asyncio.CancelledError:
-        return
+        loop.call_soon_threadsafe(_spawn)
+    except RuntimeError:
+        coro.close()
+        finished.set()
+        logger.debug("MCP session-env fenced connection cleanup failed")
+    return finished
+
+
+def _wait_fenced(finished: threading.Event) -> None:
+    """Wait for a close already queued. Timeout and interrupt do not cancel it."""
+    from tools.interrupt import is_interrupted
+
+    deadline = time.monotonic() + _FENCED_CLEANUP_TIMEOUT
+    while not finished.is_set():
+        if is_interrupted():
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        finished.wait(min(0.1, remaining))
 
 
 def protect_call(server_name, handler):
@@ -463,7 +506,7 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
         if not current:
             if server is not None:
                 try:
-                    _loop._run_on_mcp_loop(lambda: _shutdown_fenced(server), timeout=_FENCED_CLEANUP_TIMEOUT)
+                    _wait_fenced(_schedule_fenced_close(server))
                 except Exception:  # health: allow BLE001 -- fenced cleanup is best-effort, without payloads
                     logger.debug("MCP session-env fenced connection cleanup failed")
             return None

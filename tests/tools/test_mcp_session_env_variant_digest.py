@@ -15,6 +15,10 @@ from agent.session_client_env import client_env_scope
 from tools import mcp_tool_session_env as se
 from tools.mcp_tool_common import _core
 
+# Ledgers live on the process. Borrow the close-failure fixture instead of
+# writing the real dicts and wiping them with reset().
+pytest_plugins = ["tests.tools.test_mcp_session_env_close_failures"]
+
 _CONFIG = {
     "command": "unused",
     "args": ["--pin", "${RUN_PIN}"],
@@ -26,12 +30,6 @@ _CONFIG = {
 def _install(base, config=None):
     _core._lazy_server_configs[base] = dict(config or _CONFIG)
     return _core._lazy_server_configs[base]
-
-
-def _cleanup(*bases):
-    for base in bases:
-        _core._lazy_server_configs.pop(base, None)
-    se.reset()
 
 
 def _identity(base, values):
@@ -61,76 +59,65 @@ def _id_of(key):
     return scope, digest
 
 
-def test_variant_id_is_hmac_under_the_process_secret_not_an_unkeyed_hash():
+def test_variant_id_is_hmac_under_the_process_secret_not_an_unkeyed_hash(isolated_ledgers):
     """Knowing the epoch and the session values must not be enough to rebuild the id."""
     base = ("profile-scope", "digest-srv")
     values = {"RUN_PIN": "slug-a"}
     _install(base)
-    try:
-        with client_env_scope(values):
-            key = se.variant_key(base)
-        assert se.is_variant_key(key)
-        scope, digest = _id_of(key)
-        material = _material(base, values)
-        unkeyed = hashlib.sha256(material).hexdigest()[:16]
-        assert digest != unkeyed
-        assert scope == "profile-scope"
-        assert key[1] == "digest-srv"
-        assert digest == _keyed(material)
-        assert "slug-a" not in key[0]
-        assert len(digest) == 16
-    finally:
-        _cleanup(base)
+    with client_env_scope(values):
+        key = se.variant_key(base)
+    assert key is not None
+    assert se.is_variant_key(key)
+    scope, digest = _id_of(key)
+    material = _material(base, values)
+    unkeyed = hashlib.sha256(material).hexdigest()[:16]
+    assert digest != unkeyed
+    assert scope == "profile-scope"
+    assert key[1] == "digest-srv"
+    assert digest == _keyed(material)
+    assert "slug-a" not in key[0]
+    assert len(digest) == 16
 
 
-def test_same_inputs_reuse_the_variant_id_until_the_process_secret_rotates(monkeypatch):
+def test_same_inputs_reuse_the_variant_id_until_the_process_secret_rotates(monkeypatch, isolated_ledgers):
     """One secret reuses the connection; rotating it must mint a different id."""
     base = "digest-rotate"
     values = {"RUN_PIN": "slug-a"}
     _install(base)
-    try:
-        with client_env_scope(values):
-            first = se.variant_key(base)
-            again = se.variant_key(base)
-            rotated = os.urandom(32)
-            monkeypatch.setattr(se, "_DIGEST_SECRET", rotated, raising=False)
-            second = se.variant_key(base)
-        assert first == again
-        assert second != first
-        assert _id_of(second)[1] == _keyed(_material(base, values), rotated)
-        assert _id_of(first)[1] != _id_of(second)[1]
-    finally:
-        _cleanup(base)
+    with client_env_scope(values):
+        first = se.variant_key(base)
+        again = se.variant_key(base)
+        rotated = os.urandom(32)
+        monkeypatch.setattr(se, "_DIGEST_SECRET", rotated, raising=False)
+        second = se.variant_key(base)
+    assert first == again
+    assert second != first
+    assert _id_of(second)[1] == _keyed(_material(base, values), rotated)
+    assert _id_of(first)[1] != _id_of(second)[1]
 
 
-def test_value_or_config_change_still_selects_a_fresh_keyed_id():
+def test_value_or_config_change_still_selects_a_fresh_keyed_id(isolated_ledgers):
     """A new value or an edited base config still gets its own id, still keyed."""
     base = "digest-fresh"
     config = _install(base)
-    try:
-        with client_env_scope({"RUN_PIN": "slug-a"}):
-            original = se.variant_key(base)
-        assert _id_of(original)[1] == _keyed(_material(base, {"RUN_PIN": "slug-a"}))
-        with client_env_scope({"RUN_PIN": "slug-b"}):
-            changed_value = se.variant_key(base)
-        assert original != changed_value
-        assert _id_of(changed_value)[1] == _keyed(_material(base, {"RUN_PIN": "slug-b"}))
-        config["args"] = ["--changed"]
-        with client_env_scope({"RUN_PIN": "slug-a"}):
-            changed_config = se.variant_key(base)
-        assert changed_config not in (original, changed_value)
-        assert _id_of(changed_config)[1] == _keyed(_material(base, {"RUN_PIN": "slug-a"}))
-    finally:
-        _cleanup(base)
+    with client_env_scope({"RUN_PIN": "slug-a"}):
+        original = se.variant_key(base)
+    assert _id_of(original)[1] == _keyed(_material(base, {"RUN_PIN": "slug-a"}))
+    with client_env_scope({"RUN_PIN": "slug-b"}):
+        changed_value = se.variant_key(base)
+    assert original != changed_value
+    assert _id_of(changed_value)[1] == _keyed(_material(base, {"RUN_PIN": "slug-b"}))
+    config["args"] = ["--changed"]
+    with client_env_scope({"RUN_PIN": "slug-a"}):
+        changed_config = se.variant_key(base)
+    assert changed_config not in (original, changed_value)
+    assert _id_of(changed_config)[1] == _keyed(_material(base, {"RUN_PIN": "slug-a"}))
 
 
 @pytest.mark.parametrize("values", [{"RUN_PIN": ""}, {}, {"OTHER": "x"}])
-def test_absent_declared_values_still_do_not_mint_a_variant(values):
+def test_absent_declared_values_still_do_not_mint_a_variant(values, isolated_ledgers):
     """Keying the digest must not start a variant when the client sent nothing declared."""
     base = "digest-absent"
     _install(base)
-    try:
-        with client_env_scope(values):
-            assert se.variant_key(base) is None
-    finally:
-        _cleanup(base)
+    with client_env_scope(values):
+        assert se.variant_key(base) is None
