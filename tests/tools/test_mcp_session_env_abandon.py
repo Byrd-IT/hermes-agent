@@ -145,3 +145,65 @@ def test_fenced_connect_cleanup_failure_does_not_escape(monkeypatch):
         assert len(calls) == 2
     finally:
         se.reset()
+
+
+def test_discard_started_before_the_pending_cancel_still_finishes(mcp_loop, monkeypatch):
+    """The task finishes after the abandon flag is set but before task.cancel() lands."""
+    from agent import async_utils
+    from tools import mcp_tool_loop as loop
+
+    server = object()
+    proceed = asyncio.Event()
+    gate = asyncio.Event()
+    started = threading.Event()
+    completed = threading.Event()
+
+    async def cleanup(result):
+        started.set()
+        await gate.wait()  # still shutting down when the cancel arrives
+        completed.set()
+
+    async def connect():
+        await proceed.wait()
+        return server
+
+    real_schedule = async_utils.safe_schedule_threadsafe
+
+    class SlowCancel:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def cancel(self):
+            mcp_loop.call_soon_threadsafe(proceed.set)
+            assert started.wait(5)  # discard is running inside the wrapped task
+            self._inner.cancel()  # the real task.cancel() now arrives
+            mcp_loop.call_soon_threadsafe(gate.set)
+            return True
+
+        def result(self, timeout=None):
+            raise TimeoutError
+
+        def done(self):
+            return False
+
+    monkeypatch.setattr(async_utils, "safe_schedule_threadsafe",
+                        lambda *a, **k: SlowCancel(real_schedule(*a, **k)))
+    with pytest.raises(TimeoutError):
+        loop._run_on_mcp_loop(connect, timeout=0.2, on_discard=cleanup)
+    assert completed.wait(5)
+
+
+def test_bound_variant_key_reaches_the_real_loop_task(mcp_loop):
+    """The fence relies on the caller's context reaching the task run on the MCP loop."""
+    from tools import mcp_tool_loop as loop
+
+    token = se._bound_keys.set({"base": ("scope#env:x", "base")})
+    try:
+        seen = loop._run_on_mcp_loop(lambda: _read_bound(), timeout=5)
+    finally:
+        se._bound_keys.reset(token)
+    assert seen == {"base": ("scope#env:x", "base")}
+
+
+async def _read_bound():
+    return se._bound_keys.get()

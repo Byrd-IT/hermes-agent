@@ -171,7 +171,11 @@ class _DiscardGuard:
                 else:
                     self._have, self._result = True, result
             if discard:
-                await self._on_discard(result)
+                # Its own task: the abandoning thread's pending task.cancel() must not cut the
+                # shutdown short (the loop keeps only weak refs, so hold a strong one).
+                cleanup = asyncio.ensure_future(self._on_discard(result))
+                _DISCARD_TASKS.add(cleanup)
+                cleanup.add_done_callback(_DISCARD_TASKS.discard)
             return result
         return guarded()
 
@@ -183,17 +187,14 @@ class _DiscardGuard:
         with self._lock:
             if self._handled:
                 return _NO_RESULT
-            if self._have:
-                result = self._result
-            elif future.done() and not future.cancelled() and future.exception() is None:
-                result = future.result()  # completed without passing through the wrapper
-            else:
+            if not self._have:
                 return _NO_RESULT
             self._handled = True
-            return result
+            return self._result
 
 
 _NO_RESULT = object()
+_DISCARD_TASKS: set = set()
 
 
 def _abandoner(future, loop, guard):
