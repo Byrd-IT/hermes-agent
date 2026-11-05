@@ -59,8 +59,10 @@ def test_apply_transport_is_byte_exact(tmp_path, monkeypatch):
         return real_run(*args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", record)
+    assert carry._file_apply_check(repo, patch, ["a.txt"], "HEAD", git_bin="git") == "clean"
+    assert carry._patch_id(patch, git_bin="git")
     assert carry._apply_patch(repo, patch, git_bin="git") == "reapply"
-    assert payloads == [patch.encode(), patch.encode()]
+    assert [value for value in payloads if value is not None] == [patch.encode()] * 4
     assert (repo / "a.txt").read_bytes() == b"bytes\r\n"
 
 

@@ -177,10 +177,10 @@ def _patch_id(diff: str, *, git_bin: str = "git") -> str:
     if not diff.strip():
         return ""
     proc = subprocess.run(
-        [git_bin, "patch-id", "--stable"], input=diff, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", check=False,
+        [git_bin, "patch-id", "--stable"], input=diff.encode("utf-8", errors="surrogateescape"), capture_output=True, check=False,
         timeout=120,
     )
-    parts = (proc.stdout or "").split()
+    parts = proc.stdout.decode("utf-8", errors="surrogateescape").split()
     return parts[0] if parts else ""
 
 
@@ -462,7 +462,7 @@ def _file_apply_check(repo: Path, patch: str, paths: list[str], upstream: str, *
                     return "unknown"
         proc = subprocess.run(
             [git_bin, "apply", "--check", "--unsafe-paths", "-"],
-            cwd=temp, input=patch, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", check=False, timeout=120,
+            cwd=temp, input=patch.encode("utf-8", errors="surrogateescape"), capture_output=True, check=False, timeout=120,
         )
         return "clean" if proc.returncode == 0 else "conflict"
     finally:
