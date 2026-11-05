@@ -14,6 +14,13 @@ import pytest
 from tools import mcp_tool as _core
 from tools import mcp_tool_session_env as se
 
+pytest_plugins = ["tests.tools.test_mcp_session_env_close_failures"]
+
+
+@pytest.fixture(autouse=True)
+def _isolate_variant_ledgers(isolated_ledgers):
+    yield
+
 
 @pytest.fixture
 def mcp_loop(monkeypatch):
