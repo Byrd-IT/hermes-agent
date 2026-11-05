@@ -511,6 +511,24 @@ async def _finish_pending_fenced(*, timeout: float) -> None:
             task.exception()
 
 
+def _creator_loop(server) -> Optional[asyncio.AbstractEventLoop]:
+    """Loop that built *server*'s run task, if that binding is known.
+
+    The task, transport, and anyio cancel scopes live on that loop. The MCP
+    loop registered now may already be a replacement; shutdown must not follow
+    it. A closed creator is still returned so the caller does not retarget.
+    """
+    task = getattr(server, "_task", None)
+    get_loop = getattr(task, "get_loop", None)
+    if not callable(get_loop):
+        return None
+    try:
+        loop = get_loop()
+    except RuntimeError:
+        return None
+    return loop if isinstance(loop, asyncio.AbstractEventLoop) else None
+
+
 def _schedule_fenced_close(server) -> threading.Event:
     """Queue *server*'s close before any cancellable wait.
 
@@ -518,6 +536,14 @@ def _schedule_fenced_close(server) -> threading.Event:
     that lands before that coroutine is stepped never runs the body, so the
     close cannot live only there. The spawn callback is not that future: once
     queued, giving up on the wait cannot drop it.
+
+    The record is owned by the loop that built the server, not by whichever
+    MCP loop is current when the waiter returns. A connect can finish on the
+    loop that accepted it after that loop has been replaced; scheduling the
+    close on the replacement attaches shutdown to the wrong loop and lets the
+    creator's stop drop the server. A known creator that is already closed is
+    not retargeted. Servers with no task binding (tests, a close before
+    ``start``) still use the current loop.
 
     The record is registered before the callback is queued, owned by the loop
     generation that accepted it. ``loop.stop`` drops a callback that missed
@@ -530,7 +556,11 @@ def _schedule_fenced_close(server) -> threading.Event:
 
     finished = threading.Event()
     scope = _loop._capture_fenced_scope()
-    loop = _loop._running_loop()
+    creator = _creator_loop(server)
+    if creator is not None:
+        loop = None if creator.is_closed() else creator
+    else:
+        loop = _loop._running_loop()
     if loop is None:
         logger.debug("MCP session-env fenced connection cleanup failed")
         finished.set()

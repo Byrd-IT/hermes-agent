@@ -1,5 +1,6 @@
 """Fenced server cleanup belongs to the loop that accepted it."""
 import asyncio
+import itertools
 import threading
 from types import SimpleNamespace
 
@@ -93,8 +94,11 @@ def _release_held(soon, held):
 
 
 def _isolate_fenced(monkeypatch):
+    """Fresh fenced ledgers. Generation ids must not leak across tests."""
     monkeypatch.setattr(session_env, "_FENCED_CLOSES", [])
     monkeypatch.setattr(session_env, "_FENCED_CLEANUPS", set())
+    monkeypatch.setattr(session_env, "_LOOP_GENERATIONS", {})
+    monkeypatch.setattr(session_env, "_LOOP_GENERATION_SEQ", itertools.count(1))
 
 
 def _server(observed, loop_tag):
@@ -348,3 +352,229 @@ def test_old_loop_shutdown_does_not_consume_newer_fenced_close(
         if not old_loop.is_closed():
             _join_loop(old_loop, old_thread, old_soon)
         _join_loop(new_loop, new_thread, new_real)
+
+
+def _parked_task(loop):
+    """A task bound to *loop*, so its loop is the one that built it."""
+
+    async def make():
+        async def hang():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return
+
+        return asyncio.ensure_future(hang())
+
+    return asyncio.run_coroutine_threadsafe(make(), loop).result(5)
+
+
+def _bound_server(task, observed):
+    async def shutdown():
+        observed.append(asyncio.get_running_loop())
+
+    return SimpleNamespace(shutdown=shutdown, _task=task)
+
+
+def _drop_task(loop, soon, task):
+    if task is None or task.done() or loop.is_closed():
+        return
+    if not loop.is_running():
+        task.cancel()
+        try:
+            loop.run_until_complete(task)
+        except (asyncio.CancelledError, RuntimeError):
+            pass
+        return
+
+    async def cancel():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        asyncio.run_coroutine_threadsafe(cancel(), loop).result(5)
+    except (asyncio.CancelledError, TimeoutError, RuntimeError):
+        pass
+    else:
+        return
+    try:
+        soon(task.cancel)
+    except RuntimeError:
+        pass
+
+
+def _finish_on(loop, timeout):
+    return asyncio.run_coroutine_threadsafe(
+        session_env._finish_pending_fenced(timeout=timeout), loop,
+    ).result(5)
+
+
+def test_fenced_close_uses_creator_loop_not_current(monkeypatch, isolated_ledgers):
+    """A server built on one loop must not be shut down on a later MCP loop."""
+    creator, creator_thread, _creator_soon = _start_loop()
+    current, current_thread, _current_soon = _start_loop()
+    task = _parked_task(creator)
+    creator_real, creator_hold, creator_held = _hold_soon(creator)
+    current_real, current_hold, current_held = _hold_soon(current)
+    monkeypatch.setattr(creator, "call_soon_threadsafe", creator_hold)
+    monkeypatch.setattr(current, "call_soon_threadsafe", current_hold)
+    monkeypatch.setattr(loop_mod, "_running_loop", lambda: current)
+    _isolate_fenced(monkeypatch)
+    observed = []
+    try:
+        finished = session_env._schedule_fenced_close(_bound_server(task, observed))
+        assert creator_held, "close was not queued on the loop that built the server"
+        assert not current_held, "close was queued on the current loop"
+        monkeypatch.setattr(current, "call_soon_threadsafe", current_real)
+        _finish_on(current, 1)
+        assert not finished.is_set(), "replacement loop consumed the creator's close"
+        assert not observed
+        monkeypatch.setattr(creator, "call_soon_threadsafe", creator_real)
+        _release_held(creator_real, creator_held)
+        assert finished.wait(5)
+        assert observed == [creator]
+    finally:
+        monkeypatch.setattr(creator, "call_soon_threadsafe", creator_real)
+        monkeypatch.setattr(current, "call_soon_threadsafe", current_real)
+        _release_held(creator_real, creator_held)
+        _release_held(current_real, current_held)
+        _drop_task(creator, creator_real, task)
+        _join_loop(creator, creator_thread, creator_real)
+        _join_loop(current, current_thread, current_real)
+
+
+def test_closed_creator_loop_is_not_retargeted(monkeypatch, isolated_ledgers):
+    """A dead creator is a failed close, not a shutdown on the replacement loop."""
+    creator, creator_thread, creator_soon = _start_loop()
+    current, current_thread, _current_soon = _start_loop()
+    task = _parked_task(creator)
+    _drop_task(creator, creator_soon, task)
+    creator_soon(creator.stop)
+    creator_thread.join(5)
+    creator.close()
+    assert task.get_loop().is_closed()
+    current_real, current_hold, current_held = _hold_soon(current)
+    monkeypatch.setattr(current, "call_soon_threadsafe", current_hold)
+    monkeypatch.setattr(loop_mod, "_running_loop", lambda: current)
+    _isolate_fenced(monkeypatch)
+    observed = []
+    try:
+        finished = session_env._schedule_fenced_close(_bound_server(task, observed))
+        assert finished.is_set(), "closed creator left the waiter blocked on another loop"
+        assert not current_held, "closed creator was retargeted to the current loop"
+        assert not observed
+        assert not session_env._FENCED_CLOSES
+    finally:
+        monkeypatch.setattr(current, "call_soon_threadsafe", current_real)
+        _release_held(current_real, current_held)
+        _join_loop(current, current_thread, current_real)
+
+
+def test_stopped_creator_is_not_finished_by_replacement(monkeypatch, isolated_ledgers):
+    """Drain on the live loop must not run a close the stopped creator still owns."""
+    creator, creator_thread, creator_soon = _start_loop()
+    current, current_thread, _current_soon = _start_loop()
+    task = _parked_task(creator)
+    creator_soon(creator.stop)
+    creator_thread.join(5)
+    assert not creator.is_running() and not creator.is_closed()
+    current_real, current_hold, current_held = _hold_soon(current)
+    monkeypatch.setattr(current, "call_soon_threadsafe", current_hold)
+    monkeypatch.setattr(loop_mod, "_running_loop", lambda: current)
+    _isolate_fenced(monkeypatch)
+    observed = []
+    try:
+        finished = session_env._schedule_fenced_close(_bound_server(task, observed))
+        assert not current_held, "stopped creator's close was queued on the current loop"
+        assert not finished.is_set()
+        monkeypatch.setattr(current, "call_soon_threadsafe", current_real)
+        _finish_on(current, 1)
+        assert not finished.is_set(), "replacement drain ran another loop's close"
+        assert not observed
+        lifecycle._finish_fenced_before_close(creator)
+        assert finished.wait(5)
+        assert observed == [creator]
+    finally:
+        monkeypatch.setattr(current, "call_soon_threadsafe", current_real)
+        _release_held(current_real, current_held)
+        if not creator.is_closed():
+            _drop_task(creator, creator_soon, task)
+            if not creator.is_closed():
+                creator.close()
+        _join_loop(current, current_thread, current_real)
+
+
+async def _parked_body():
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        return
+
+
+def test_ensure_connected_fences_close_on_the_loop_that_built_the_server(
+    monkeypatch, isolated_ledgers,
+):
+    """After connect returns, the close follows the builder loop, not ``_running_loop``."""
+    from agent.session_client_env import client_env_scope
+    from tools import mcp_tool_discovery as discovery
+
+    creator, creator_thread, creator_soon = _start_loop()
+    current, current_thread, current_soon = _start_loop()
+    current_real, current_hold, current_held = _hold_soon(current)
+    monkeypatch.setattr(current, "call_soon_threadsafe", current_hold)
+    loops = {"active": creator}
+    monkeypatch.setattr(loop_mod, "_running_loop", lambda: loops["active"])
+    monkeypatch.setattr(loop_mod, "_ensure_mcp_loop", lambda: None)
+    monkeypatch.setattr(session_env, "_render", lambda config, values: config)
+    monkeypatch.setattr(session_env, "_FENCED_CLEANUP_TIMEOUT", 0)
+    _isolate_fenced(monkeypatch)
+    base = "origin-loop"
+    isolated_ledgers.lazy_configs[base] = {
+        "command": "unused",
+        "session_env": ["PIN"],
+    }
+    observed = []
+    parked = {}
+    key_box: list = [None]
+    closed = threading.Event()
+
+    def run_on(coro_or_factory, timeout=30, on_discard=None):
+        loop = loops["active"]
+        coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+        return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout)  # type: ignore[arg-type]
+
+    async def connect(_name, _config):
+        task = asyncio.ensure_future(_parked_body())
+        parked["task"] = task
+
+        async def shutdown():
+            observed.append(asyncio.get_running_loop())
+            if not task.done():
+                task.cancel()
+            closed.set()
+
+        with session_env._guard:
+            session_env._pending.pop(key_box[0], None)
+        loops["active"] = current
+        return SimpleNamespace(session=object(), shutdown=shutdown, _task=task)
+
+    monkeypatch.setattr(loop_mod, "_run_on_mcp_loop", run_on)
+    monkeypatch.setattr(discovery, "_connect_server", connect)
+    try:
+        with client_env_scope({"PIN": "a"}):
+            key_box[0] = session_env.variant_key(base)
+            assert key_box[0] is not None
+            result = session_env.ensure_connected(base, key_box[0])
+        assert result is None
+        assert not current_held, "close was queued on the replacement loop"
+        assert closed.wait(5), "close did not run on the loop that built the server"
+        assert observed == [creator]
+    finally:
+        monkeypatch.setattr(current, "call_soon_threadsafe", current_real)
+        _release_held(current_real, current_held)
+        _drop_task(creator, creator_soon, parked.get("task"))
+        _join_loop(creator, creator_thread, creator_soon)
+        _join_loop(current, current_thread, current_soon)
