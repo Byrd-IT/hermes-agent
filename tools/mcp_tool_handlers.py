@@ -275,6 +275,9 @@ def _result_is_error(result) -> bool:
 def _record_call_outcome(server_name: str, result) -> Any:
     """Breaker bookkeeping: an error payload from the tool itself still counts as a strike (#10447),
     flagged as an application error so the open-breaker message stays truthful."""
+    from tools.mcp_tool_session_env import fenced_error
+    if result == fenced_error():  # the connection was torn down: not this call's server's failure
+        return result
     if _result_is_error(result):
         _core._bump_server_error(server_name, application=True)
     else:
@@ -725,9 +728,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
 
         async def _call():
             async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):
-                from tools.mcp_tool_session_env import call_is_current
+                from tools.mcp_tool_session_env import call_is_current, fenced_error
                 if not call_is_current(server_name, server):
-                    return tool_error("MCP server is not connected")
+                    return fenced_error()
                 server._pending_call_context = contextvars.copy_context()  # for the elicitation callback
                 try:
                     result = await _call_tool_racing_stdio_death(
@@ -768,9 +771,9 @@ def _make_utility_handler(op: str, log_label: str, rpc, render, required: Option
 
             async def _call():
                 async with server._rpc_lock:
-                    from tools.mcp_tool_session_env import call_is_current
+                    from tools.mcp_tool_session_env import call_is_current, fenced_error
                     if not call_is_current(server_name, server):
-                        return tool_error("MCP server is not connected")
+                        return fenced_error()
                     result = await rpc(server.session, args, server_name)
                 return json.dumps(render(result, server_name), ensure_ascii=False)
             return _dispatch(

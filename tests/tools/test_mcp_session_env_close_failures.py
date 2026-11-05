@@ -4,7 +4,7 @@ A TimeoutError while submitting the close to the MCP loop leaves the server
 and its pending, last-used, and connect-lock entries in place, so a later
 close or idle reap can still tear it down. A successful close clears those
 entries and reports only servers that were actually live. Cancelling one
-shutdown still awaits the others, then propagates.
+shutdown still awaits the others; the coroutine re-raises, the sync boundary logs.
 """
 
 import asyncio
@@ -193,28 +193,29 @@ def test_close_for_bases_counts_only_live_closures(
     other_server.shutdown.assert_not_awaited()
 
 
-@pytest.mark.parametrize("threadsafe", [False, True])
-def test_cancelled_shutdown_awaits_the_rest_then_propagates(
-    isolated_ledgers, monkeypatch, threadsafe
+def test_cancelled_shutdown_awaits_the_rest_and_sync_callers_carry_on(
+    isolated_ledgers, monkeypatch
 ):
-    """The first shutdown's CancelledError still awaits the second, then propagates."""
+    """One cancelled shutdown still awaits the others; the sync boundary does not re-raise.
+
+    Reload and lazy-forget call close_for_bases and must finish their own teardown.
+    """
     base = ("profile", "pinsrv")
     first_key = ("scope#env:one", "pinsrv")
     second_key = ("scope#env:two", "pinsrv")
     first, _lock = _plant_live(isolated_ledgers, first_key, base, "alpha")
     second, _lock = _plant_live(isolated_ledgers, second_key, base, "beta")
     first.shutdown.side_effect = asyncio.CancelledError
+
     def run(factory, **kwargs):
         try:
             return _run_inline(factory, **kwargs)
         except asyncio.CancelledError:
-            if threadsafe:
-                raise concurrent.futures.CancelledError from None
-            raise
+            raise concurrent.futures.CancelledError from None
 
     _arm(monkeypatch, run)
-    cancelled = concurrent.futures.CancelledError if threadsafe else asyncio.CancelledError
-    with pytest.raises(cancelled):
-        isolated_ledgers.se.close_for_bases([base])
+    assert isolated_ledgers.se.close_for_bases([base]) == 0
     assert first.shutdown.await_count == 1
     assert second.shutdown.await_count == 1
+    assert first_key not in isolated_ledgers.servers
+    assert second_key not in isolated_ledgers.servers

@@ -460,9 +460,9 @@ def _make_events_handler(op: str, label: str, rpc, *, needs_name: bool = True, n
 
             async def _call():
                 async with server._rpc_lock:
-                    from tools.mcp_tool_session_env import call_is_current
+                    from tools.mcp_tool_session_env import call_is_current, fenced_error
                     if not call_is_current(server_name, server):
-                        return tool_error("MCP server is not connected")
+                        return fenced_error()
                     result = await rpc(server.session, args, server_name)
                 return json.dumps(result, ensure_ascii=False)
             return _handlers._dispatch(

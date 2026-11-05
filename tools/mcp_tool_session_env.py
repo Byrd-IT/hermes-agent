@@ -16,7 +16,6 @@ idle (``_IDLE_TTL_SEC``) or past ``_MAX_VARIANTS`` (least recently used first).
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import hashlib
 import itertools
 from contextvars import ContextVar
@@ -287,11 +286,18 @@ def _close(keys, *, base_keys=None, protect_in_use: bool = False, decided_at: Op
         return sum(server is not None for _, server in servers)
     try:
         return _loop._run_on_mcp_loop(_shutdown, timeout=20)
-    except concurrent.futures.CancelledError:
-        raise
     except Exception:  # health: allow BLE001 -- best-effort close, logged
+        # A cancelled shutdown surfaces here as concurrent.futures.CancelledError. The on-loop
+        # coroutine already re-raised it after attempting every popped server and selection/removal
+        # ran on the loop, so sync callers (reload, lazy-forget, eviction) must carry on.
         logger.debug("MCP session-env variant close could not reach the loop")
         return 0
+
+
+def fenced_error() -> str:
+    """The result of a queued variant call whose connection was torn down before it ran."""
+    from tools.registry import tool_error
+    return tool_error("MCP server is not connected")
 
 
 def call_is_current(server_name, server) -> bool:
@@ -406,8 +412,8 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
                 on_discard=_shutdown_discarded)
         except InterruptedError:
             raise
-        except Exception:  # health: allow BLE001 -- failed connects cool down without exposing payloads
-            logger.warning("MCP per-session connection failed")
+        except Exception as exc:  # health: allow BLE001 -- failed connects cool down; only the type name is logged
+            logger.warning("MCP server '%s': per-session connection failed (%s)", server_name, type(exc).__name__)
             with _guard:
                 if _pending.get(key) is pending:
                     _forget_ledgers(key)
@@ -422,7 +428,10 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
                 _core._server_scope_keys[key] = key[0]
         if not current:
             if server is not None:
-                _loop._run_on_mcp_loop(lambda: _shutdown_discarded(server), timeout=20)
+                try:
+                    _loop._run_on_mcp_loop(lambda: _shutdown_discarded(server), timeout=20)
+                except Exception:  # health: allow BLE001 -- fenced cleanup is best-effort, without payloads
+                    logger.debug("MCP session-env fenced connection cleanup failed")
             return None
         _ensure_reaper()
         return server

@@ -145,6 +145,74 @@ def _running_loop() -> Optional[asyncio.AbstractEventLoop]:
     return loop if loop is not None and loop.is_running() else None
 
 
+class _DiscardGuard:
+    """Hands a connection nobody will consume to ``on_discard`` exactly once.
+
+    ``Future.cancel()`` cannot be trusted to mean "no result was produced": the task may finish
+    in the same instant (or swallow the cancel), after which the concurrent future drops the
+    value. The wrapped coroutine therefore checks the abandoned flag on the loop itself.
+    """
+
+    def __init__(self, on_discard):
+        self._on_discard = on_discard
+        self._lock = threading.Lock()
+        self._abandoned = False
+        self._handled = False
+        self._have = False
+        self._result = None
+
+    def wrap(self, coro):
+        async def guarded():
+            result = await coro
+            with self._lock:
+                discard = self._abandoned and not self._handled
+                if discard:
+                    self._handled = True
+                else:
+                    self._have, self._result = True, result
+            if discard:
+                await self._on_discard(result)
+            return result
+        return guarded()
+
+    def take_for_abandon(self, future):
+        """Mark abandoned; return the unconsumed result that still needs cleanup, if any."""
+        with self._lock:
+            self._abandoned = True
+        future.cancel()
+        with self._lock:
+            if self._handled:
+                return _NO_RESULT
+            if self._have:
+                result = self._result
+            elif future.done() and not future.cancelled() and future.exception() is None:
+                result = future.result()  # completed without passing through the wrapper
+            else:
+                return _NO_RESULT
+            self._handled = True
+            return result
+
+
+_NO_RESULT = object()
+
+
+def _abandoner(future, loop, guard):
+    def abandon():
+        if guard is None:
+            future.cancel()
+            return
+        result = guard.take_for_abandon(future)
+        if result is _NO_RESULT:
+            return
+        cleanup = guard._on_discard(result)
+        try:
+            asyncio.run_coroutine_threadsafe(cleanup, loop)
+        except Exception:  # health: allow BLE001 -- close unsubmitted coroutine; never log payloads
+            cleanup.close()
+            logger.debug("MCP discarded-result cleanup scheduling failed")
+    return abandon
+
+
 def _run_on_mcp_loop(coro_or_factory, timeout: float = 30, *, on_discard=None):
     """Schedule a coroutine (or zero-arg factory — avoids leaking a never-awaited coroutine when the
     loop is down) on the MCP loop and block until done, polling so user interrupts are honored."""
@@ -160,21 +228,15 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30, *, on_discard=None):
     # would vanish here; re-establish it inside the task's own context.
     coro = _wrap_with_dashboard_oauth_flow(_wrap_with_home_override(
         coro_or_factory() if callable(coro_or_factory) else coro_or_factory))
+    guard = _DiscardGuard(on_discard) if on_discard is not None else None
+    if guard is not None:
+        coro = guard.wrap(coro)
     future = safe_schedule_threadsafe(coro, loop, logger=logger, log_message="MCP scheduling failed")
     if future is None:
         raise RuntimeError("MCP event loop unavailable (failed to schedule)")
     start_time = time.monotonic()
     deadline = None if timeout is None else start_time + timeout
-    def abandon():
-        # cancel() loses the race when a resource-producing task already completed.
-        if not future.cancel() and on_discard is not None and not future.cancelled():
-            if future.exception() is None:
-                cleanup = on_discard(future.result())
-                try:
-                    asyncio.run_coroutine_threadsafe(cleanup, loop)
-                except Exception:  # health: allow BLE001 -- close unsubmitted coroutine; never log payloads
-                    cleanup.close()
-                    logger.debug("MCP discarded-result cleanup scheduling failed")
+    abandon = _abandoner(future, loop, guard)
 
     while True:
         if is_interrupted():
