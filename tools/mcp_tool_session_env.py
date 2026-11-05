@@ -16,7 +16,6 @@ idle (``_IDLE_TTL_SEC``) or past ``_MAX_VARIANTS`` (least recently used first).
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import itertools
 from contextvars import ContextVar
 from functools import wraps
@@ -47,6 +46,8 @@ _retry_after: dict = {}  # variant key -> monotonic deadline after a failed conn
 _CONNECT_RETRY_COOLDOWN_SEC = 30.0
 _guard = threading.Lock()
 _LOG_SALT = os.urandom(16)  # per-process: a logged id cannot be brute-forced offline
+# Process key: a leaked variant id is not an offline preimage of session values.
+_DIGEST_SECRET = os.urandom(32)
 _REAP_INTERVAL_SEC = 60.0
 _reaper_stop = threading.Event()
 _reaper: Optional[threading.Thread] = None
@@ -203,7 +204,11 @@ def variant_key(base_key):
     with _guard:
         if base_key not in _base_epochs:
             _base_epochs[base_key] = next(_epoch_sequence)
-        digest = hashlib.sha256(f"{_base_epochs[base_key]}:{ident}".encode()).hexdigest()[:16]
+        # Same preimage as before (epoch + values + plain config), but keyed so the id
+        # embedded in the server key cannot be brute-forced back to the session values.
+        digest = hmac.new(
+            _DIGEST_SECRET, f"{_base_epochs[base_key]}:{ident}".encode(), "sha256",
+        ).hexdigest()[:16]
         key = (f"{scope or ''}{MARK}{digest}", name)
         _pending.setdefault(key, (base_key, values))
         _last_used[key] = time.monotonic()
@@ -315,6 +320,35 @@ async def _shutdown_discarded(server):
             await server.shutdown()
         except Exception:  # health: allow BLE001 -- cleanup is best-effort, without payloads
             logger.debug("MCP session-env discarded connection shutdown failed")
+
+
+# Strong refs: the loop keeps only weak ones, and a timed-out waiter must not drop the close.
+_FENCED_CLEANUPS: set = set()
+_FENCED_CLEANUP_TIMEOUT = 20.0
+
+
+def _release_fenced(task) -> None:
+    _FENCED_CLEANUPS.discard(task)
+    if not task.cancelled():
+        task.exception()  # retrieved; the close already logged its own failure
+
+
+async def _shutdown_fenced(server):
+    """Close *server* in a task the caller's timeout cannot cancel.
+
+    ``_run_on_mcp_loop`` cancels its future when the wait expires. Awaiting the
+    close in that future lets the cancel cut it short. ``on_discard`` cannot
+    repair that: it runs only after the wrapped coroutine returns, and a cancel
+    that lands during close never produces a result to hand off. The close
+    therefore runs shielded, in its own task.
+    """
+    task = asyncio.ensure_future(_shutdown_discarded(server))
+    _FENCED_CLEANUPS.add(task)
+    task.add_done_callback(_release_fenced)
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        return
 
 
 def protect_call(server_name, handler):
@@ -429,7 +463,7 @@ def ensure_connected(server_name: str, key) -> Optional[object]:
         if not current:
             if server is not None:
                 try:
-                    _loop._run_on_mcp_loop(lambda: _shutdown_discarded(server), timeout=20)
+                    _loop._run_on_mcp_loop(lambda: _shutdown_fenced(server), timeout=_FENCED_CLEANUP_TIMEOUT)
                 except Exception:  # health: allow BLE001 -- fenced cleanup is best-effort, without payloads
                     logger.debug("MCP session-env fenced connection cleanup failed")
             return None

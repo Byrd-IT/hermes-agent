@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import logging
 import warnings
 from concurrent.futures import Future
 from unittest.mock import patch
 
+import pytest
 
 from agent.async_utils import safe_schedule_threadsafe
 
@@ -95,5 +97,59 @@ class TestSafeScheduleThreadsafe:
             assert _no_unawaited_warnings(caught, coro_name='_sample')
         finally:
             loop.close()
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "Authorization: Bearer synthe...C123",
+            "https://user:pass@host.invalid/path",
+            "synthetic-token-recognizable-ABC123",
+            "X-Api-Key: synthe...23",
+            "https://host.invalid/path?api_key=synthetic-schedule-ABC123",
+        ],
+    )
+    def test_scheduling_failure_log_omits_exception_payload(self, caplog, payload):
+        """Scheduling failures log the exception type, never its message."""
+        loop = asyncio.new_event_loop()
+        try:
+            async def _sample():
+                return "ok"
+
+            coro = _sample()
+            with caplog.at_level(logging.DEBUG, logger="agent.async_utils"):
+                with patch(
+                    "agent.async_utils.asyncio.run_coroutine_threadsafe",
+                    side_effect=RuntimeError(payload),
+                ):
+                    result = safe_schedule_threadsafe(
+                        coro, loop, log_message="schedule failed",
+                    )
+            assert result is None
+            assert coro.cr_frame is None
+            assert "schedule failed" in caplog.text
+            assert "RuntimeError" in caplog.text
+            assert payload not in caplog.text
+            assert "ABC123" not in caplog.text
+            assert "user:pass" not in caplog.text
+            assert all(record.exc_info is None for record in caplog.records)
+        finally:
+            loop.close()
+
+    def test_missing_loop_log_omits_exception_message(self, caplog):
+        """A missing loop is logged by type, not by the raised message."""
+        async def _sample():
+            return "ok"
+
+        coro = _sample()
+        with caplog.at_level(logging.DEBUG, logger="agent.async_utils"):
+            result = safe_schedule_threadsafe(
+                coro, None, log_message="schedule failed",
+            )
+        assert result is None
+        assert coro.cr_frame is None
+        assert "schedule failed" in caplog.text
+        assert "RuntimeError" in caplog.text
+        assert "loop is None" not in caplog.text
+        assert all(record.exc_info is None for record in caplog.records)
 
 

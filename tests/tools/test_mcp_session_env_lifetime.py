@@ -8,12 +8,26 @@ import pytest
 from tools import mcp_tool_session_env as se
 from tools.mcp_tool_common import _core
 
+# Ledgers live on the process. Borrow the close-failure fixture instead of
+# mutating the real dicts and restoring them in finally.
+pytest_plugins = ["tests.tools.test_mcp_session_env_close_failures"]
+
+
+def _isolate_uncovered_maps(isolated_ledgers, monkeypatch):
+    """Lazy configs, epochs, and call leases are outside isolated_ledgers."""
+    monkeypatch.setattr(isolated_ledgers.core, "_lazy_server_configs", {})
+    monkeypatch.setattr(isolated_ledgers.se, "_base_epochs", {})
+    monkeypatch.setattr(isolated_ledgers.se, "_call_leases", {})
+
 
 @pytest.mark.parametrize("interrupt", [False, True])
-def test_connect_cannot_publish_after_teardown_or_swallow_interrupt(monkeypatch, interrupt):
+def test_connect_cannot_publish_after_teardown_or_swallow_interrupt(
+    monkeypatch, interrupt, isolated_ledgers,
+):
     from agent.session_client_env import client_env_scope
     from tools import mcp_tool_loop as loop
 
+    _isolate_uncovered_maps(isolated_ledgers, monkeypatch)
     base = "lifetime"
     _core._lazy_server_configs[base] = {"command": "unused", "session_env": ["RUN_PIN"]}
     server = SimpleNamespace(session=object(), shutdown=AsyncMock())
@@ -34,69 +48,64 @@ def test_connect_cannot_publish_after_teardown_or_swallow_interrupt(monkeypatch,
         return server
 
     monkeypatch.setattr(loop, "_run_on_mcp_loop", dispatch)
-    try:
-        with client_env_scope({"RUN_PIN": "a"}):
-            key = se.variant_key(base)
-            if interrupt:
-                with pytest.raises(InterruptedError):
-                    se.ensure_connected(base, key)
-                assert key not in se._retry_after
-            else:
-                assert se.ensure_connected(base, key) is None
-                assert key not in _core._servers
-                server.shutdown.assert_awaited_once()
-    finally:
-        _core._lazy_server_configs.pop(base, None)
-        _core._servers.pop(key, None)
-        _core._server_scope_keys.pop(key, None)
-        se.reset()
+    with client_env_scope({"RUN_PIN": "a"}):
+        key = se.variant_key(base)
+        if interrupt:
+            with pytest.raises(InterruptedError):
+                se.ensure_connected(base, key)
+            assert key not in se._retry_after
+        else:
+            assert se.ensure_connected(base, key) is None
+            assert key not in _core._servers
+            server.shutdown.assert_awaited_once()
 
 
 @pytest.mark.parametrize("utility", [False, True])
-def test_handler_lease_prevents_eviction_before_rpc_starts(monkeypatch, utility):
+def test_handler_lease_prevents_eviction_before_rpc_starts(
+    monkeypatch, utility, isolated_ledgers,
+):
     from agent.session_client_env import client_env_scope
     from tools import mcp_tool_discovery as discovery
     from tools import mcp_tool_handlers as handlers
 
+    _isolate_uncovered_maps(isolated_ledgers, monkeypatch)
     base = "leased"
     _core._lazy_server_configs[base] = {"command": "unused", "session_env": ["RUN_PIN"]}
     monkeypatch.setattr(handlers, "_trust_gate_check", lambda *args: None)
     monkeypatch.setattr(handlers, "_check_circuit_breaker", lambda *args: None)
-    try:
-        with client_env_scope({"RUN_PIN": "a"}):
-            key = se.variant_key(base)
-            _core._servers[key] = SimpleNamespace(session=object())
+    with client_env_scope({"RUN_PIN": "a"}):
+        key = se.variant_key(base)
+        _core._servers[key] = SimpleNamespace(session=object())
 
-            def acquire(*args):
-                assert se._close([key], protect_in_use=True) == 0
-                assert key in _core._servers
-                if utility:
-                    return None
-                return None, "unavailable"
-
+        def acquire(*args):
+            assert se._close([key], protect_in_use=True) == 0
+            assert key in _core._servers
             if utility:
-                monkeypatch.setattr(discovery, "_get_connected_server_for_call", acquire)
-                handler = handlers._make_utility_handler("list", "list", None, None)(base, 5)
-            else:
-                monkeypatch.setattr(handlers, "_acquire_call_server", acquire)
-                handler = handlers._make_tool_handler(base, "who", 5)
-            handler({})
-            assert key not in se._call_leases
-    finally:
-        _core._lazy_server_configs.pop(base, None)
-        _core._servers.pop(key, None)
-        se.reset()
+                return None
+            return None, "unavailable"
+
+        if utility:
+            monkeypatch.setattr(discovery, "_get_connected_server_for_call", acquire)
+            handler = handlers._make_utility_handler("list", "list", None, None)(base, 5)
+        else:
+            monkeypatch.setattr(handlers, "_acquire_call_server", acquire)
+            handler = handlers._make_tool_handler(base, "who", 5)
+        handler({})
+        assert key not in se._call_leases
 
 
 @pytest.mark.parametrize("reset_all", [False, True])
 @pytest.mark.parametrize("new_caller", [False, True])
-def test_shutdown_invalidates_a_call_queued_after_lease(monkeypatch, reset_all, new_caller):
+def test_shutdown_invalidates_a_call_queued_after_lease(
+    monkeypatch, reset_all, new_caller, isolated_ledgers,
+):
     from contextvars import Context
     from agent.session_client_env import client_env_scope
     from tools import mcp_tool_discovery as discovery
     from tools import mcp_tool_loop as loop
     from tools.mcp_tool_scope import _resolve_server_key
 
+    _isolate_uncovered_maps(isolated_ledgers, monkeypatch)
     base = "queued-shutdown"
     _core._lazy_server_configs[base] = {"command": "unused", "session_env": ["RUN_PIN"]}
     keys = []
@@ -130,23 +139,17 @@ def test_shutdown_invalidates_a_call_queued_after_lease(monkeypatch, reset_all, 
         assert not launched
         assert keys[0] not in se._pending
 
-    try:
-        with client_env_scope({"RUN_PIN": "a"}):
-            se.protect_call(base, queued)()
-        assert not se._call_leases
-    finally:
-        _core._lazy_server_configs.pop(base, None)
-        for key in keys:
-            _core._servers.pop(key, None)
-            _core._server_scope_keys.pop(key, None)
-        se.reset()
+    with client_env_scope({"RUN_PIN": "a"}):
+        se.protect_call(base, queued)()
+    assert not se._call_leases
 
 
-def test_scoped_close_selects_variants_atomically(monkeypatch):
+def test_scoped_close_selects_variants_atomically(monkeypatch, isolated_ledgers):
     import asyncio
     from agent.session_client_env import client_env_scope
     from tools import mcp_tool_loop as loop
 
+    _isolate_uncovered_maps(isolated_ledgers, monkeypatch)
     monkeypatch.setattr(loop, "_run_on_mcp_loop", lambda fn, **kw: asyncio.run(fn()))
 
     base = "atomic-close"
@@ -160,14 +163,10 @@ def test_scoped_close_selects_variants_atomically(monkeypatch):
         return close(*args, **kwargs)
 
     monkeypatch.setattr(se, "_close", interleaved)
-    try:
-        with client_env_scope({"RUN_PIN": "first"}):
-            keys.append(se.variant_key(base))
-        se.close_for_bases([base])
-        assert all(key not in se._pending for key in keys)
-    finally:
-        _core._lazy_server_configs.pop(base, None)
-        se.reset()
+    with client_env_scope({"RUN_PIN": "first"}):
+        keys.append(se.variant_key(base))
+    se.close_for_bases([base])
+    assert all(key not in se._pending for key in keys)
 
 
 def test_reaper_failure_does_not_log_exception_payload(monkeypatch, caplog):

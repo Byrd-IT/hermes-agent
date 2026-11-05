@@ -194,6 +194,7 @@ class _DiscardGuard:
 
 
 _NO_RESULT = object()
+# Only the MCP loop thread adds and removes tasks in this set.
 _DISCARD_TASKS: set = set()
 
 
@@ -225,8 +226,9 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30, *, on_discard=None):
         if asyncio.iscoroutine(coro_or_factory):
             coro_or_factory.close()
         raise RuntimeError("MCP event loop is not running")
-    # run_coroutine_threadsafe copies the LOOP thread's context, so a per-request profile scope
-    # would vanish here; re-establish it inside the task's own context.
+    # call_soon_threadsafe carries the submitting thread's context into the loop task;
+    # the bound variant-key fence depends on it. Keep the explicit wrappers below for
+    # profile HOME and dashboard OAuth propagation as well.
     coro = _wrap_with_dashboard_oauth_flow(_wrap_with_home_override(
         coro_or_factory() if callable(coro_or_factory) else coro_or_factory))
     guard = _DiscardGuard(on_discard) if on_discard is not None else None

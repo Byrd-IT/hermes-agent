@@ -36,7 +36,8 @@ def safe_schedule_threadsafe(
     except Exception as exc:
         if asyncio.iscoroutine(coro):
             coro.close()
-        log.log(log_level, "%s: %s", log_message, exc)
+        # Exception text can embed credentials; the type name is enough.
+        log.log(log_level, "%s: %s", log_message, type(exc).__name__)
         return None
 
 
