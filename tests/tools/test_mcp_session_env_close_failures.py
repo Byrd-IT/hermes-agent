@@ -47,6 +47,7 @@ def isolated_ledgers(monkeypatch):
         call_leases={},
         reaper=None,
         reaper_stop=threading.Event(),
+        loop_generations={},
     )
     monkeypatch.setattr(core, "_servers", state.servers)
     monkeypatch.setattr(core, "_server_scope_keys", state.scope_keys)
@@ -68,6 +69,7 @@ def isolated_ledgers(monkeypatch):
     monkeypatch.setattr(se, "_call_leases", state.call_leases)
     monkeypatch.setattr(se, "_reaper", state.reaper)
     monkeypatch.setattr(se, "_reaper_stop", state.reaper_stop)
+    monkeypatch.setattr(se, "_LOOP_GENERATIONS", state.loop_generations)
     monkeypatch.setattr(se, "_ensure_reaper", lambda: None)
     return state
 
