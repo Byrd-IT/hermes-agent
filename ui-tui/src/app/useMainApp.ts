@@ -8,20 +8,8 @@ import {
   useStdout,
   useTerminalTitle
 } from '@hermes/ink'
+import { sharedControlParams } from '@hermes/shared/gateway-canonical'
 import type { SessionControlSnapshot } from '@hermes/shared/gateway-events'
-import { JSON_RPC_METHOD_NOT_FOUND, type ServerRequest } from '@hermes/shared/json-rpc-channel'
-import { useStore } from '@nanostores/react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-
-import { sharedControlParams } from '../canonicalGateway.js'
-import { DASHBOARD_TUI_MODE, NATIVE_MODE, STARTUP_RESUME_ID } from '../config/env.js'
-import { WHEEL_SCROLL_STEP } from '../config/limits.js'
-import { hasLeadGap, prevRenderedMsg } from '../domain/blockLayout.js'
-import { SECTION_NAMES, sectionMode } from '../domain/details.js'
-import { hasPasteChip } from '../domain/pasteExpand.js'
-import { composeTabTitle, fmtProjectCwdBranch, shortCwd } from '../domain/paths.js'
-import { type GatewayClient } from '../gatewayClient.js'
-import type { SubagentListResponse } from '../gatewayTypes.js'
 import type {
   AnyGatewayEvent,
   ClarifyLockResponse,
@@ -29,8 +17,20 @@ import type {
   SessionActiveListResponse,
   SessionCloseResponse,
   SharedControlRespondResponse,
+  SubagentListResponse,
   TerminalResizeResponse
-} from '../gatewayTypes.js'
+} from '@hermes/shared/gateway-types'
+import { JSON_RPC_METHOD_NOT_FOUND, type ServerRequest } from '@hermes/shared/json-rpc-channel'
+import { useStore } from '@nanostores/react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+
+import { DASHBOARD_TUI_MODE, NATIVE_MODE, STARTUP_RESUME_ID } from '../config/env.js'
+import { WHEEL_SCROLL_STEP } from '../config/limits.js'
+import { hasLeadGap, prevRenderedMsg } from '../domain/blockLayout.js'
+import { SECTION_NAMES, sectionMode } from '../domain/details.js'
+import { hasPasteChip } from '../domain/pasteExpand.js'
+import { composeTabTitle, fmtProjectCwdBranch, shortCwd } from '../domain/paths.js'
+import { type GatewayClient } from '../gatewayClient.js'
 import { useGitBranch } from '../hooks/useGitBranch.js'
 import { pruneVirtualHeightCache, useVirtualHistory } from '../hooks/useVirtualHistory.js'
 import { t } from '../i18n/runtime.js'
@@ -976,10 +976,12 @@ export function useMainApp(gw: GatewayClient) {
     actions: {
       appendMessage,
       cancelClarify,
+      countPrompts: () => historyItemsRef.current.filter(msg => msg.role === 'user' && !msg.kind).length,
       die,
       dispatchSubmission,
       guardBusySessionSwitch: session.guardBusySessionSwitch,
       newSession: session.newSession,
+      openBacktrack: () => slashRef.current('/rewind', undefined, false),
       sys
     },
     composer: { actions: composerActions, refs: composerRefs, state: composerState },
@@ -1167,10 +1169,14 @@ export function useMainApp(gw: GatewayClient) {
         composer: {
           attachClipboardImage: composerActions.attachClipboardImage,
           attachImagePath: composerActions.attachImagePath,
+          appendPaste: composerActions.appendPaste,
+          appendText: composerActions.appendText,
+          attachImagePaths: composerActions.attachImagePaths,
           enqueue: composerActions.enqueue,
           hasSelection,
           openEditor: composerActions.openEditor,
           queueRef: composerRefs.queueRef,
+          restoreDraft: composerActions.restoreDraft,
           selection,
           setInput: composerActions.setInput
         },
