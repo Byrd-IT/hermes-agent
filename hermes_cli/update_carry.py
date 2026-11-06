@@ -166,7 +166,7 @@ def _patch_id(diff: str, *, git_bin: str = "git") -> str:
     if not diff.strip():
         return ""
     proc = subprocess.run(
-        [git_bin, "patch-id", "--stable"], input=diff, capture_output=True, text=True, check=False,
+        [git_bin, "patch-id", "--stable"], input=diff, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
         timeout=120,
     )
     parts = (proc.stdout or "").split()
@@ -252,7 +252,7 @@ def _bytes_diff(path: str, current: bytes | None, baseline: bytes | None, *, git
             left.write_bytes(baseline)
             argv = [git_bin, "diff", "--no-index", "--", str(left), str(right)]
         proc = subprocess.run(
-            argv, capture_output=True, text=True, check=False, timeout=120,
+            argv, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=120,
         )
         if proc.returncode not in (0, 1):
             return ""
@@ -336,7 +336,7 @@ def _file_apply_check(repo: Path, patch: str, paths: list[str], upstream: str, *
                 dest.write_bytes(blob)
         proc = subprocess.run(
             [git_bin, "apply", "--check", "--unsafe-paths", "-"],
-            cwd=temp, input=patch, capture_output=True, text=True, check=False, timeout=120,
+            cwd=temp, input=patch, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=120,
         )
         return "clean" if proc.returncode == 0 else "conflict"
     finally:
@@ -623,13 +623,13 @@ def _apply_patch(dest: Path, patch: str, *, git_bin: str) -> str:
         return "drop"
     check = subprocess.run(
         [git_bin, "apply", "--check", "-"], cwd=dest, input=patch,
-        capture_output=True, text=True, check=False, timeout=120,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=120,
     )
     if check.returncode != 0:
         return "conflict"
     applied = subprocess.run(
         [git_bin, "apply", "-"], cwd=dest, input=patch,
-        capture_output=True, text=True, check=False, timeout=120,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=120,
     )
     return "reapply" if applied.returncode == 0 else "conflict"
 
