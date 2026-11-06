@@ -150,7 +150,8 @@ def _reject(args: list[str]) -> None:
 def _git(cwd: Path, args: list[str], *, git_bin: str = "git") -> subprocess.CompletedProcess:
     _reject(args)
     return subprocess.run(
-        [git_bin, *args], cwd=cwd, capture_output=True, text=True, check=False, timeout=120,
+        [git_bin, *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        check=False, timeout=120,
     )
 
 

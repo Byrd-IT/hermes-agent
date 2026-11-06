@@ -576,9 +576,10 @@ def workspaces_root(board: Optional[str] = None) -> Path:
     when any ancestor is a dot-directory.
     """
     override = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
-    if override:
+    slug = _explicit_board_slug(board)
+    # Same priority as _board_path: explicit board intent outranks the env pin unless fenced.
+    if override and (slug is None or _explicit_board_intent_pinned()):
         return Path(override).expanduser()
-    slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
     return kanban_home().parent / "hermes-workspaces" / slug
