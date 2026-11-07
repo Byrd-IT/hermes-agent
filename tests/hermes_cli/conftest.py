@@ -187,3 +187,11 @@ def probe_root(tmp_path):
     """
     (tmp_path / "hermes_bootstrap.py").write_text("", encoding="utf-8")
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def _allow_plain_update_in_updater_tests(monkeypatch):
+    """The fork-host guard (update_fork_guard) refuses a plain update on carried or release-folder
+    checkouts, and the checkout under test can be exactly that. Updater tests exercise the updater
+    itself, so they run with the deliberate override; test_update_fork_guard.py clears it."""
+    monkeypatch.setenv("HERMES_ALLOW_PLAIN_UPDATE", "1")

@@ -2257,6 +2257,7 @@ def _update_preflight_handled(args) -> bool:
     return False
 
 
+from hermes_cli.update_fork_guard import refuse_plain_update_or_exit
 from hermes_cli.update_receipt import update_receipt_scope
 
 
@@ -2273,16 +2274,13 @@ def cmd_update(args):
     if _update_preflight_handled(args):
         return
     gateway_mode = getattr(args, "gateway", False)
+    refuse_plain_update_or_exit(PROJECT_ROOT, gateway_mode)  # before the lock, snapshot, receipt, any git write
 
     _update_io_state = _install_hangup_protection(gateway_mode=gateway_mode)
     # Cross-process mutual exclusion: dashboard Update button, Tauri updater
     # and this command all mutate one checkout; two at once strand it
     # half-updated. Shares the marker the Tauri/Electron updaters already use.
-    from hermes_cli.update_lock import (
-        UPDATE_EXIT_CONCURRENT,
-        UpdateLock,
-        describe_holder,
-    )
+    from hermes_cli.update_lock import UPDATE_EXIT_CONCURRENT, UpdateLock, describe_holder
 
     _update_lock = UpdateLock(install_root=PROJECT_ROOT)
     if not _update_lock.acquire():
