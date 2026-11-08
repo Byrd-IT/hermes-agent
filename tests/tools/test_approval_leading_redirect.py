@@ -181,7 +181,10 @@ def test_normalization_fused_fd_duplication_keeps_the_separator(command):
     assert _verdicts(command) != (False, False)
 
 
-@pytest.mark.parametrize("command", ["A=1 halt=0 ls", "halt=0 ls", ">f reboot_count=2 ls", "FOO=1 poweroff=yes ls"])
+@pytest.mark.parametrize("command", [
+    "A=1 halt=0 ls", "halt=0 ls", ">f reboot_count=2 ls", "FOO=1 poweroff=yes ls",
+    "FOO=1 halt=0", "A=1 reboot=2; ls", "A=1 poweroff=0 && ls", ">f halt=0", "halt=0 && ls", "A=1 mkfs=ext4",
+])
 def test_assignment_named_like_a_command_is_not_the_command(command):
     assert _verdicts(command) == (False, False)
 
@@ -201,3 +204,8 @@ def test_ampersand_before_redirect_stays_a_separator_fail_closed():
 ])
 def test_fused_fd_duplication_inside_payload_still_reaches_hardline(command):
     assert detect_hardline_command(command)[0]
+
+
+@pytest.mark.parametrize("command", ["A=1 halt=0; reboot", "A=1 reboot=2 && reboot", ">f halt=0\nreboot"])
+def test_command_after_a_trailing_assignment_is_still_flagged(command):
+    assert _verdicts(command)[0]

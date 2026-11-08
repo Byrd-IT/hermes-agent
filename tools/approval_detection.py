@@ -95,7 +95,8 @@ _WRITE_TARGET_BOUNDARY = r'(?=[\s;&|<>"\']|$)'
 # Words the shell consumes BEFORE the command word, so `>/dev/null <cmd>`, `&>f <cmd>` and
 # `FOO=1 >f <cmd>` run <cmd> exactly like the plain form: a redirection (optional fd number, `{var}`
 # or `&` prefix) or a `NAME=value` assignment. The operand/value is ONE shell word: any run of quoted
-# pieces, backslash pairs, `${...}` and bare characters (`a"b c"d`, `a\ b`). Blanks only after it (no
+# pieces, `${...}` and bare characters (`a"b c"d`). A backslash pair matches only in variants that still
+# hold the raw text: normalization has already flattened `a\ b` (not handled, see the card). Blanks only after it (no
 # newline): a newline ends the command and is its own start position. Backticks and `$(` stay out of
 # the bare characters (every backtick is a start position of its own, so scanning across them is
 # quadratic); a value built from a substitution is left to the other detectors. `${` stops at the next
@@ -104,7 +105,9 @@ _WRITE_TARGET_BOUNDARY = r'(?=[\s;&|<>"\']|$)'
 _LEAD_WORD_PIECE = r'''"[^"\n]*"|'[^'\n]*'|\\.|\$\{[^{}\n]*\}|[^\s;&|()<>"'`\\]'''
 _LEAD_WORD = r'(?>(?:' + _LEAD_WORD_PIECE + r')+)'
 _LEAD_REDIRECT = r'(?:\{\w+\}|&|\d+)?(?:>>|>\||>&|<<<|<<-?|<>|<&|[<>])[^\S\n]*' + _LEAD_WORD
-_LEAD_END = r'(?:[^\S\n]+|(?=(?:\{\w+\}|&|\d+)?[<>]))'  # a blank, or the next redirection glued on
+# A word ends at a blank, where the next redirection is glued on, or where its command ends: a trailing
+# `FOO=1 halt=0` must consume `halt=0` as an assignment, not leave `halt` at command position.
+_LEAD_END = r'(?:[^\S\n]+|(?=(?:\{\w+\}|&|\d+)?[<>])|(?=[^\S\n]*(?:[;&|)\n`]|\Z)))'
 _LEAD_ASSIGNMENT = r'[A-Za-z_]\w*(?:\[[^\]\s]*\])?\+?=(?>(?:' + _LEAD_WORD_PIECE + r')*)'
 # Start-of-command position: start of string, newline, subshell opener ($( or backtick), optionally consuming
 # sudo/env/exec/nohup/setsid/time wrappers. Keeps shutdown/reboot rules from firing on "echo reboot" / "grep
