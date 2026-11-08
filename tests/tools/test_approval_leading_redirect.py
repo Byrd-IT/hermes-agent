@@ -117,3 +117,23 @@ def test_non_dangerous_stays_allowed(command):
 def test_long_redirect_runs_stay_linear():
     command = ">f " * 20000 + "ls"
     assert _verdicts(command)[0] is not None  # returns (parser-limit verdicts allowed), does not hang
+
+
+@pytest.mark.parametrize("prefix", ["2>&1 ", ">&2 ", "2>&- ", "<&0 ", ">/dev/null 2>&1 "])
+@pytest.mark.parametrize("command", ["bash -c 'reboot'", "sh -c \"mkfs.ext4 /dev/sda1\"", "python3 -c 'print(1)'"])
+def test_fd_duplication_is_not_a_command_separator(prefix, command):
+    """`2>&1 bash -c ...`: the `&` of `>&` is part of the redirect, so bash is still the command word."""
+    plain = _verdicts(command)
+    assert plain != (False, False)
+    assert _verdicts(prefix + command) == plain
+
+
+@pytest.mark.parametrize("command", ["ls 2>&1 && reboot", "ls >&2; reboot", "ls 2>&1 | true; reboot", "ls 2>&1 & reboot"])
+def test_separator_after_fd_duplication_still_splits(command):
+    assert _verdicts(command)[0]
+
+
+def test_fd_duplication_does_not_flag_plain_commands():
+    assert _verdicts("ls 2>&1") == (False, False)
+    assert _verdicts("2>&1 ls -la") == (False, False)
+    assert _verdicts("echo a 2>&1 bash -c 'reboot'") == (False, False)

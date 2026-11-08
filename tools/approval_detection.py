@@ -1132,11 +1132,18 @@ def _shell_segment_tokens(segment: str, start: int) -> list[str] | None:
         return None
 
 
+def _is_fd_dup_ampersand(command: str, i: int) -> bool:
+    """True for the `&` of `>&` / `<&` (`2>&1`, `>&2`): it duplicates a descriptor and is part of the
+    redirection, not a command separator, so the words after its operand still belong to the same command."""
+    return command[i] == "&" and i > 0 and command[i - 1] in "<>"
+
+
 def _iter_top_level_shell_segments(command: str):
     """Yield top-level command segments in one left-to-right pass."""
     start = 0
     for kind, i, j, quote in _scan_shell(command, comments=True):
-        if kind == "comment" or (kind == "char" and quote is None and command[i] in ";&|\n"):
+        if kind == "comment" or (kind == "char" and quote is None and command[i] in ";&|\n"
+                                    and not _is_fd_dup_ampersand(command, i)):
             if start < i:
                 yield command[start:i]
             start = j
@@ -1434,7 +1441,7 @@ def _iter_shell_command_starts(command: str):
                 if command[i] in "(;\n" or (command[i] == "{" and (i == 0 or command[i - 1].isspace()
                                                                    or command[i - 1] in "(;&|)")):
                     starts.append(i + 1)
-                elif command[i] in "&|":
+                elif command[i] in "&|" and not _is_fd_dup_ampersand(command, i):
                     repeated = i + 1 < end and command[i + 1] == command[i]
                     skip = i + 1 if repeated else skip
                     starts.append(i + 1 + repeated)
@@ -1547,7 +1554,8 @@ def _shell_command_segment(command: str, start: int) -> str:
     """Bound a candidate to its command, preserving quoted argument bytes."""
     end = len(command)
     for kind, i, _, quote in _scan_shell(command, start, subst="uq", brace=True, comments=True):
-        if kind == "comment" or (kind == "char" and quote is None and command[i] in ";&|\n)`"):
+        if kind == "comment" or (kind == "char" and quote is None and command[i] in ";&|\n)`"
+                                    and not _is_fd_dup_ampersand(command, i)):
             end = i
             break
     return command[start:end].strip()
