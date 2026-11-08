@@ -290,8 +290,22 @@ export function useQueue(gw?: { request: (method: string, params: Record<string,
   )
 
   const enqueue = useCallback(
-    (text: string, display = text, destination?: SubmissionDestination, attachments?: QueueItem['attachments']) => {
+    (
+      text: string,
+      display = text,
+      destination?: SubmissionDestination,
+      attachments?: QueueItem['attachments'],
+      literal = false
+    ) => {
       const { queue, item } = draft(text, display, destination, attachments)
+
+      // Before the journal write. A crash, or the next process's drain, must
+      // still submit this as text: sendQueued treats a missing preparedText as
+      // ! / {!} shell syntax.
+      if (literal) {
+        item.preparedText = text
+      }
+
       savePendingInput(item)
       queue.items.push(item)
       syncQueue()
@@ -393,9 +407,23 @@ export function useQueue(gw?: { request: (method: string, params: Record<string,
   // One durable write: the row joins the queue only once its attempt is journaled,
   // so a failed write leaves the composer as the draft's only copy.
   const stage = useCallback(
-    (text: string, display = text, destination = captureDestination(), attachments?: QueueItem['attachments']) => {
+    (
+      text: string,
+      display = text,
+      destination = captureDestination(),
+      attachments?: QueueItem['attachments'],
+      literal = false
+    ) => {
       const { queue, item } = draft(text, display, destination, attachments)
       item.queued = false
+
+      // Before claim's journal write. A crash, or the next process's retry, must
+      // still submit this as text: sendQueued treats a missing preparedText as
+      // ! / {!} shell syntax.
+      if (literal) {
+        item.preparedText = text
+      }
+
       claim(queue, item)
       queue.items.push(item)
       syncQueue()

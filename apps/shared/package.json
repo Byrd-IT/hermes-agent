@@ -14,6 +14,7 @@
     "./charge-settlement": "./src/charge-settlement.ts",
     "./circular-buffer": "./src/circular-buffer.ts",
     "./color": "./src/color.ts",
+    "./dashboard-talk": "./src/dashboard-talk.ts",
     "./format": "./src/format.ts",
     "./fuzzy": "./src/fuzzy.ts",
     "./gateway-canonical": "./src/gateway-canonical.ts",
