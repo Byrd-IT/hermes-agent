@@ -92,22 +92,24 @@ _WRITE_TARGET_BOUNDARY = r'(?=[\s;&|<>"\']|$)'
 # shutdown, DoS). Recoverable operations (git reset --hard, chmod -R 777, curl|sh) stay in
 # DANGEROUS_PATTERNS.
 
+# Words the shell consumes BEFORE the command word, so `>/dev/null <cmd>`, `&>f <cmd>` and
+# `FOO=1 >f <cmd>` run <cmd> exactly like the plain form: a redirection (optional fd number, `{var}`
+# or `&` prefix) or a `NAME=value` assignment. The operand/value is ONE shell word: any run of quoted
+# pieces, backslash pairs, `${...}` and bare characters (`a"b c"d`, `a\ b`). Blanks only after it (no
+# newline): a newline ends the command and is its own start position. Backticks and `$(` stay out of
+# the bare characters (every backtick is a start position of its own, so scanning across them is
+# quadratic); a value built from a substitution is left to the other detectors. `${` stops at the next
+# `{` so an unterminated run cannot rescan the line from every brace. The word is an atomic group, so a
+# failed match never re-splits it.
+_LEAD_WORD_PIECE = r'''"[^"\n]*"|'[^'\n]*'|\\.|\$\{[^{}\n]*\}|[^\s;&|()<>"'`\\]'''
+_LEAD_WORD = r'(?>(?:' + _LEAD_WORD_PIECE + r')+)'
+_LEAD_REDIRECT = r'(?:\{\w+\}|&|\d+)?(?:>>|>\||>&|<<<|<<-?|<>|<&|[<>])[^\S\n]*' + _LEAD_WORD
+_LEAD_END = r'(?:[^\S\n]+|(?=(?:\{\w+\}|&|\d+)?[<>]))'  # a blank, or the next redirection glued on
+_LEAD_ASSIGNMENT = r'[A-Za-z_]\w*(?:\[[^\]\s]*\])?\+?=(?>(?:' + _LEAD_WORD_PIECE + r')*)'
 # Start-of-command position: start of string, newline, subshell opener ($( or backtick), optionally consuming
 # sudo/env/exec/nohup/setsid/time wrappers. Keeps shutdown/reboot rules from firing on "echo reboot" / "grep
 # 'shutdown' log". Real ;/&/| separators are converted to newlines by the quote-aware _mark_command_starts pass;
 # keeping them here mistakes quoted data (grep '(safe|rm -rf /)') for commands.
-# Words the shell consumes BEFORE the command word, so `>/dev/null <cmd>`, `&>f <cmd>` and
-# `FOO=1 >f <cmd>` run <cmd> exactly like the plain form: a redirection (optional fd number, `{var}`
-# or `&` prefix) or a `NAME=value` assignment. The operand/value is ONE shell word: any run of quoted
-# pieces, backslash pairs and bare characters (`a"b c"d`, `a\ b`). Blanks only after it (no newline): a
-# newline ends the command and is its own start position. Backticks and `$(` stay out of the bare
-# characters (every backtick is a start position of its own, so scanning across them is quadratic);
-# a value built from a substitution is left to the other detectors. The word is an atomic group, so a
-# failed match never re-splits it (linear time on long runs).
-_LEAD_WORD = r'''(?>(?:"[^"\n]*"|'[^'\n]*'|\\.|\$\{[^}\n]*\}|[^\s;&|()<>"'`\\])+)'''
-_LEAD_REDIRECT = r'(?:\{\w+\}|&|\d+)?(?:>>|>\||>&|<<<|<<-?|<>|<&|[<>])[^\S\n]*' + _LEAD_WORD
-_LEAD_END = r'(?:[^\S\n]+|(?=(?:\{\w+\}|&|\d+)?[<>]))'  # a blank, or the next redirection glued on
-_LEAD_ASSIGNMENT = r'[A-Za-z_]\w*(?:\[[^\]\s]*\])?\+?=(?>(?:"[^"\n]*"|\'[^\'\n]*\'|\\.|\$\{[^}\n]*\}|[^\s;&|()<>"\'`\\])*)'
 _CMDPOS = (
     r'(?:^|[\n`]|\$\()' r'\s*'  # start position, optional whitespace
     # Any number of: redirections, assignments, sudo with flags, env (with its own NAME=value words,
@@ -1699,6 +1701,18 @@ def _deny_command_variants(command: str):
                 pending.append(payload)
 
 
+def _execution_flag_texts(command: str, normalized: str) -> list[str]:
+    """Texts the execution-flag scan must cover. Normalization strips escapes, drops empty quotes and folds
+    unicode, which can fuse a literal `>` with a real `&` separator into `>&`; the scan therefore also
+    runs on the starts-marked text and on the raw text (shlex keeps `\\>`, `''` and fullwidth `>` intact
+    there), so payloads inside `bash -c '...'` keep their separators."""
+    texts = [normalized]
+    for extra in (_faithful_detection_text(command), _mask_quoted_newlines(command)):
+        if extra not in texts:
+            texts.append(extra)
+    return texts
+
+
 def _faithful_detection_text(command: str) -> str:
     """Normalized text whose command starts were marked on the RAW command (quote and escape state intact).
     Normalization alone can fuse a literal `>` (escaped, quoted-empty or fullwidth) with a real `&` separator
@@ -1735,7 +1749,7 @@ def _command_detection_variants(command: str):
     # Program-bearing options are parsed in their owning command's context; surfacing only the payload lets the
     # hardline floor inspect what will actually run without promoting similar flags or quoted prose.
     faithful = _faithful_detection_text(command)
-    pending = [normalized] if faithful == normalized else [normalized, faithful]
+    pending = _execution_flag_texts(command, normalized)
     while pending:
         for _, payload in _execution_flag_findings(pending.pop()):
             if fresh(payload):
@@ -1745,6 +1759,9 @@ def _command_detection_variants(command: str):
                 marked_payload = _mark_command_starts(payload)
                 if marked_payload != payload and fresh(marked_payload):
                     yield marked_payload
+                faithful_payload = _faithful_detection_text(payload)
+                if fresh(faithful_payload):
+                    yield faithful_payload
                 pending.append(payload)
     # Subshell `(cmd)` / brace-group `{ cmd; }` openers put `cmd` at a real command position the flat `_CMDPOS`
     # patterns can't see (adding `(`/`{` there would match quoted prose like `--title "(reboot)"`). Insert a newline
@@ -1948,8 +1965,7 @@ def _iter_dangerous_descriptions(command: str, only: frozenset[str] | None = Non
             yield _INVISIBLE_UNICODE_DESCRIPTION
         return
     normalized = _normalize_command_for_detection(command)
-    faithful = _faithful_detection_text(command)
-    for text in (normalized,) if faithful == normalized else (normalized, faithful):
+    for text in _execution_flag_texts(command, normalized):
         for description, _ in _execution_flag_findings(text):
             yield description
     if _is_shell_token_spliced_gateway_lifecycle(command):

@@ -189,3 +189,15 @@ def test_assignment_named_like_a_command_is_not_the_command(command):
 def test_ampersand_before_redirect_stays_a_separator_fail_closed():
     """`echo hi &>f reboot`: bash passes `reboot` to echo, POSIX sh backgrounds `echo hi` and runs it."""
     assert _verdicts("echo hi &>f reboot")[0]
+
+
+@pytest.mark.parametrize("command", [
+    "bash -c 'echo \\>& reboot'",
+    "bash -c \"echo >''& reboot\"",
+    "bash -c 'echo \uff1e& reboot'",
+    "bash -c \"echo >''& rm -rf /\"",
+    "sh -c 'echo >\"\"& mkfs /dev/sda'",
+    "bash -c \"bash -c 'echo \\>& reboot'\"",
+])
+def test_fused_fd_duplication_inside_payload_still_reaches_hardline(command):
+    assert detect_hardline_command(command)[0]
