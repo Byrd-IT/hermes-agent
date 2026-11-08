@@ -97,8 +97,7 @@ _WRITE_TARGET_BOUNDARY = r'(?=[\s;&|<>"\']|$)'
 # or `&` prefix) or a `NAME=value` assignment. The operand/value is ONE shell word: any run of quoted
 # pieces, `${...}` and bare characters (`a"b c"d`). A backslash pair matches only in variants that still
 # hold the raw text: normalization has already flattened `a\ b`, so an escaped blank inside an operand is not
-# handled. Blanks only after it (no
-# newline): a newline ends the command and is its own start position. Backticks and `$(` stay out of
+# handled. Blanks only after it (no newline): a newline ends the command and is its own start position. Backticks and `$(` stay out of
 # the bare characters (every backtick is a start position of its own, so scanning across them is
 # quadratic); a value built from a substitution is left to the other detectors. `${` stops at the next
 # `{` so an unterminated run cannot rescan the line from every brace. The word is an atomic group, so a
