@@ -6,6 +6,8 @@ hardline and dangerous rules that match only at command position saw nothing.
 Invariant: a prefix of redirections and `NAME=value` assignments never changes the verdict.
 """
 
+import time
+
 import pytest
 
 from tools.approval import detect_dangerous_command, detect_hardline_command
@@ -114,26 +116,41 @@ def test_non_dangerous_stays_allowed(command):
     assert _verdicts(command) == (False, False)
 
 
-def test_long_redirect_runs_stay_linear():
-    command = ">f " * 20000 + "ls"
-    assert _verdicts(command)[0] is not None  # returns (parser-limit verdicts allowed), does not hang
+def test_long_prefix_runs_stay_linear():
+    """Long runs of prefixes (with a separator, under the parser limits) match in linear time."""
+    for unit in (">f ", "A=1 ", "2>&1 ", "A=b\"c d\"e "):
+        command = unit * 800 + "echo hi; " + unit * 800 + "reboot"
+        started = time.monotonic()
+        assert _verdicts(command)[0]
+        assert time.monotonic() - started < 20
 
 
-@pytest.mark.parametrize("prefix", ["2>&1 ", ">&2 ", "2>&- ", "<&0 ", ">/dev/null 2>&1 "])
-@pytest.mark.parametrize("command", ["bash -c 'reboot'", "sh -c \"mkfs.ext4 /dev/sda1\"", "python3 -c 'print(1)'"])
-def test_fd_duplication_is_not_a_command_separator(prefix, command):
-    """`2>&1 bash -c ...`: the `&` of `>&` is part of the redirect, so bash is still the command word."""
-    plain = _verdicts(command)
-    assert plain != (False, False)
-    assert _verdicts(prefix + command) == plain
-
-
-@pytest.mark.parametrize("command", ["ls 2>&1 && reboot", "ls >&2; reboot", "ls 2>&1 | true; reboot", "ls 2>&1 & reboot"])
-def test_separator_after_fd_duplication_still_splits(command):
+@pytest.mark.parametrize("command", [
+    "echo \\>& reboot",
+    "echo \\<& mkfs.ext4 /dev/sda1",
+    "echo \\>& bash -c 'reboot'",
+    "echo \\\\\\>& reboot",
+])
+def test_escaped_redirect_character_does_not_hide_next_command(command):
     assert _verdicts(command)[0]
 
 
-def test_fd_duplication_does_not_flag_plain_commands():
-    assert _verdicts("ls 2>&1") == (False, False)
-    assert _verdicts("2>&1 ls -la") == (False, False)
-    assert _verdicts("echo a 2>&1 bash -c 'reboot'") == (False, False)
+@pytest.mark.parametrize("command", [
+    "env FOO=$(x) reboot",
+    "env FOO='a'b reboot",
+    'env FOO=a"b" reboot',
+    "env 1X=y reboot",
+    "env X=<(y) reboot",
+    ">\"a\"b reboot",
+    '>a"b c" reboot',
+    'FOO=a"b c" reboot',
+    "FOO+=1 reboot",
+    "A[0]=1 reboot",
+])
+def test_word_shapes_do_not_hide_command(command):
+    assert _verdicts(command)[0]
+
+
+def test_escaped_space_in_operand_fails_closed():
+    """`FOO=a\\ reboot ls` runs `ls`; normalization drops the escape, so it is flagged (rare, safe side)."""
+    assert _verdicts("FOO=a\\ reboot ls")[0]

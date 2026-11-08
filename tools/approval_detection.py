@@ -98,20 +98,24 @@ _WRITE_TARGET_BOUNDARY = r'(?=[\s;&|<>"\']|$)'
 # keeping them here mistakes quoted data (grep '(safe|rm -rf /)') for commands.
 # Words the shell consumes BEFORE the command word, so `>/dev/null <cmd>`, `&>f <cmd>` and
 # `FOO=1 >f <cmd>` run <cmd> exactly like the plain form: a redirection (optional fd number, `{var}`
-# or `&` prefix; the operand is one word, quoted or bare) or a `NAME=value` assignment. Blanks only
-# (no newline): a newline ends the command and is its own start position.
-_LEAD_REDIRECT = (
-    r'(?:\{\w+\}|&|\d+)?(?:>>|>\||>&|<<<|<<-?|<>|<&|[<>])[^\S\n]*'
-    r'(?:"[^"\n]*"|\'[^\'\n]*\'|[^\s;&|()<>"\']+)'
-)
-_LEAD_ASSIGNMENT = r'[A-Za-z_]\w*=(?:"[^"\n]*"|\'[^\'\n]*\'|[^\s;&|()<>"\']*)'
+# or `&` prefix) or a `NAME=value` assignment. The operand/value is ONE shell word: any run of quoted
+# pieces, backslash pairs and bare characters (`a"b c"d`, `a\ b`). Blanks only after it (no newline): a
+# newline ends the command and is its own start position. Backticks and `$(` stay out of the bare
+# characters (every backtick is a start position of its own, so scanning across them is quadratic);
+# a value built from a substitution is left to the other detectors. The word is an atomic group, so a
+# failed match never re-splits it (linear time on long runs).
+_LEAD_WORD = r'''(?>(?:"[^"\n]*"|'[^'\n]*'|\\.|[^\s;&|()<>"'`\\])+)'''
+_LEAD_REDIRECT = r'(?:\{\w+\}|&|\d+)?(?:>>|>\||>&|<<<|<<-?|<>|<&|[<>])[^\S\n]*' + _LEAD_WORD
+_LEAD_ASSIGNMENT = r'[A-Za-z_]\w*(?:\[[^\]\s]*\])?\+?=(?>(?:"[^"\n]*"|\'[^\'\n]*\'|\\.|[^\s;&|()<>"\'`\\])*)'
 _CMDPOS = (
     r'(?:^|[\n`]|\$\()' r'\s*'  # start position, optional whitespace
-    # Any number of: redirections, assignments, sudo with flags, env, exec/nohup/setsid/time wrappers.
-    # One alternation loop (not one optional group per wrapper), so adjacent groups cannot split a
-    # long run of prefixes in many ways when the match fails.
+    # Any number of: redirections, assignments, sudo with flags, env (with its own NAME=value words,
+    # which may hold substitutions), exec/nohup/setsid/time wrappers. One alternation loop (not one
+    # optional group per wrapper), so adjacent groups cannot split a long run of prefixes many ways.
     r'(?:(?:' + _LEAD_REDIRECT + r'|' + _LEAD_ASSIGNMENT + r')[^\S\n]+'
-    r'|sudo\s+(?:-[^\s]+\s+)*|env\s+|(?:exec|nohup|setsid|time)\s+)*' r'\s*'
+    r'|sudo\s+(?:-[^\s]+\s+)*'
+    r'|env\s+(?>(?:\w+=(?:"[^"\n]*"|\'[^\'\n]*\'|\S*)\s+)*)'
+    r'|(?:exec|nohup|setsid|time)\s+)*' r'\s*'
 )
 
 
@@ -1135,7 +1139,12 @@ def _shell_segment_tokens(segment: str, start: int) -> list[str] | None:
 def _is_fd_dup_ampersand(command: str, i: int) -> bool:
     """True for the `&` of `>&` / `<&` (`2>&1`, `>&2`): it duplicates a descriptor and is part of the
     redirection, not a command separator, so the words after its operand still belong to the same command."""
-    return command[i] == "&" and i > 0 and command[i - 1] in "<>"
+    if command[i] != "&" or i == 0 or command[i - 1] not in "<>":
+        return False
+    j = i - 2
+    while j >= 0 and command[j] == "\\":
+        j -= 1
+    return (i - 2 - j) % 2 == 0  # an escaped `\>` is a literal `>`, so its `&` is a separator
 
 
 def _iter_top_level_shell_segments(command: str):
@@ -1684,6 +1693,9 @@ def _deny_command_variants(command: str):
                 pending.append(payload)
 
 
+_ESCAPED_FD_DUP_RE = re.compile(r"\\[<>]&")
+
+
 def _command_detection_variants(command: str):
     # Mask quoted newlines BEFORE normalization: normalization strips escapes (\" -> ") and ""
     # pairs, corrupting quote tracking (`echo "a\""` becomes an unterminated quote) so masking
@@ -1713,6 +1725,10 @@ def _command_detection_variants(command: str):
     # Program-bearing options are parsed in their owning command's context; surfacing only the payload lets the
     # hardline floor inspect what will actually run without promoting similar flags or quoted prose.
     pending = [normalized]
+    if _ESCAPED_FD_DUP_RE.search(command):
+        # Normalization drops the escape of `echo \>& bash -c ...`, which turns the literal `>` and the
+        # separator `&` into a redirection; the starts marked on the raw text keep the separator.
+        pending.append(_normalize_command_for_detection(_mark_command_starts(_mask_quoted_newlines(command), marker=" \n")))
     while pending:
         for _, payload in _execution_flag_findings(pending.pop()):
             if fresh(payload):
