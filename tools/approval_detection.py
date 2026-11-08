@@ -104,18 +104,19 @@ _WRITE_TARGET_BOUNDARY = r'(?=[\s;&|<>"\']|$)'
 # characters (every backtick is a start position of its own, so scanning across them is quadratic);
 # a value built from a substitution is left to the other detectors. The word is an atomic group, so a
 # failed match never re-splits it (linear time on long runs).
-_LEAD_WORD = r'''(?>(?:"[^"\n]*"|'[^'\n]*'|\\.|[^\s;&|()<>"'`\\])+)'''
+_LEAD_WORD = r'''(?>(?:"[^"\n]*"|'[^'\n]*'|\\.|\$\{[^}\n]*\}|[^\s;&|()<>"'`\\])+)'''
 _LEAD_REDIRECT = r'(?:\{\w+\}|&|\d+)?(?:>>|>\||>&|<<<|<<-?|<>|<&|[<>])[^\S\n]*' + _LEAD_WORD
-_LEAD_ASSIGNMENT = r'[A-Za-z_]\w*(?:\[[^\]\s]*\])?\+?=(?>(?:"[^"\n]*"|\'[^\'\n]*\'|\\.|[^\s;&|()<>"\'`\\])*)'
+_LEAD_END = r'(?:[^\S\n]+|(?=(?:\{\w+\}|&|\d+)?[<>]))'  # a blank, or the next redirection glued on
+_LEAD_ASSIGNMENT = r'[A-Za-z_]\w*(?:\[[^\]\s]*\])?\+?=(?>(?:"[^"\n]*"|\'[^\'\n]*\'|\\.|\$\{[^}\n]*\}|[^\s;&|()<>"\'`\\])*)'
 _CMDPOS = (
     r'(?:^|[\n`]|\$\()' r'\s*'  # start position, optional whitespace
     # Any number of: redirections, assignments, sudo with flags, env (with its own NAME=value words,
     # which may hold substitutions), exec/nohup/setsid/time wrappers. One alternation loop (not one
     # optional group per wrapper), so adjacent groups cannot split a long run of prefixes many ways.
-    r'(?:(?:' + _LEAD_REDIRECT + r'|' + _LEAD_ASSIGNMENT + r')[^\S\n]+'
+    r'(?>(?:(?:' + _LEAD_REDIRECT + r'|' + _LEAD_ASSIGNMENT + r')' + _LEAD_END +
     r'|sudo\s+(?:-[^\s]+\s+)*'
     r'|env\s+(?>(?:\w+=(?:"[^"\n]*"|\'[^\'\n]*\'|\S*)\s+)*)'
-    r'|(?:exec|nohup|setsid|time)\s+)*' r'\s*'
+    r'|(?:exec|nohup|setsid|time)\s+)*)' r'\s*'
 )
 
 
@@ -1431,6 +1432,10 @@ def _is_shell_comment_start(command: str, index: int) -> bool:
                                       or command[index - 1] in ";&|()<>")
 
 
+# `{fd}>f cmd`: the braces name a descriptor variable (a redirection), they do not open a group.
+_FD_VARIABLE_REDIRECT_RE = re.compile(r"\{\w+\}[<>]")
+
+
 def _iter_shell_command_starts(command: str):
     starts = [0]
 
@@ -1448,7 +1453,8 @@ def _iter_shell_command_starts(command: str):
                 # is a parameter expansion and `-{delete,print}` a brace-expansion word, and a start
                 # marked inside either splits the word the flat patterns need to see intact.
                 if command[i] in "(;\n" or (command[i] == "{" and (i == 0 or command[i - 1].isspace()
-                                                                   or command[i - 1] in "(;&|)")):
+                                                                   or command[i - 1] in "(;&|)")
+                                           and not _FD_VARIABLE_REDIRECT_RE.match(command, i)):
                     starts.append(i + 1)
                 elif command[i] in "&|" and not _is_fd_dup_ampersand(command, i):
                     repeated = i + 1 < end and command[i + 1] == command[i]
@@ -1693,7 +1699,11 @@ def _deny_command_variants(command: str):
                 pending.append(payload)
 
 
-_ESCAPED_FD_DUP_RE = re.compile(r"\\[<>]&")
+def _faithful_detection_text(command: str) -> str:
+    """Normalized text whose command starts were marked on the RAW command (quote and escape state intact).
+    Normalization alone can fuse a literal `>` (escaped, quoted-empty or fullwidth) with a real `&` separator
+    into `>&`, which then reads as a descriptor duplication; the starts marked beforehand keep the split."""
+    return _normalize_command_for_detection(_mark_command_starts(_mask_quoted_newlines(command), marker=" \n"))
 
 
 def _command_detection_variants(command: str):
@@ -1724,11 +1734,8 @@ def _command_detection_variants(command: str):
             yield win_variant
     # Program-bearing options are parsed in their owning command's context; surfacing only the payload lets the
     # hardline floor inspect what will actually run without promoting similar flags or quoted prose.
-    pending = [normalized]
-    if _ESCAPED_FD_DUP_RE.search(command):
-        # Normalization drops the escape of `echo \>& bash -c ...`, which turns the literal `>` and the
-        # separator `&` into a redirection; the starts marked on the raw text keep the separator.
-        pending.append(_normalize_command_for_detection(_mark_command_starts(_mask_quoted_newlines(command), marker=" \n")))
+    faithful = _faithful_detection_text(command)
+    pending = [normalized] if faithful == normalized else [normalized, faithful]
     while pending:
         for _, payload in _execution_flag_findings(pending.pop()):
             if fresh(payload):
@@ -1750,7 +1757,6 @@ def _command_detection_variants(command: str):
     # quote, no start was marked, and the hardline floor let it through. Mark starts on the RAW
     # command (only quoted newlines masked), then normalize; the leading space keeps the marker
     # from being eaten as a `\<newline>` continuation when the preceding text ends in a backslash.
-    faithful = _normalize_command_for_detection(_mark_command_starts(_mask_quoted_newlines(command), marker=" \n"))
     if fresh(faithful):
         yield faithful
     # Quoting/escaping can spell an executable in pieces (r\m, r''m). Keep that deobfuscation scoped
@@ -1942,8 +1948,10 @@ def _iter_dangerous_descriptions(command: str, only: frozenset[str] | None = Non
             yield _INVISIBLE_UNICODE_DESCRIPTION
         return
     normalized = _normalize_command_for_detection(command)
-    for description, _ in _execution_flag_findings(normalized):
-        yield description
+    faithful = _faithful_detection_text(command)
+    for text in (normalized,) if faithful == normalized else (normalized, faithful):
+        for description, _ in _execution_flag_findings(text):
+            yield description
     if _is_shell_token_spliced_gateway_lifecycle(command):
         yield _GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION
     if _HIDDEN_VARIATION_SELECTOR_RE.search(command):

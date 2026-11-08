@@ -59,9 +59,20 @@ _PREFIXES = [
     "sudo >f ",
     "sudo FOO=1 ",
     "env >f ",
+    ">f>g ",
+    "2>&1>f ",
+    ">/dev/null 2>&1>f ",
+    "FOO=1>f ",
+    "<a>b ",
+    "FOO=${X:-a b} ",
+    ">${f:-a b} ",
+    ">\"a\"b ",
+    'FOO=a"b c" ',
+    "FOO+=1 ",
+    "A[0]=1 ",
 ]
 
-_STARTS = ["{p}{c}", "echo hi; {p}{c}", "echo hi && {p}{c}", "true | {p}{c}", "$({p}{c})", "(\n{p}{c}\n)"]
+_STARTS = ["{p}{c}", "echo hi; {p}{c}", "echo hi && {p}{c}", "true | {p}{c}", "$({p}{c})", "(\n{p}{c}\n)", "echo hi & {p}{c}"]
 
 
 def _verdicts(command: str):
@@ -82,6 +93,7 @@ def test_prefix_after_separator_or_substitution(template, command):
     plain = _verdicts(command)
     assert _verdicts(template.format(p=">/dev/null ", c=command)) == plain
     assert _verdicts(template.format(p="&>f FOO=1 ", c=command)) == plain
+    assert _verdicts(template.format(p="{fd}>f ", c=command)) == plain
 
 
 @pytest.mark.parametrize("command", [">/dev/null reboot", "&>f reboot", ">/dev/null mkfs.ext4 /dev/sda1"])
@@ -116,8 +128,9 @@ def test_non_dangerous_stays_allowed(command):
     assert _verdicts(command) == (False, False)
 
 
-def test_long_prefix_runs_stay_linear():
-    """Long runs of prefixes (with a separator, under the parser limits) match in linear time."""
+def test_long_prefix_runs_do_not_blow_up():
+    """Long runs of prefixes (with a separator, under the parser limits) finish well inside a loose bound
+    (catches exponential or badly polynomial backtracking, not a precise complexity class)."""
     for unit in (">f ", "A=1 ", "2>&1 ", "A=b\"c d\"e "):
         command = unit * 800 + "echo hi; " + unit * 800 + "reboot"
         started = time.monotonic()
@@ -154,3 +167,25 @@ def test_word_shapes_do_not_hide_command(command):
 def test_escaped_space_in_operand_fails_closed():
     """`FOO=a\\ reboot ls` runs `ls`; normalization drops the escape, so it is flagged (rare, safe side)."""
     assert _verdicts("FOO=a\\ reboot ls")[0]
+
+
+@pytest.mark.parametrize("command", [
+    "echo >''& bash -c 'reboot'",
+    'echo >""& bash -c \'reboot\'',
+    "echo \uff1e& bash -c 'reboot'",
+    "echo \\>& python3 -c 'import os; os.system(1)'",
+    "echo \\>& bash -c 'true'",
+])
+def test_normalization_fused_fd_duplication_keeps_the_separator(command):
+    """Normalization (escape/quote removal, NFKC) can fuse a literal `>` with a real `&` separator."""
+    assert _verdicts(command) != (False, False)
+
+
+@pytest.mark.parametrize("command", ["A=1 halt=0 ls", "halt=0 ls", ">f reboot_count=2 ls", "FOO=1 poweroff=yes ls"])
+def test_assignment_named_like_a_command_is_not_the_command(command):
+    assert _verdicts(command) == (False, False)
+
+
+def test_ampersand_before_redirect_stays_a_separator_fail_closed():
+    """`echo hi &>f reboot`: bash passes `reboot` to echo, POSIX sh backgrounds `echo hi` and runs it."""
+    assert _verdicts("echo hi &>f reboot")[0]
