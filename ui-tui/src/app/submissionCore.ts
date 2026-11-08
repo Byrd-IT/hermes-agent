@@ -57,6 +57,10 @@ export function markNextSubmitVoice(text: string): void {
   pendingVoiceTranscript = text
 }
 
+export function clearNextSubmitVoice(): void {
+  pendingVoiceTranscript = null
+}
+
 function takeVoiceTranscript(): null | string {
   const transcript = pendingVoiceTranscript
   pendingVoiceTranscript = null

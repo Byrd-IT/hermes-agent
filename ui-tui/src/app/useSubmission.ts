@@ -18,6 +18,7 @@ import { stagePastes } from './pasteStore.js'
 import { findSlashCommand } from './slash/registry.js'
 import { submitPrompt } from './submissionCore.js'
 import { captureDestination, isCurrentDestination, type SubmissionDestination } from './submissionDestination.js'
+import { mustStayLiteral, submitTalkDraft } from './submissionTalkDraft.js'
 import { turnController } from './turnController.js'
 import { getUiState, patchUiState } from './uiStore.js'
 import { describeShellExecError } from './userMessages.js'
@@ -128,7 +129,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
       showUserMessage = true,
       displayText?: string,
       expandOverride?: (value: string) => string,
-      submitOpts: { attachments?: Array<{ path: string; mime: string }>; skipDetectDrop?: boolean; destination?: SubmissionDestination; queueItem?: QueueItem; behindTurn?: boolean } = {}
+      submitOpts: { attachments?: Array<{ path: string; mime: string }>; literal?: boolean; skipDetectDrop?: boolean; destination?: SubmissionDestination; queueItem?: QueueItem; behindTurn?: boolean } = {}
     ) => {
       // Read tokens off the ref, not render state: a paste immediately followed
       // by Enter submits before React has re-rendered with the new token.
@@ -137,7 +138,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
       const destination = submitOpts.destination ?? captureDestination()
 
       const item =
-        submitOpts.queueItem ?? (destination.sid ? composerActions.stage?.(text, displayText, destination, submitOpts.attachments) : undefined)
+        submitOpts.queueItem ?? (destination.sid ? composerActions.stage?.(text, displayText, destination, submitOpts.attachments, submitOpts.literal) : undefined)
 
       submitPrompt(
         text,
@@ -360,12 +361,28 @@ export function useSubmission(opts: UseSubmissionOptions) {
           composerActions.clearIn()
 
           return { value }
-        } catch (error) {
-          sys(t('canonical.queue.notSavedDraftKept', (error as Error).message))
+        } catch {
+          // The journal error can echo the draft, a path or a key: say only that it failed.
+          sys(t('canonical.queue.notSavedDraftKept', 'queue write failed'))
           patchUiState({ status: t('canonical.queue.statusInputNotSaved') })
 
           return undefined
         }
+      }
+
+      // Spoken text Talk could not queue sits in the composer until Enter. It is a
+      // prompt, never `/cmd`, `!cmd` or `{!cmd}`, whichever session exists by now.
+      if (mustStayLiteral(full)) {
+        return submitTalkDraft({
+          composerActions,
+          destination,
+          full,
+          journaled,
+          send,
+          submission,
+          tokens: submissionTokens,
+          toHistory
+        })
       }
 
       if (looksLikeSlashCommand(full)) {
@@ -568,7 +585,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
         return
       }
 
-      send(value, true, value, v => v, { skipDetectDrop: true, attachments })
+      send(value, true, value, v => v, { literal: true, skipDetectDrop: true, attachments })
     },
     [send]
   )

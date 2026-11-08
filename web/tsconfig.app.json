@@ -21,6 +21,7 @@
       "@/*": ["./src/*"],
       "@hermes/shared": ["../apps/shared/src/index.ts"],
       "@hermes/shared/ansi": ["../apps/shared/src/ansi.ts"],
+      "@hermes/shared/dashboard-talk": ["../apps/shared/src/dashboard-talk.ts"],
       "@hermes/shared/i18n": ["../apps/shared/src/i18n.ts"]
     },
 

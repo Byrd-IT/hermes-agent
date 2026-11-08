@@ -420,9 +420,23 @@ export interface ComposerActions {
   /** Attach an image by path in as a token. */
   attachImagePath: (path: string) => void
   clearIn: () => void
-  stage?: (text: string, display?: string, destination?: SubmissionDestination, attachments?: QueueItem['attachments']) => QueueItem
+  /** `literal` journals final text before the claim write, so a crash retry does not run `!` / `{!}`. */
+  stage?: (
+    text: string,
+    display?: string,
+    destination?: SubmissionDestination,
+    attachments?: QueueItem['attachments'],
+    literal?: boolean
+  ) => QueueItem
   dequeue: (retry?: boolean) => QueueItem | undefined
-  enqueue: (text: string, display?: string, destination?: SubmissionDestination, attachments?: QueueItem['attachments']) => QueueItem | void
+  /** `literal` journals the row as final text so a later drain does not run `!` / `{!}`. */
+  enqueue: (
+    text: string,
+    display?: string,
+    destination?: SubmissionDestination,
+    attachments?: QueueItem['attachments'],
+    literal?: boolean
+  ) => QueueItem | void
   handleTextPaste: (event: PasteEvent) => MaybePromise<ComposerPasteResult | null>
   openEditor: () => Promise<void>
   prependQueue: (item: QueueItem, destination?: SubmissionDestination) => void
