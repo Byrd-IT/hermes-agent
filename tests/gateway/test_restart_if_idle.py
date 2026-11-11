@@ -90,8 +90,10 @@ def _runner():
 
 
 @pytest.fixture(autouse=True)
-def _no_queued_events(monkeypatch):
-    monkeypatch.setattr(GatewayRunner, "_queued_events", property(lambda self: self.__dict__.setdefault("_qe", {})))
+def _no_queued_events():
+    """Kept as a named fixture (the sibling test files import it). The runner no longer has a ``_queued_events``
+    view: queued events live on ``SessionState.conversation.queued_events`` and a fresh runner has none."""
+    yield
 
 
 # ── the owner-bound lookup in estop ──────────────────────────────────────────
@@ -336,8 +338,7 @@ def _busy_cases():
         r._profile_adapters = {"ops": {Platform.TELEGRAM: other}}
 
     def queued(r, monkeypatch, **_):
-        monkeypatch.setattr(GatewayRunner, "_queued_events",
-                            property(lambda self: {"telegram:9": [object()]}))
+        r._session_state("telegram:9").conversation.queued_events.append(object())
 
     def bg_task(r, **_):
         t = MagicMock()
@@ -806,3 +807,17 @@ def test_a_profile_gateway_authenticates_against_the_hold_the_updater_keeps_at_t
     body = _request(prof, h)
     assert rii.validate_request(json.dumps(body).encode(), pid=pid, start_time=start, now=time.time())[1] is None
     assert rii._home() == prof
+
+
+def test_queued_events_are_counted_from_session_state_not_a_removed_runner_attribute():
+    """The runner has no ``_queued_events`` view any more (the /queue FIFO lives on SessionState). The probe must read
+    the real state: 0 on a fresh runner (never 'unknown', which would block every conditional restart), then the
+    number of queued events across sessions."""
+    runner = _runner()
+    assert not hasattr(GatewayRunner, "_queued_events")
+    assert rii._queued_events(runner) == 0
+    assert "queued_events" not in rii.idle_probe(runner)["unknown"]
+    runner._session_state("telegram:1").conversation.queued_events.extend([object(), object()])
+    runner._session_state("telegram:2").conversation.queued_events.append(object())
+    assert rii._queued_events(runner) == 3
+    assert rii.idle_probe(runner)["busy"]["queued_events"] == 3

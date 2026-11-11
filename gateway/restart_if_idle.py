@@ -378,8 +378,10 @@ def _pending_messages(runner: Any) -> int:
 
 
 def _queued_events(runner: Any) -> int:
-    queued = runner._queued_events
-    return sum(len(v) for v in dict(queued).values() if v)
+    # The /queue overflow FIFO lives on SessionState.conversation.queued_events (the runner no longer has a
+    # ``_queued_events`` view). A runner without ``_sessions_map`` raises -> the check reads "unknown" (fail closed).
+    sessions = dict(runner._sessions_map())
+    return sum(len(st.conversation.queued_events) for st in sessions.values() if st.conversation.queued_events)
 
 
 def _background_tasks(runner: Any) -> int:
