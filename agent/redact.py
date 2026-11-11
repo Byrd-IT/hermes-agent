@@ -1584,7 +1584,7 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         text = _BASIC_PAIR_ASSIGN_RE.sub(_basic_pair, text)
 
     if "uthorization" in text or "UTHORIZATION" in text:  # cheapest gate over every casing
-        text = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + (m.group(2) or "") + _mask_token(m.group(3)), text)
+        text = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + (m.group(2) or "") + (_mask_token_nonreusable if file_read else _mask_token)(m.group(3)), text)
 
     if ":" in text:
         text = redact_header_credentials(text)
@@ -1607,7 +1607,7 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         text = _redact_kv_connection_strings(text, code_file)
 
     if "eyJ" in text:
-        text = _JWT_RE.sub(lambda m: _mask_token(m.group(0)), text)
+        text = _JWT_RE.sub(lambda m: (_mask_token_nonreusable if file_read else _mask_token)(m.group(0)), text)
 
     # A Webapp sign-in link signs a browser in as the user, so its credential is masked whatever the
     # web-URL policy below.

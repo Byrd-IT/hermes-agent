@@ -40,7 +40,8 @@ def _redact_telegram_error_text(error: object, proxy_url: str | None = None) -> 
         return f"<{type(error).__name__}>" if error is not None else text
     try:
         from agent.redact import redact_sensitive_text
-        return redact_sensitive_text(text, force=True)
+        return redact_sensitive_text(text, force=True, file_read=True, secret_file=True,
+                                     redact_url_credentials=True)
     except Exception:
         return "<telegram error redacted>"
 
@@ -2274,7 +2275,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 "[%s] Telegram polling conflict (%d/%d) — previous session still "
                 "held open on Telegram's servers. Waiting %ds for it to expire. Error: %s",
                 self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES,
-                RETRY_DELAY, _redact_telegram_error_text(error))
+                RETRY_DELAY, _redact_telegram_error_text(error, self._ptb_proxy_url))
             # Stop the updater before sleeping (no-op if PTB raised before running was set).
             if not await self._stop_updater_or_go_fatal(self._app, "conflict-retry"):
                 return
