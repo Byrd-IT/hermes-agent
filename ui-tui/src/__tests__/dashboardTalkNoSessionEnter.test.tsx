@@ -331,4 +331,29 @@ describe('no-session composer Enter never executes shell', () => {
       live.unmount()
     }
   })
+
+  it('keeps the draft literal when the save fails and the user presses Enter again', async () => {
+    const spoken = '!printenv GATE_CODE'
+    const live = mount(true)
+
+    try {
+      markTalkDraft(spoken)
+      live.submission.submit(spoken)
+      await new Promise(resolve => setTimeout(resolve, 0))
+
+      expect(isTalkDraft(spoken)).toBe(true)
+
+      patchUiState({ gatewayConnected: true, sid: 'sess-later' })
+      live.submission.submit(spoken)
+      await new Promise(resolve => setTimeout(resolve, 0))
+
+      expect(live.request.mock.calls.map(call => call[0])).not.toContain('shell.exec')
+      expect(live.request).toHaveBeenCalledWith(
+        'prompt.submit',
+        expect.objectContaining({ session_id: 'sess-later', text: spoken })
+      )
+    } finally {
+      live.unmount()
+    }
+  })
 })

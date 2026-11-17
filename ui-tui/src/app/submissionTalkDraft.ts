@@ -3,7 +3,7 @@ import type { QueueItem } from '../hooks/useQueue.js'
 import type { ComposerActions, ComposerToken } from './interfaces.js'
 import { stagePastes } from './pasteStore.js'
 import type { SubmissionDestination } from './submissionDestination.js'
-import { consumeTalkDraft, isTalkDraft } from './talkDraftProvenance.js'
+import { consumeTalkDraft, isTalkDraft, markTalkDraft } from './talkDraftProvenance.js'
 import { getUiState } from './uiStore.js'
 
 interface TalkDraftContext {
@@ -41,19 +41,21 @@ export function submitTalkDraft(ctx: TalkDraftContext): void {
 
   // Busy goes to the local literal queue on purpose: the draft must never reach
   // handleBusyInput's interrupt/steer paths, which treat text as a command line.
-  if (!state.sid || state.gatewayConnected === false || state.busy) {
-    journaled(() =>
-      composerActions.enqueue(submission.text, submission.display, destination, submission.attachments, true)
-    )
+  const saved =
+    !state.sid || state.gatewayConnected === false || state.busy
+      ? journaled(() =>
+          composerActions.enqueue(submission.text, submission.display, destination, submission.attachments, true)
+        )
+      : journaled(() =>
+          send(submission.text, true, submission.display, value => value, {
+            attachments: submission.attachments,
+            literal: true,
+            skipDetectDrop: true
+          })
+        )
 
-    return
+  // A failed write leaves the text in the composer: it is still the spoken draft.
+  if (!saved) {
+    markTalkDraft(full)
   }
-
-  journaled(() =>
-    send(submission.text, true, submission.display, value => value, {
-      attachments: submission.attachments,
-      literal: true,
-      skipDetectDrop: true
-    })
-  )
 }
