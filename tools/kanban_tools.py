@@ -11,8 +11,10 @@ import functools
 import json
 import logging
 import os
+import re
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.delegation_context import owned_kanban_task
@@ -24,8 +26,8 @@ from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
-    KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
-    KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
+    KANBAN_LIST_SCHEMA, KANBAN_RECORD_COMPLETION_STATE_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA,
+    KANBAN_REQUEST_REVIEW_SCHEMA, KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
 
 logger = logging.getLogger(__name__)
 
@@ -362,6 +364,38 @@ def _ok_landed(kb, conn, tid: str, default_status: str, **extra: Any) -> str:
                status=landed.status if landed else default_status, **extra)
 
 
+_REPO_WORK_HINT = re.compile(
+    r"\b(?:branch\s+off|on\s+(?:a\s+)?branch|commit\s+to)\b", re.IGNORECASE)
+
+
+def _scratch_repo_workspace_warning(
+    title: str, body: Optional[str], workspace_kind: Optional[str],
+) -> Optional[str]:
+    """Return guidance when a scratch card asks for branch/commit work (wording: branch off,
+    on a branch, commit to). No filesystem access.
+
+    This is intentionally advisory: a creator may explicitly choose scratch,
+    and the creation path must never silently promote that choice to worktree.
+    """
+    if workspace_kind != "scratch":
+        return None
+    text = f"{title}\n{body or ''}"
+    if not _REPO_WORK_HINT.search(text):
+        return None
+    # The path is only echoed back to the card's own author. It is never stat()ed: card text is
+    # author-controlled, and a filesystem probe of arbitrary paths (network mounts, other users'
+    # trees) is not worth a courtesy warning.
+    found = re.search(r"(?<!\S)(/[\w.~/+-]+)", text)     # path characters only: a query string is never echoed
+    repo_path = found.group(1).rstrip(".,;:!?)]}")[:200] if found else None
+    repo_detail = f" {repo_path}" if repo_path else ""
+    return (
+        f"card references git repository{repo_detail} but workspace_kind=scratch — "
+        "scratch workspaces contain no git repo; create with "
+        "workspace_kind='worktree' (and workspace_path=<repo> for a non-default repo) "
+        "if this task needs a branch or commits"
+    )
+
+
 def _redact(value: Any) -> str:
     return redact_sensitive_text(str(value), force=True)
 
@@ -436,7 +470,8 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override completion_contract last_failure_error".split())
+    "provider_override completion_contract completion_state completion_evidence "
+    "requires_live_verification verification_owner_id last_failure_error".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
     "created_at started_at completed_at current_run_id model_override provider_override".split())
@@ -807,14 +842,16 @@ def _handle_complete(args: dict, **kw) -> str:
             # complete_task reports every refusal as bare False; a reopened or
             # never-finished parent is the actionable one. Name the blockers so
             # the worker/operator completes the parents instead of re-running.
+            from hermes_cli.kanban_live_verification import live_verification_refusal
             blockers = kb.unsatisfied_parents(conn, tid)
             if blockers:
                 detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
                 raise _Reject(
                     f"could not complete {tid}: unsatisfied parent dependencies: "
                     f"{detail}; complete the parents first (done or archived)")
-            _check(False, (task.last_failure_error if task else None) or
-                   f"could not complete {tid} (unknown id, stale run, or already terminal)")
+            _check(False, (live_verification_refusal(conn, tid) if task and task.status not in ("done", "archived") else None)
+                   or (task.last_failure_error if task else None)
+                   or f"could not complete {tid} (unknown id, stale run, or already terminal)")
         run = kb.latest_run(conn, tid)
         # Artifact staging is atomic with the completion write, so a worker that
         # read `kanban_attachments` before completing saw an empty list and has
@@ -944,6 +981,20 @@ def _handle_request_changes(args: dict, **kw) -> str:
             conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
         _check(ok, f"could not request changes for {tid}: {detail or 'invalid review state'}")
         return _ok_landed(kb, conn, tid, "ready", implementer=detail)
+
+
+@_kanban_handler("kanban_record_completion_state")
+def _handle_record_completion_state(args: dict, **kw) -> str:
+    """Persist precisely one evidence-backed delivery label without inference."""
+    tid = _worker_guard("kanban_record_completion_state", args)
+    state = _require_text(args, "state", "state is required")
+    evidence = args.get("evidence")
+    _check(isinstance(evidence, dict), "evidence must be an object containing a non-empty 'proof' string")
+    with _board(args.get("board")) as (kb, conn):
+        _check(kb.record_completion_state(conn, tid, state, evidence),
+               f"could not record completion state for {tid} (unknown task)")
+        task = kb.get_task(conn, tid)
+        return _ok(task_id=tid, **_fields(task, ("completion_state", "completion_evidence")))
 
 
 @_kanban_handler("kanban_heartbeat")
@@ -1164,13 +1215,16 @@ def _handle_create(args: dict, **kw) -> str:
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
+            requires_live_verification=_parse_bool_arg(args, "requires_live_verification"),
+            verification_owner_id=args.get("verification_owner_id"),
             initial_status=str(args.get("initial_status") or "running"),
             created_by=_persisted_identity(), session_id=session_id)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
+        warning = _scratch_repo_workspace_warning(title, args.get("body"), landed["workspace_kind"])
         return _ok(task_id=new_tid, **landed, **gate,
-                   subscribed=_maybe_auto_subscribe(conn, new_tid))
+                   subscribed=_maybe_auto_subscribe(conn, new_tid), **({"warning": warning} if warning else {}))
 
 
 def _live_tui_session_key(session_key: str, profile: Optional[str]) -> str:
@@ -1315,6 +1369,8 @@ _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
     ("kanban_complete", KANBAN_COMPLETE_SCHEMA, _handle_complete, "✔"),
+    ("kanban_record_completion_state", KANBAN_RECORD_COMPLETION_STATE_SCHEMA,
+     _handle_record_completion_state, "🏷"),
     ("kanban_block", KANBAN_BLOCK_SCHEMA, _handle_block, "⏸"),
     ("kanban_schedule", KANBAN_SCHEDULE_SCHEMA, _handle_schedule, "⏰"),
     ("kanban_request_review", KANBAN_REQUEST_REVIEW_SCHEMA, _handle_request_review, "👀"),

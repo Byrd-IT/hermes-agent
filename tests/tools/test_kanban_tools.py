@@ -173,6 +173,33 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     assert tenant_ids == [c]
 
 
+def test_record_completion_state_keeps_labels_explicit_and_returns_evidence(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_record_completion_state({
+        "state": "tested",
+        "evidence": {"proof": "scripts/run_tests.sh: 42 passed"},
+    })
+    data = json.loads(out)
+    assert data["ok"] is True
+    assert data["task_id"] == worker_env
+    assert data["completion_state"] == "tested"
+    assert data["completion_evidence"] == {"proof": "scripts/run_tests.sh: 42 passed"}
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task.completion_state == "tested"
+        assert task.completion_evidence == {"proof": "scripts/run_tests.sh: 42 passed"}
+        states = [event.payload["state"] for event in kb.list_events(conn, worker_env)
+                  if event.kind == "completion_state_recorded"]
+        assert states == ["tested"]
+    finally:
+        conn.close()
+
+
 def test_complete_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_complete({
@@ -740,6 +767,27 @@ def test_create_happy_path(worker_env):
         assert child.assignee == "peer"
     finally:
         conn.close()
+
+
+def test_create_scratch_with_repo_path_returns_worktree_guidance(worker_env, tmp_path):
+    """A repo-bound scratch card remains scratch but tells its creator why that
+    workspace cannot support the requested branch/commit work."""
+    from tools import kanban_tools as kt
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    result = json.loads(kt._handle_create({
+        "title": "Implement the fix",
+        "body": f"Branch off main in {repo} and commit the change.",
+        "assignee": "peer",
+        "workspace_kind": "scratch",
+    }))
+
+    assert result["ok"] is True
+    assert result["workspace_kind"] == "scratch"
+    assert str(repo) in result["warning"]
+    assert "workspace_kind='worktree'" in result["warning"]
 
 
 @pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])

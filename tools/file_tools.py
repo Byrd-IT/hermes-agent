@@ -27,7 +27,7 @@ from tools.file_operations import (
 from tools.file_operations_common import DEFAULT_READ_LIMIT, count_conflict_blocks
 from tools import file_state
 from hermes_platform.host import facts
-from agent.redact import _is_secret_file_arg, redact_sensitive_text
+from agent.redact import _SENSITIVE_QUERY_PARAMS, _is_secret_file_arg, redact_sensitive_text
 from tools.file_tools_paths import (
     _expand_tilde, _hosted_tilde, _path_resolution_warning, _resolve_base_dir, _resolve_entry_for_task,
     _resolve_path_for_task)
@@ -134,6 +134,83 @@ def _file_ops_uses_host_paths(file_ops) -> bool:
 # must be checked).
 _V4A_SINGLE_HEADER_RE = re.compile(r'^(\*\*\*\s*(Update|Add|Delete)\s+File:\s*)(.+)$', re.MULTILINE)
 _V4A_MOVE_HEADER_RE = re.compile(r'^(\*\*\*\s*Move\s+File:\s*)(.+?)\s*->\s*(.+)$', re.MULTILINE)
+
+# The redactor returns three asterisks for short secrets and this exact marker for
+# vault-filled values. Those display-only replacements must never become file
+# content through a fuzzy patch whose source was a redacted tool result.
+# The vault marker is always refused. A run of exactly three asterisks is refused only where it sits
+# in a credential context: after a credential word (env and JSON fields, auth
+# headers with any scheme), as a URL query value or userinfo, or after a Telegram bot id. Ordinary
+# source such as a Markdown rule, bold-italic, a C pointer type, ``return "<run>"`` or
+# ``text.replace(v, '<run>')`` has no credential word before it and is left alone; so is a run that
+# touches a word character. The credential words are matched anywhere before the run on the line,
+# because the redactor keeps the field name and masks only the value.
+_VAULT_SECRET_MARKER = "\u00abredacted-vault-secret\u00bb"
+_MASK_RUN_RE = re.compile(r"(?<!\*)\*{3}(?!\*)")
+_CREDENTIAL_WORD_RE = re.compile(
+    r"key|token|secret|pass|pwd|(?<![a-z])pw(?![a-z])|_pw\b|credential|auth|bearer|digest|basic|"
+    r"signature|(?<![a-z])sig(?![a-z])|cookie|session|ticket|jwt", re.IGNORECASE)
+# A URL query / fragment / form-body value whose name the redactor treats as sensitive.
+_QUERY_VALUE_RE = re.compile(
+    r"(?:^|[?#&;])(?:" + "|".join(sorted(map(re.escape, _SENSITIVE_QUERY_PARAMS))) + r")=$", re.IGNORECASE)
+_URL_USERINFO_RE = re.compile(r"//[^/\s?#@]*$")     # after // with no path yet: user:<mask>@host
+_TELEGRAM_ID_RE = re.compile(r"\d{6,}:$")
+
+
+def _is_word_char(ch: str) -> bool:
+    return ch.isalnum() or ch == "_"
+
+
+def _is_masked_credential_run(text: str, start: int, end: int) -> bool:
+    """Whether the three-asterisk run at ``text[start:end]`` looks like redactor output."""
+    if (start and _is_word_char(text[start - 1])) or (end < len(text) and _is_word_char(text[end])):
+        return False
+    line_start = text.rfind("\n", 0, start) + 1
+    line_end = text.find("\n", end)
+    line_end = len(text) if line_end == -1 else line_end
+    prefix = text[line_start:start]
+    if not prefix.strip() and not text[end:line_end].strip():
+        return False                                        # alone on its line: a Markdown rule
+    return bool(_CREDENTIAL_WORD_RE.search(prefix) or _QUERY_VALUE_RE.search(prefix)
+                or _URL_USERINFO_RE.search(prefix) or _TELEGRAM_ID_RE.search(prefix))
+
+
+def _has_masked_credential_run(text: str) -> bool:
+    return any(_is_masked_credential_run(text, m.start(), m.end()) for m in _MASK_RUN_RE.finditer(text))
+
+
+def _masked_secret_edit_error() -> str:
+    """Explain why a display-redacted patch payload is refused."""
+    return (
+        "Refused to apply an edit containing a masked credential literal. "
+        "Masked tool output is display-only and must not be written to files. "
+        "Use the credential-vault or configuration path for secrets instead. If the file really "
+        "contains this literal (you read it from the file itself, not from tool output), edit it "
+        "with write_file or a terminal command."
+    )
+
+
+def _contains_masked_secret_marker(*values: str | None) -> bool:
+    """Whether patch text contains a display-only secret redaction marker."""
+    return any(
+        isinstance(value, str) and (_VAULT_SECRET_MARKER in value or _has_masked_credential_run(value))
+        for value in values
+    )
+
+
+def _v4a_contains_masked_secret_marker(patch: str) -> bool:
+    """Inspect V4A edit content without mistaking its ``***`` control lines for data."""
+    from tools.patch_parser import parse_v4a_patch
+
+    operations, _parse_error = parse_v4a_patch(patch)
+    return any(
+        _contains_masked_secret_marker(
+            hunk.context_hint,
+            *(line.content for line in hunk.lines),
+        )
+        for operation in operations
+        for hunk in operation.hunks
+    )
 
 
 def _rewrite_v4a_patch_paths_for_host(patch: str, path_to_resolved: dict, path_to_entry: dict,
@@ -969,6 +1046,10 @@ def patch_tool(mode: str = "replace", path: str | None = None, old_string: str |
     ``cross_profile``: same semantics as ``write_file``'s flag (mirror-guard
     bypass only; unadvertised).
     """
+    if mode == "replace" and _contains_masked_secret_marker(old_string, new_string):
+        return tool_error(_masked_secret_edit_error())
+    if mode == "patch" and patch and _v4a_contains_masked_secret_marker(patch):
+        return tool_error(_masked_secret_edit_error())
     _paths_to_check = [path] if path else []
     _content_write_paths = list(_paths_to_check)
     _entry_paths: list[str] = []

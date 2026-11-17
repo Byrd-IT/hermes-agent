@@ -934,11 +934,14 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             if not done:
                 # complete_task returns bare False for a dependency refusal too;
                 # name the open parents instead of claiming the id is unknown.
+                from hermes_cli.kanban_live_verification import live_verification_refusal
                 blockers = kb.unsatisfied_parents(conn, tid)
                 if blockers:
                     detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
                     fail_msg[tid] = (f"cannot complete {tid}: unsatisfied parent dependencies: {detail}; "
                                      f"complete the parents first, or `hermes kanban unlink <parent> {tid}`.")
+                else:
+                    fail_msg[tid] = live_verification_refusal(conn, tid) or fail_msg[tid]
             return done
 
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
