@@ -58,3 +58,17 @@ def test_seek_falls_through_exact_rstrip_strip_in_order():
     assert _seek_hunk(content, ["c"], 0) == (6, 9)          # strip match
     assert _seek_hunk(content, ["a", "b  "], 0) == (0, 5)   # exact multi-line
     assert _seek_hunk(content, ["zzz"], 0) is None
+
+
+def test_a_later_hunk_starting_with_a_blank_context_line_is_not_double_counted():
+    """The cursor sits at the end of the previous hunk's line; that line's empty tail is not a
+    candidate for the seek, so it must not make a unique blank-led block look ambiguous."""
+    patch = (
+        "*** Begin Patch\n*** Update File: a.py\n@@\n-start\n+START\n@@\n \n-x\n+X\n*** End Patch\n"
+    )
+    ops, err = parse_v4a_patch(patch)
+    assert err is None
+    files = _Files({"a.py": "start\nx\n\nx\n"})
+    result = apply_v4a_operations(ops, files)
+    assert result.success is True, result.error
+    assert files.files["a.py"] == "START\nx\n\nX\n"
