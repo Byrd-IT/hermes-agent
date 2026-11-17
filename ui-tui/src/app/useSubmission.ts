@@ -355,9 +355,17 @@ export function useSubmission(opts: UseSubmissionOptions) {
       const submission = prepareSubmission(full, submissionTokens)
       const toHistory = submission.text
 
-      // Expanded here, before clearIn() empties the tokens the async rewind would expand against;
-      // the tokens ride along so a rewind that cuts nothing restores the draft whole.
-      if (sendPendingRewind({ ...submission, tokens: submissionTokens }, getUiState().sid)) {
+      // A Talk draft is spoken text: it must reach the model as a prompt, never as `/cmd`,
+      // `!cmd` or `{!cmd}`. An armed backtrack edit would rewind and send it without the
+      // literal flag, so a draft holding `{!cmd}` could run as shell: disarm the edit
+      // (nothing was cut) and let the draft take the literal Talk path below.
+      if (mustStayLiteral(full)) {
+        cancelPendingRewind()
+      } else if (
+        // Expanded here, before clearIn() empties the tokens the async rewind would expand against;
+        // the tokens ride along so a rewind that cuts nothing restores the draft whole.
+        sendPendingRewind({ ...submission, tokens: submissionTokens }, getUiState().sid)
+      ) {
         // The sent row shows each chip and expands it from these bodies, as an ordinary submit's does.
         stagePastes(full, submission.text, submissionTokens)
         composerActions.pushHistory(toHistory)

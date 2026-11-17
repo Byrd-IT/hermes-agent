@@ -35,7 +35,6 @@ export function submitTalkDraft(ctx: TalkDraftContext): void {
   const { composerActions, destination, full, journaled, send, submission, tokens, toHistory } = ctx
 
   consumeTalkDraft(full)
-  composerActions.pushHistory(toHistory)
   stagePastes(full, submission.text, tokens)
   const state = getUiState()
 
@@ -57,5 +56,11 @@ export function submitTalkDraft(ctx: TalkDraftContext): void {
   // A failed write leaves the text in the composer: it is still the spoken draft.
   if (!saved) {
     markTalkDraft(full)
+
+    return
   }
+
+  // History records what was sent, so it follows the durable write: a retry after a failed
+  // write must not push the same entry twice.
+  composerActions.pushHistory(toHistory)
 }
