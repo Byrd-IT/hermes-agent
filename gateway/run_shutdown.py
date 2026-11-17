@@ -1610,6 +1610,13 @@ class GatewayShutdownMixin(GatewaySessionEndMixin, GatewayHomeShutdownNoticeMixi
         from gateway.restart_when_idle import request_restart
         return request_restart(self, detached=detached, via_service=via_service)
 
+    def handle_restart_if_idle_request(self) -> None:
+        """Decide ONE conditional-restart request (``gateway/restart_if_idle.py``) in a single synchronous step on the
+        loop thread: freeze admission, count all work, then either refuse (admission reopens) or acknowledge and
+        start the normal graceful restart. Without a valid request nothing happens; this is never SIGUSR1."""
+        from gateway import restart_if_idle
+        restart_if_idle.decide(self)
+
     def _start_systemd_watchdog(self) -> bool:
         """Start sd_notify only after a configured gateway is truly running."""
         if not self._running or self.config.systemd_watchdog_seconds <= 0:

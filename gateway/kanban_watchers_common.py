@@ -110,6 +110,34 @@ def _kanban_dispatch_allowed() -> bool:
     return not check_paused("kanban", logger)
 
 
+def _kanban_owner_unavailable(runner: Any) -> str:
+    """Why this gateway (the owner of every kanban worker) cannot take new work, or ``""``.
+
+    ``restart_wait`` / ``draining`` / ``not_ready``: a restart or stop has begun, so a worker spawned now would
+    wait on an owner that is about to go (and its exit would spend the card's failure budget);
+    ``update_paused``: an update owns the install. The dispatcher resumes by itself on the next
+    tick of the gateway that replaces this one. Never raises: unknown state reads as available.
+    """
+    try:
+        if getattr(runner, "_draining", False) or getattr(runner, "_restart_requested", False):
+            from gateway.drain_control import RESTART_WAIT_REASON
+            descriptor = getattr(runner, "session_runtime_descriptor", None) or {}
+            return RESTART_WAIT_REASON if descriptor.get("drain_reason") == RESTART_WAIT_REASON else "draining"
+        # The session API turns workers away (``gateway_not_ready``) whenever its state is not
+        # ``ready``: ``starting`` at boot, ``failed`` once the listener died. A worker spawned then
+        # only waits out OWNER_WAIT_S. No descriptor (no session API) reads as available.
+        state = (getattr(runner, "session_runtime_descriptor", None) or {}).get("state")
+        if state not in (None, "ready"):
+            return "not_ready"
+        from hermes_cli.gateway_runtime import _update_fenced
+        from hermes_constants import get_default_hermes_root, get_hermes_home, get_process_hermes_home
+        if _update_fenced({get_hermes_home(), get_process_hermes_home(), get_default_hermes_root()}):
+            return "update_paused"
+    except Exception:
+        logger.debug("kanban dispatcher: owner availability check failed", exc_info=True)
+    return ""
+
+
 def _acquire_singleton_lock(lock_path) -> tuple[Optional[object], str]:
     """Take the exclusive, non-blocking advisory lock for the sole dispatcher.
 

@@ -26,6 +26,7 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from hermes_cli.kanban_db_dispatch_streaks import _protocol_violation_streak
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 from hermes_cli._startup_fast import project_root_str
 
@@ -942,40 +943,6 @@ def _error_fingerprint(error_text: str) -> str:
 # nor extend it. Per-task ``max_retries`` overrides it.
 _PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
 
-# Closed runs to walk when counting the streak; it trips at a handful anyway.
-_PROTOCOL_VIOLATION_SCAN_LIMIT = 50
-
-
-def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
-    """Count the task's trailing run of clean-exit protocol violations.
-
-    Walks closed runs newest-first (including the one ``detect_crashed_workers``
-    just closed). ``rate_limited`` runs are neutral and skipped (a quota wall
-    says nothing about the task); any other closed run breaks the streak, so
-    the budget counts ONLY protocol violations. Violations are recognized by the
-    ``protocol_violation`` run-metadata marker, with the error text as fallback
-    for runs recorded before the marker existed.
-    """
-    streak = 0
-    rows = conn.execute(
-        "SELECT outcome, error, metadata FROM task_runs "
-        "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY id DESC LIMIT ?",
-        (task_id, _PROTOCOL_VIOLATION_SCAN_LIMIT),
-    ).fetchall()
-    for row in rows:
-        outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
-            continue
-        head = (row["error"] or "").partition(WORKER_OUTPUT_SEP)[0]  # never the worker's own words
-        if outcome == "crashed" and (
-                _kb._json_dict(row["metadata"]).get("protocol_violation") or "protocol violation" in head):
-            streak += 1
-            continue
-        break
-    return streak
-
-
 WORKER_OUTPUT_SEP = " Worker's last output: "  # dead-worker error text: our words, then the worker's
 _PROTOCOL_VIOLATION_ERROR = (
     # Worker subprocess returned 0 but its task is still ``running`` in the DB — it exited without calling
@@ -1056,6 +1023,9 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    owner_restart: str = ""
+    """Evidence that the profile OWNER restarted or drained under the worker
+    (``owner_restart_evidence``): booked as infrastructure, never as a card failure."""
 
     @property
     def run_outcome(self) -> str:
@@ -1178,7 +1148,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
-        from hermes_cli.kanban_owner_recovery import apply_attempt_note, managed_run_exit_code, owner_reclaim_blocked
+        from hermes_cli.kanban_owner_recovery import (
+            apply_attempt_note, managed_run_exit_code, mark_owner_restart, owner_reclaim_blocked)
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -1200,6 +1171,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
             dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
             apply_attempt_note(conn, row["id"], pid, dead)
+            mark_owner_restart(conn, row["id"], dead)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1258,11 +1230,16 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
     for _, _, _, dead in crash_details:
+        if dead.owner_restart:
+            continue  # the owner's restart is not a shared card error
         fp = _error_fingerprint(dead.error_text)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
     for tid, pid, claimer, dead in crash_details:
         error_text = dead.error_text
-        if dead.protocol_violation:
+        if dead.owner_restart:
+            from hermes_cli.kanban_owner_recovery import account_owner_restart
+            tripped = account_owner_restart(conn, tid, pid, claimer, dead)
+        elif dead.protocol_violation:
             streak = _protocol_violation_streak(conn, tid)
             trow = conn.execute("SELECT max_retries FROM tasks WHERE id = ?", (tid,)).fetchone()
             if trow is None:
@@ -2075,6 +2052,33 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
 
 
 def _dispatch_lane_task(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    assignee: str,
+    result: DispatchResult,
+    **kwargs: Any,
+) -> bool:
+    """Guard, claim and spawn one ready/review row inside an admission span (``_dispatch_lane_task_admitted``).
+
+    Conditional restart (``gateway/restart_if_idle.py``): the embedded dispatcher reads the gateway's availability
+    in one thread hop and claims/spawns in another, so the availability read proves nothing by the time a card is
+    claimed. The span is the proof: a claim that begins before an idle decision is counted by it (and the decision
+    refuses), one that begins after an accepted decision is refused before the card is touched -- it stays ready
+    for the replacement gateway's dispatcher. A dry run changes nothing and needs no span."""
+    if kwargs.get("dry_run"):
+        return _dispatch_lane_task_admitted(conn, row, assignee, result, **kwargs)
+    from agent.admission_gate import gate as _admission_gate
+
+    span = _admission_gate().enter("kanban_spawn")
+    if span is None:
+        return False
+    try:
+        return _dispatch_lane_task_admitted(conn, row, assignee, result, **kwargs)
+    finally:
+        span.exit()
+
+
+def _dispatch_lane_task_admitted(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
     assignee: str,

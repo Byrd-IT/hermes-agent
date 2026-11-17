@@ -15,6 +15,7 @@ lost attempt:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -25,6 +26,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_dispatch_streaks as kbds
 from hermes_cli import kanban_owner_recovery
 
 NOW = int(time.time())
@@ -97,7 +99,7 @@ class _Board:
         if owner:
             request_id = f'kanban:["default","{tid}",{run_id}]'
             self.event(tid, run_id, "owner_admitted",
-                       {"db": str(self.ledger), "session_id": "sess-1", "pid": owner_pid or _absent_pid(base=3_950_000),
+                       {"db": str(self.ledger), "session_id": "sess-1", "pid": owner_pid or os.getpid(),  # a LIVE owner: a dead one is a restart, not a card failure
                         "request_id": request_id}, started + 3)
             if admission:
                 with sqlite3.connect(self.ledger) as store:
@@ -190,7 +192,7 @@ def test_a_lost_worker_that_exited_cleanly_still_charges_the_breaker(board):
     kinds = [r[0] for r in board.conn.execute(
         "SELECT kind FROM task_events WHERE task_id='t_clean' AND run_id=?", (run_id,))]
     assert "protocol_violation" not in kinds and "crashed" in kinds
-    assert kbd._protocol_violation_streak(board.conn, "t_clean") == 0
+    assert kbds._protocol_violation_streak(board.conn, "t_clean") == 0
 
 
 def test_a_crash_whose_output_quotes_protocol_violation_is_not_one(board):
@@ -204,7 +206,7 @@ def test_a_crash_whose_output_quotes_protocol_violation_is_not_one(board):
     board.tick(failure_limit=5)
     run = board.run(run_id)
     assert run["outcome"] == "crashed" and "protocol violation" in run["error"]
-    assert kbd._protocol_violation_streak(board.conn, "t_quote") == 0
+    assert kbds._protocol_violation_streak(board.conn, "t_quote") == 0
 
 
 # --- A2: an elapsed claim lock is never "still running" after one tick ---------------------

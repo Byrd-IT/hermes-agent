@@ -1,6 +1,7 @@
 """Read-only canonical admission fences for dispatcher reclaim paths."""
 from contextlib import closing
 import json
+import re
 from pathlib import Path
 import sqlite3
 import time
@@ -240,6 +241,71 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
     from hermes_cli.kanban_db_dispatch import WORKER_OUTPUT_SEP
     head, sep, output = dead.error_text.partition(WORKER_OUTPUT_SEP)
     dead.error_text = f"{head} [{note}]{sep}{output}"
+
+
+# What a worker prints when it loses its owner for ``OWNER_WAIT_S`` (kanban_worker_client): the
+# owner draining/restarting/not ready, or a refused, reset or unanswered dial. The detail is one
+# of the client's own messages (gateway_client.py, a reason code, an exception name); the wrapper
+# phrase alone is the evidence, so a new client message cannot silently fall out of it.
+# Anchored near the END of the worker's captured output (a short tail only), so a card that merely
+# prints the phrase mid-run (a test log, a quoted incident) is not reclassified.
+_OWNER_SILENT_RE = re.compile(r"Kanban owner silent for \d+s: [^\n]{0,200}$")
+
+
+def owner_restart_evidence(conn, task_id, error_text="") -> str:
+    """Why a dead worker's loss is the OWNER's restart or drain, not the card's fault; ``""`` if unproven.
+
+    Either: the owner process that admitted this run is gone or replaced (a gateway restart
+    killed every worker it owned at once); or the worker's own final output line says its owner
+    stayed silent (``Kanban owner silent for Ns: Gateway draining: restart_wait`` / ``not_ready``).
+    Missing evidence is never proof, so a plain crash with a live owner returns ``""``. A gone
+    owner is evidence, not proof (an idle-exit gateway can leave before its own sweep): the
+    ``OWNER_RESTART_RETRY_LIMIT`` streak bounds a misread. The same bound covers a card whose own
+    final output imitates the owner-silence line: at most that many free retries, then a sticky block.
+    """
+    receipt = _owner_receipt(conn, task_id)
+    if receipt and _owner_process_gone(receipt):
+        return "owner process gone or replaced"
+    from hermes_cli.kanban_db_dispatch import WORKER_OUTPUT_SEP
+    if _OWNER_SILENT_RE.search((error_text or "").partition(WORKER_OUTPUT_SEP)[2]):
+        return "worker exit: owner silent"
+    return ""
+
+
+def mark_owner_restart(conn, task_id, dead) -> None:
+    """Flag a plain crash as the owner's restart (``dead.owner_restart``) and its run/event as
+    ``infrastructure``. Protocol violations, quota walls and terminal provider errors have their
+    own accounting and are never reclassified here."""
+    if dead.protocol_violation or dead.rate_limited or dead.terminal_provider:
+        return
+    dead.owner_restart = owner_restart_evidence(conn, task_id, dead.error_text)
+    if dead.owner_restart:
+        dead.event_payload.update(infrastructure=True, owner_restart=dead.owner_restart)
+
+
+def account_owner_restart(conn, tid, pid, claimer, dead) -> bool:
+    """Book a loss caused by the owner's restart/drain: infrastructure, not a card failure.
+
+    The sweep already put the card back at its retry status and closed the run (flagged
+    ``infrastructure``); ``consecutive_failures`` is untouched and the loss never joins the
+    systemic fingerprint count. Only a streak of ``OWNER_RESTART_RETRY_LIMIT`` such losses blocks
+    the card (sticky, ``owner did not return``). True when it blocked.
+    """
+    from hermes_cli.kanban_db_dispatch import _record_task_failure
+    extra = {"pid": pid, "claimer": claimer, "owner_restart": dead.owner_restart}
+    from hermes_cli.kanban_db_dispatch_streaks import OWNER_RESTART_RETRY_LIMIT, owner_restart_streak
+    streak = owner_restart_streak(conn, tid)
+    if streak >= OWNER_RESTART_RETRY_LIMIT:
+        extra.update(sticky=True, owner_did_not_return=True, owner_restart_losses=streak)
+        return _record_task_failure(
+            conn, tid,
+            error=f"owner did not return: {streak} consecutive attempts lost to an owner "
+                  f"restart/drain ({dead.owner_restart}); unblock once the gateway is healthy",
+            outcome="crashed", force_trip=True, release_claim=False, end_run=False,
+            event_payload_extra=extra)
+    return _record_task_failure(
+        conn, tid, error=dead.error_text, outcome="crashed", release_claim=False, end_run=False,
+        event_payload_extra=extra, infrastructure=True)
 
 
 def owner_reclaim_blocked(conn, task_id, *, crash_sweep=False) -> bool:
