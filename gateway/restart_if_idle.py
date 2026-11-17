@@ -74,6 +74,8 @@ import time
 from collections import OrderedDict
 from typing import Any, Callable, Optional
 
+from gateway import restart_when_idle
+
 logger = logging.getLogger("gateway.restart_if_idle")
 
 PROTOCOL_VERSION = 2
@@ -422,6 +424,11 @@ def _base_sources(runner: Any, run_runtime: Any) -> list[tuple[str, Callable[[],
         ("queued_events", lambda: _queued_events(runner)),
         ("background_tasks", lambda: _background_tasks(runner)),
         ("delegations", _delegations),
+        # The restart this decision starts waits for these too (gateway/restart_when_idle.py): a live notify
+        # process watcher and a queued delegation completion notice each deliver a new turn later. Counted
+        # here, the probe cannot call the gateway idle while the restart would wait on them.
+        ("process_watchers", lambda: len(restart_when_idle.process_units(runner, time.time()))),
+        ("queued_notices", lambda: len(restart_when_idle.queued_notice_units(runner))),
         ("voice_sessions", lambda: runner._active_voice_session_count()),      # None = could not be counted
     ]
 

@@ -821,3 +821,25 @@ def test_queued_events_are_counted_from_session_state_not_a_removed_runner_attri
     runner._session_state("telegram:2").conversation.queued_events.append(object())
     assert rii._queued_events(runner) == 3
     assert rii.idle_probe(runner)["busy"]["queued_events"] == 3
+
+
+def test_the_probe_counts_the_background_work_the_restart_it_starts_would_wait_for(home, hold, monkeypatch):
+    """The restart this decision starts waits for a live notify process watcher and a queued delegation
+    completion notice (``gateway/restart_when_idle.py``: each delivers a new turn later). The probe must count
+    them too, or it accepts a restart that then waits on them with admission already frozen."""
+    import queue as queue_mod
+
+    from tools.process_registry import process_registry
+
+    monkeypatch.setattr(process_registry, "completion_queue", queue_mod.Queue())
+    runner = _runner()
+    runner._live_process_watchers = {"proc_watch1"}
+    process_registry.completion_queue.put({"type": "async_delegation", "delegation_id": "d1",
+                                            "parent_session_id": "s1"})
+    probe = rii.idle_probe(runner)
+    assert probe["busy"]["process_watchers"] == 1
+    assert probe["busy"]["queued_notices"] == 1
+    ack = _decide(runner, home, _request(home, hold))
+    assert ack["result"] == rii.RESULT_BUSY
+    assert ack["active"]["process_watchers"] == 1 and ack["active"]["queued_notices"] == 1
+    assert runner._draining is False and runner._restart_task_started is False
