@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
-import { act, type ReactNode } from "react";
+import { act, useEffect, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { MemoryRouter } from "react-router";
+import { MemoryRouter, useNavigate } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -96,6 +96,10 @@ class FakeTerminal {
 const maybeReloadForLoopbackWsAuthFailure = vi.fn(() => false);
 const apiMocks = vi.hoisted(() => ({
   buildWsUrl: vi.fn(async () => "ws://localhost/api/pty?channel=chat-1"),
+  getConfig: vi.fn(async () => ({ voice: {} })),
+  getSessionDetail: vi.fn(async () => ({ title: null })),
+  getSessionLatestDescendant: vi.fn(async () => ({})),
+  fetchJSON: vi.fn(async () => ({ transcript: "should-not-send" })),
 }));
 const uploadChatImage = vi.hoisted(() =>
   vi.fn(async () => ({ path: "/tmp/pasted.png" })),
@@ -147,6 +151,7 @@ vi.mock("@/lib/dashboard-auth-reload", () => ({
 vi.mock("@/lib/api", () => ({
   api: apiMocks,
   buildWsUrl: apiMocks.buildWsUrl,
+  fetchJSON: apiMocks.fetchJSON,
 }));
 
 class FakeWebSocket {
@@ -177,6 +182,15 @@ type CloseEventLike = {
   reason: string;
   wasClean: boolean;
 };
+
+/** Changes the chat URL after mount so ChatPage's connect effect replaces the socket. */
+function ResumeJump({ to }: { to: string | null }) {
+  const navigate = useNavigate();
+  useEffect(() => {
+    if (to) navigate(to);
+  }, [navigate, to]);
+  return null;
+}
 
 let container: HTMLDivElement;
 let root: Root;
@@ -942,5 +956,83 @@ describe("ChatPage WebGL renderer gating", () => {
     });
 
     expect(webglInstances[0].disposed).toBe(true);
+  });
+});
+
+describe("ChatPage talk cancellation", () => {
+  it("stops Talk when a resume change replaces the socket without leaving open", async () => {
+    class FakeMediaRecorder {
+      static instances: FakeMediaRecorder[] = [];
+      static isTypeSupported() {
+        return false;
+      }
+      mimeType = "audio/webm";
+      state = "inactive";
+      ondataavailable: ((ev: { data: Blob }) => void) | null = null;
+      onstop: (() => void) | null = null;
+      onerror: ((ev: { error?: Error }) => void) | null = null;
+      constructor() {
+        FakeMediaRecorder.instances.push(this);
+      }
+      start() {
+        this.state = "recording";
+      }
+      stop() {
+        this.state = "inactive";
+        this.onstop?.();
+      }
+    }
+    const previousDevices = navigator.mediaDevices;
+    vi.stubGlobal("MediaRecorder", FakeMediaRecorder);
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: vi.fn(async () => ({
+          getTracks: () => [{ stop() {} }],
+        })),
+      },
+    });
+    apiMocks.fetchJSON.mockClear();
+    try {
+      const { default: ChatPage } = await import("./ChatPage");
+      const tree = (resume: string | null) => (
+        <MemoryRouter initialEntries={["/chat"]}>
+          <ResumeJump to={resume} />
+          <ChatPage isActive />
+        </MemoryRouter>
+      );
+      await render(tree(null));
+      await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+      await act(async () => {
+        FakeWebSocket.instances[0]?.onopen?.();
+      });
+      const talk = container.querySelector(
+        'button[aria-label="Talk"]',
+      ) as HTMLButtonElement | null;
+      expect(talk?.disabled).toBe(false);
+      await act(async () => {
+        talk?.click();
+      });
+      await vi.waitFor(() => {
+        expect(FakeMediaRecorder.instances[0]?.state).toBe("recording");
+      });
+
+      await act(async () => {
+        root.render(tree("/chat?resume=sess-1"));
+      });
+      await vi.waitFor(() => {
+        expect(FakeMediaRecorder.instances[0]?.state).toBe("inactive");
+      });
+      expect(apiMocks.fetchJSON).not.toHaveBeenCalled();
+      expect(container.textContent).not.toContain("should-not-send");
+      const failed = container.querySelector('button[aria-label="Talk failed"]');
+      expect(failed).not.toBeNull();
+      expect(failed?.getAttribute("title")).toBe("Talk using voice settings");
+    } finally {
+      Object.defineProperty(navigator, "mediaDevices", {
+        configurable: true,
+        value: previousDevices,
+      });
+    }
   });
 });
