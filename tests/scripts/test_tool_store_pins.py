@@ -441,3 +441,81 @@ def test_runtime_dir_through_a_link_readlink_cannot_read_is_refused(tmp_path):
     assert run.returncode != 0
     assert "or a link readlink cannot read" in run.stderr
     assert _snapshot(store) == before
+
+
+# Under the account's own HOME (getent answers HOME itself) there is no other home
+# to provision instead: the store `pm install` writes is the one the installed
+# Hermes runs on, so a run at other pins must stop rather than re-stage it.
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("named_by", ["HERMES_RUNTIME_DIR", "HERMES_HOME", "default"])
+def test_accounts_own_home_refuses_to_re_stage_its_live_store_at_other_pins(tmp_path, named_by):
+    home = tmp_path / "account"
+    store = _store_at_other_pins(home / ".hermes" / "tools")
+    naming = {} if named_by == "default" else _naming(named_by, store)
+    before = _snapshot(store)
+    run, provisioned = _run_runner(tmp_path, home, home, naming)
+    assert provisioned is None, f"setup reached {provisioned}\n{run.stdout}{run.stderr}"
+    assert run.returncode != 0
+    assert "refusing to provision" in run.stderr and "live Hermes tool store" in run.stderr, run.stderr
+    assert "HERMES_RUNTIME_DIR" in run.stderr, "the refusal must say how to proceed"
+    assert _snapshot(store) == before
+
+
+@pytest.mark.platforms("posix")
+def test_accounts_own_home_uses_its_live_store_at_this_checkouts_pins(tmp_path):
+    """A store already at this checkout's pins is what the run provisions anyway."""
+    home = tmp_path / "account"
+    store = home / ".hermes" / "tools"
+    _matching_store(store)
+    run, provisioned = _run_runner(tmp_path, home, home, {})
+    assert provisioned is not None and provisioned.samefile(store), run.stdout + run.stderr
+    assert "refusing" not in run.stderr, run.stderr
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("bootstrap", [True, False])
+def test_accounts_own_home_provisions_a_separate_runtime_dir_beside_its_live_store(tmp_path, bootstrap):
+    """HERMES_RUNTIME_DIR naming a store of the run's own is the documented way out."""
+    home, separate = tmp_path / "account", tmp_path / "separate"
+    store = _store_at_other_pins(home / ".hermes" / "tools")
+    before = _snapshot(store)
+    run, provisioned = _run_runner(tmp_path, home, home, {"HERMES_RUNTIME_DIR": str(separate)}, bootstrap=bootstrap)
+    assert provisioned == separate.resolve(), run.stdout + run.stderr
+    assert _snapshot(store) == before
+
+
+@pytest.mark.platforms("posix")
+def test_accounts_own_home_refuses_when_no_interpreter_can_name_the_store(tmp_path):
+    """Without a bootstrap Python pm cannot say which store setup would provision,
+    and setup would fetch its own Python and provision the live one."""
+    home = tmp_path / "account"
+    store = _store_at_other_pins(home / ".hermes" / "tools")
+    before = _snapshot(store)
+    run, provisioned = _run_runner(tmp_path, home, home, {}, bootstrap=False)
+    assert provisioned is None, f"setup reached {provisioned}\n{run.stdout}{run.stderr}"
+    assert run.returncode != 0
+    assert "cannot check whether this run would provision the live Hermes tool store" in run.stderr, run.stderr
+    assert _snapshot(store) == before
+
+
+@pytest.mark.platforms("posix")
+def test_accounts_own_home_without_a_store_yet_is_provisioned(tmp_path):
+    """A first install (no facts.json yet) has no installed Hermes to protect."""
+    home = tmp_path / "account"
+    run, provisioned = _run_runner(tmp_path, home, home, {})
+    assert provisioned == (home / ".hermes" / "tools").resolve(), run.stdout + run.stderr
+
+
+@pytest.mark.platforms("posix")
+def test_accounts_own_home_does_not_stage_bootstrap_uv_into_its_live_store(tmp_path):
+    """With a custom HERMES_HOME choosing pm's store under the account's own HOME,
+    setup-hermes.sh's bootstrap uv staging must follow pm, not land in the live store."""
+    home, custom = tmp_path / "account", tmp_path / "custom"
+    store = _store_at_other_pins(home / ".hermes" / "tools")
+    run, pm_store = _run_runner(tmp_path, home, home, {"HERMES_HOME": str(custom)})
+    assert pm_store == (custom / "tools").resolve(), "control: pm provisions the custom home's store"
+    before = _snapshot(store)
+    run, staged = _run_runner(tmp_path / "real", home, home, {"HERMES_HOME": str(custom)}, real_setup=True)
+    assert staged is not None, run.stdout + run.stderr
+    assert Path(staged).resolve() == (custom / "tools").resolve(), run.stdout + run.stderr
+    assert _snapshot(store) == before

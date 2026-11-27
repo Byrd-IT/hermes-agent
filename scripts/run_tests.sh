@@ -23,6 +23,7 @@
 #   scripts/run_tests.sh tests/foo.py -v --tb=long  # bare flags "just work"
 #   scripts/run_tests.sh -k 'pattern'               # value flags pass through too
 #   scripts/run_tests.sh tests/foo.py -- --tb=long  # explicit '--' still works
+#   scripts/run_tests.sh --help                     # options; provisions nothing
 #
 # Bare pytest flags (anything starting with '-' that isn't one of this
 # runner's own options: -j/--jobs, --paths, --slice, --file-timeout, etc.)
@@ -54,6 +55,38 @@ _has_pytest() { [ -n "$1" ] && [ -x "$1" ] && "$1" -c 'import pytest' 2>/dev/nul
 # shellcheck source=scripts/_activation.sh
 . "$SCRIPT_DIR/_activation.sh"
 
+# ── Help ────────────────────────────────────────────────────────────────────
+# -h/--help only prints usage, so it must never provision anything: answer it
+# here, before the environment check below can re-run this script under
+# run-in-hermes-env (which syncs, and may download, the test environment). The
+# usage is run_tests_parallel.py's own (stdlib only), printed by an interpreter
+# that is already there; without one, the Usage block above. The scan splits
+# arguments as that runner does: it stops at a literal `--` and skips the value
+# of a space-separated pytest value flag, so `-k -h` still selects tests.
+_wants_help() {
+  local arg skip=0
+  for arg in "$@"; do
+    [ "$arg" != -- ] || return 1
+    if [ "$skip" = 1 ]; then skip=0; continue; fi
+    case "$arg" in
+      -k | -m | -p | -o | -c | -r | -W) skip=1 ;;
+      -h | --help) return 0 ;;
+    esac
+  done
+  return 1
+}
+if _wants_help "$@"; then
+  for _help_python in "${HERMES_PYTHON:-}" "$(hermes_bootstrap_python "$REPO_ROOT" 2>/dev/null)" \
+      "$(command -v python3 2>/dev/null)"; do
+    [ -n "$_help_python" ] && [ -x "$_help_python" ] || continue
+    _help="$(PYTHONHOME='' "$_help_python" -I -B "$SCRIPT_DIR/run_tests_parallel.py" --help 2>/dev/null)" || continue
+    printf '%s\n' "$_help"
+    exit 0
+  done
+  sed -n '/^# Usage:$/,/^# root (tests\/)\.$/s/^# \{0,1\}//p' "${BASH_SOURCE[0]}"
+  exit 0
+fi
+
 # A test run under a faked HOME (worktree lanes, probe homes) provisions its
 # test environment from the OS account's tool store instead of downloading
 # ~1 GB of tools into every temporary home, but only while that store already
@@ -70,12 +103,18 @@ _has_pytest() { [ -n "$1" ] && [ -x "$1" ] && "$1" -c 'import pytest' 2>/dev/nul
 # HERMES_RUNTIME_DIR, a custom HERMES_HOME, a home that already holds a store,
 # or an account without a usable store keep today's per-home layout, unless
 # what they name is the account's store (_avoid_account_stores).
-# Prints the OS account's home when HOME is faked (it is not that home).
-_account_home() {
+# Prints the OS account's home, whether or not HOME is it.
+_os_account_home() {
   local account
   account="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
   [ -n "$account" ] || account="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: *//p')"
-  [ -n "$account" ] && [ -d "$account" ] && [ ! "$account" -ef "$HOME" ] || return 1
+  [ -n "$account" ] && [ -d "$account" ] || return 1
+  printf '%s\n' "$account"
+}
+# Prints the OS account's home when HOME is faked (it is not that home).
+_account_home() {
+  local account
+  account="$(_os_account_home)" && [ ! "$account" -ef "$HOME" ] || return 1
   printf '%s\n' "$account"
 }
 # Prints the account home, then the pinned Python minor.
@@ -101,9 +140,10 @@ _account_tool_store() {
 # whatever that turns out to be.
 # Prints the account's stores: its default home's, and the one
 # HERMES_DATA_DIR_SUFFIX selects (hermes_constants._platform_default_hermes_home).
+# ACCOUNT, when given, is the account's home; else the one a faked HOME hides.
 _account_stores() {
-  local account suffix
-  account="$(_account_home)" || return 0
+  local account="${1:-}" suffix
+  [ -n "$account" ] || account="$(_account_home)" || return 0
   for suffix in "" ${HERMES_DATA_DIR_SUFFIX:+"$HERMES_DATA_DIR_SUFFIX"}; do
     if [ -f "$account/.hermes$suffix/tools/facts.json" ]; then
       printf '%s\n' "$account/.hermes$suffix/tools"
@@ -151,18 +191,20 @@ _resolved_path() {
 }
 # Prints the store this run's `pm install` writes: HERMES_RUNTIME_DIR as pm
 # takes it, else pm's own resolver (stamps, HERMES_HOME, profiles), run by the
-# bootstrap interpreter found beside STORE; says why on stderr when it cannot.
+# bootstrap interpreter found beside STORE; says why on stderr when it cannot,
+# after the LABEL that names the check asking (default: faked HOME).
 _pm_store() (
+  label="${2:-faked HOME}"
   if [ -n "${HERMES_RUNTIME_DIR:-}" ]; then
     _resolved_path "$HERMES_RUNTIME_DIR" && exit
-    echo "error: faked HOME: HERMES_RUNTIME_DIR cannot be resolved (more than 40 symlinks, or a link readlink cannot read)" >&2
+    echo "error: $label: HERMES_RUNTIME_DIR cannot be resolved (more than 40 symlinks, or a link readlink cannot read)" >&2
     exit 1
   fi
   # Asked and resolved from the checkout, as setup asks: a relative HERMES_HOME
   # names a store there, not in the caller's directory.
   cd "$REPO_ROOT" || exit 1
   if ! python="$(HERMES_RUNTIME_DIR="$1" hermes_bootstrap_python "$REPO_ROOT")"; then
-    echo "error: faked HOME: no bootstrap Python to ask pm which tool store this run provisions" >&2
+    echo "error: $label: no bootstrap Python to ask pm which tool store this run provisions" >&2
     exit 1
   fi
   PYTHONHOME= "$python" -I -B -c 'import sys
@@ -171,7 +213,7 @@ from pm.environments import store_root
 try:
     print(store_root(sys.argv[1]).resolve())
 except Exception as error:
-    sys.exit(f"error: faked HOME: pm cannot resolve the tool store this run provisions: {error}")' "$REPO_ROOT"
+    sys.exit(f"error: {sys.argv[2]}: pm cannot resolve the tool store this run provisions: {error}")' "$REPO_ROOT" "$label"
 )
 # Points HERMES_RUNTIME_DIR away from an account store that this run's
 # `pm install` would write other pins into; status 1 when it cannot.
@@ -205,6 +247,36 @@ _avoid_account_stores() {
   export HERMES_RUNTIME_DIR="$fallback"
   echo "▶ faked HOME: the account's tool store records other pins; provisioning $HERMES_RUNTIME_DIR instead"
 }
+# Under the account's own HOME there is no other home to provision instead: the
+# store this run's `pm install` writes may be the one the installed Hermes runs
+# on. Refuses the run when it is and that store records other pins (re-staging
+# them would pull the installed Hermes's tools out from under it), or when no
+# interpreter can tell which store pm would pick. A store at this checkout's
+# pins is used as is, and a store of the run's own (HERMES_RUNTIME_DIR, a custom
+# HERMES_HOME) or an account with no store yet is not the installed one. Like
+# the faked-HOME rules it needs the account lookup (getent, dscl); without one
+# (native Windows) the run keeps today's behavior.
+_refuse_live_store() {
+  local account stores target named
+  account="$(_os_account_home)" && [ "$account" -ef "$HOME" ] || return 0
+  stores="$(_account_stores "$account")"
+  [ -n "$stores" ] || return 0
+  if ! target="$(_pm_store "${stores%%$'\n'*}" "live tool store" && printf x)"; then
+    echo "error: cannot check whether this run would provision the live Hermes tool store (${stores//$'\n'/, }); set HERMES_RUNTIME_DIR to a separate tool store" >&2
+    return 1
+  fi
+  target="${target%$'\nx'}"
+  # setup-hermes.sh stages its bootstrap uv into $HOME/.hermes/tools before pm
+  # runs; when pm provisions another store, point the staging there too.
+  if [ -z "${HERMES_RUNTIME_DIR:-}" ] && _which_store "$HOME/.hermes/tools" "$stores" >/dev/null; then
+    export HERMES_RUNTIME_DIR="$target"
+  fi
+  named="$(_which_store "$target" "$stores")" || return 0
+  ! _store_has_pins "$named" >/dev/null || return 0
+  echo "error: refusing to provision $named: it is the live Hermes tool store and records other pins than this checkout." >&2
+  echo "  Set HERMES_RUNTIME_DIR to a separate tool store (for example HERMES_RUNTIME_DIR=\"\$HOME/.cache/hermes-test-tools\"), or run under a throwaway HOME." >&2
+  return 1
+}
 # Read-only check that the store already records this checkout's pins
 # (scripts/tool_store_pins.py says why and what counts); prints the Python minor.
 _store_has_pins() {
@@ -217,7 +289,7 @@ _store_has_pins() {
 # to keep off the account's.
 _choose_tool_store() {
   local shared account
-  shared="$(_account_tool_store)" || { _avoid_account_stores; return; }
+  shared="$(_account_tool_store)" || { _avoid_account_stores && _refuse_live_store; return; }
   account="${shared%%$'\n'*}"
   export HERMES_RUNTIME_DIR="$account/.hermes/tools"
   # setup-hermes.sh's uv-managed bootstrap interpreter is the same kind of

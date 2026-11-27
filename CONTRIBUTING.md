@@ -280,6 +280,14 @@ just test tests/agent/ -v
 
 Both recipes call `scripts/run_tests.sh`; `just test` refuses to start
 without a path, and `just test-all` runs the full suite.
+`scripts/run_tests.sh --help` lists the runner's options without provisioning
+anything.
+
+When the test environment needs provisioning under your own HOME, the runner
+refuses to re-stage the tool store your installed Hermes runs on
+(`~/.hermes/tools`) at pins other than the ones it records. Point
+`HERMES_RUNTIME_DIR` at a separate store for that checkout, for example
+`HERMES_RUNTIME_DIR="$HOME/.cache/hermes-test-tools" just test tests/agent/`.
 
 On Windows, run the script through Bash. When no local `.venv` or `venv`
 contains pytest, the runner accepts the explicit `HERMES_PYTHON` above. It
